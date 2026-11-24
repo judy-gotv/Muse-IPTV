@@ -1,0 +1,16 @@
+# cargo-xtask 惯例：开发辅助命令（开发文档 §12.8 `cargo xtask i18n-check`）。
+# 仅依赖标准库，保持轻量；是 workspace 成员（`cargo run -p xtask` 要求），
+# 但不参与任何业务构建。
+# 作者: Passwd Word
+[package]
+name = "xtask"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "xtask"
+path = "src/main.rs"
+
+[dependencies]

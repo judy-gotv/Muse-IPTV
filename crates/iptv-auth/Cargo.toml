@@ -1,0 +1,24 @@
+# Token 哈希、会话、TOTP、限流（§1.1/§13）
+# 作者: Passwd Word
+[package]
+name = "iptv-auth"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+iptv-core = { path = "../iptv-core" }
+iptv-dto = { path = "../iptv-dto" }
+argon2 = { workspace = true }
+sha2 = { workspace = true }
+sha1 = { workspace = true }
+hmac = { workspace = true }
+base64 = { workspace = true }
+rand = { workspace = true }
+hex = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

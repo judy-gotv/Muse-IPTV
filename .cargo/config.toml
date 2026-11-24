@@ -1,0 +1,4 @@
+# cargo-xtask 惯例：`cargo xtask <cmd>` 等价于 `cargo run -p xtask -- <cmd>`。
+# 作者: Passwd Word
+[alias]
+xtask = "run -p xtask --"

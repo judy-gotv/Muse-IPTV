@@ -1,0 +1,32 @@
+# 用户端门户 Leptos SSR + hydrate（§4）
+# 作者: Passwd Word
+[package]
+name = "iptv-portal"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+iptv-dto = { path = "../iptv-dto" }
+iptv-i18n = { path = "../iptv-i18n" }
+iptv-design = { path = "../iptv-design" }
+iptv-ui = { path = "../iptv-ui" }
+iptv-core = { path = "../iptv-core" }
+leptos = { workspace = true }
+leptos_meta = { workspace = true }
+leptos_router = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+reqwest = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+fluent-bundle = { workspace = true }
+leptos_axum = { workspace = true }
+axum = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

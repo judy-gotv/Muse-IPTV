@@ -1,0 +1,28 @@
+# 定时任务、订阅同步、健康探测（§3.1/§7.3）
+# 作者: Passwd Word
+[package]
+name = "iptv-worker"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+iptv-core = { path = "../iptv-core" }
+iptv-dto = { path = "../iptv-dto" }
+iptv-store = { path = "../iptv-store" }
+iptv-m3u = { path = "../iptv-m3u" }
+iptv-epg = { path = "../iptv-epg" }
+iptv-auth = { path = "../iptv-auth" }
+iptv-concurrency = { path = "../iptv-concurrency" }
+iptv-i18n = { path = "../iptv-i18n" }
+tokio = { workspace = true }
+reqwest = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

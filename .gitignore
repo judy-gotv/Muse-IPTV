@@ -1,0 +1,6 @@
+/target/
+*.db
+*.db-journal
+data/
+.env
+.DS_Store

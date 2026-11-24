@@ -1,0 +1,18 @@
+# 语言包、locale 协商、格式化（§12）
+# 作者: Passwd Word
+[package]
+name = "iptv-i18n"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+
+fluent-bundle = { workspace = true }
+unic-langid = { workspace = true }
+serde = { workspace = true }
+chrono = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

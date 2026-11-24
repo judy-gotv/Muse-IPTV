@@ -1,0 +1,19 @@
+# XMLTV 解析器 quick-xml（§1.1/§14.1）
+# 作者: Passwd Word
+[package]
+name = "iptv-epg"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+iptv-core = { path = "../iptv-core" }
+iptv-dto = { path = "../iptv-dto" }
+serde = { workspace = true }
+quick-xml = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

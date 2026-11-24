@@ -1,0 +1,88 @@
+# Muse-IPTV CI（开发文档 §15 M0 / §16 验收）
+# 作者: Passwd Word
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: fmt / clippy / test (SQLite)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.89"
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: fmt
+        run: cargo fmt --all -- --check
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: i18n-check
+        run: cargo run -p xtask -- i18n-check
+      - name: test
+        run: cargo test --workspace
+      - name: smoke (SQLite 实跑)
+        run: |
+          cargo build --release -p iptv-api -p iptv-worker
+          mkdir -p /tmp/iptv-smoke
+          cd /tmp/iptv-smoke
+          DATABASE_URL=sqlite://./iptv.db IPTV_ADMIN_USER=admin IPTV_ADMIN_PASSWORD='smoke-test-123' BIND_ADDR=127.0.0.1:18080 timeout 15 ${{ github.workspace }}/target/release/iptv-api &
+          API_PID=$!
+          sleep 6
+          curl -fsSL http://127.0.0.1:18080/healthz
+          curl -fsSL http://127.0.0.1:18080/api/v1/openapi.json | head -c 200
+          kill $API_PID || true
+
+  contract-postgres:
+    name: 契约测试 PostgreSQL（§16）
+    runs-on: ubuntu-22.04
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: iptv
+          POSTGRES_PASSWORD: iptv
+          POSTGRES_DB: iptv
+        ports: ["5432:5432"]
+        options: --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.89"
+      - uses: Swatinem/rust-cache@v2
+      - name: contract tests (PostgreSQL)
+        env:
+          DATABASE_URL: postgres://iptv:iptv@127.0.0.1:5432/iptv
+        run: cargo test -p iptv-store --test contract
+
+  contract-mysql:
+    name: 契约测试 MySQL（§16）
+    runs-on: ubuntu-22.04
+    services:
+      mysql:
+        image: mysql:8
+        env:
+          MYSQL_ROOT_PASSWORD: iptv
+          MYSQL_DATABASE: iptv
+        ports: ["3306:3306"]
+        options: --health-cmd "mysqladmin ping -h 127.0.0.1" --health-interval 5s --health-timeout 5s --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.89"
+      - uses: Swatinem/rust-cache@v2
+      - name: contract tests (MySQL)
+        env:
+          DATABASE_URL: mysql://root:iptv@127.0.0.1:3306/iptv
+        run: cargo test -p iptv-store --test contract

@@ -1,0 +1,81 @@
+# IPTV 播放平台 — 全 Rust 技术栈 (开发文档 v1.2, §1.1)
+# 作者: Passwd Word
+[workspace]
+resolver = "2"
+members = [
+    "crates/iptv-core",
+    "crates/iptv-dto",
+    "crates/iptv-store",
+    "crates/iptv-m3u",
+    "crates/iptv-epg",
+    "crates/iptv-auth",
+    "crates/iptv-concurrency",
+    "crates/iptv-i18n",
+    "crates/iptv-design",
+    "crates/iptv-api",
+    "crates/iptv-worker",
+    "crates/iptv-ui",
+    "crates/iptv-portal",
+    "crates/iptv-admin",
+    # xtask 必须是成员，`cargo run -p xtask` / `cargo xtask` 才能解析到它
+    # （只在 exclude 里时 -p 找不到包；xtask 无业务依赖，不影响主构建）。
+    "xtask",
+]
+exclude = ["deploy/tauri-shell"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+authors = ["Passwd Word"]
+repository = "https://github.com/judy-gotv/Muse-IPTV"
+
+[workspace.dependencies]
+# --- async / web (§2) ---
+tokio = { version = "1", features = ["full"] }
+axum = { version = "0.8", features = ["macros", "multipart"] }
+tower = { version = "0.5" }
+tower-http = { version = "0.6", features = ["cors", "trace", "compression-gzip"] }
+http = "1"
+# --- serde (§2) ---
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# --- db (§2, §10): SQLx Any — 同一套代码跑 PG / MySQL / SQLite, 只改 DATABASE_URL ---
+sqlx = { version = "0.8", features = ["any", "postgres", "mysql", "sqlite", "runtime-tokio", "tls-rustls"] }
+# --- crypto / auth (§2, §13) ---
+argon2 = "0.5"
+sha2 = "0.10"
+sha1 = "0.10"
+hmac = "0.12"
+base64 = "0.22"
+hex = "0.4"
+rand = "0.8"
+uuid = { version = "1", features = ["v4"] }
+# --- http client / parsing (§2) ---
+reqwest = { version = "0.12", features = ["rustls-tls", "json", "stream"] }
+quick-xml = { version = "0.38", features = ["serialize"] }
+# --- i18n (§2, §12) ---
+fluent-bundle = "0.16"
+unic-langid = { version = "0.9", features = ["serde"] }
+# --- observability / errors (§2) ---
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+thiserror = "2"
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde", "clock"] }
+# --- misc ---
+redis = { version = "0.27", features = ["tokio-comp"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+qrcode = "0.14"
+utoipa = { version = "5", features = ["axum_extras"] }
+utoipa-swagger-ui = { version = "9", features = ["axum"] }
+url = "2"
+leptos = { version = "0.8", features = ["ssr"] }
+leptos_axum = { version = "0.8" }
+leptos_meta = { version = "0.8", features = ["ssr"] }
+leptos_router = { version = "0.8", features = ["ssr"] }
+
+[profile.release]
+lto = true
+codegen-units = 1

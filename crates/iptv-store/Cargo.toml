@@ -1,0 +1,22 @@
+# 存储抽象 Repository trait + Any 实现（§1.1/§10）
+# 作者: Passwd Word
+[package]
+name = "iptv-store"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+iptv-core = { path = "../iptv-core" }
+iptv-dto = { path = "../iptv-dto" }
+iptv-m3u = { path = "../iptv-m3u" }
+sqlx = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+anyhow = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

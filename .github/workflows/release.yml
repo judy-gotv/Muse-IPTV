@@ -1,0 +1,131 @@
+# Muse-IPTV Release：打 tag v* 即全架构打包
+# 作者: Passwd Word
+# 架构（6 个包）：linux x86_64 / aarch64 / armv7、macOS x86_64 / arm64、windows x86_64
+# 每个包：iptv-api + iptv-worker + iptv-portal + iptv-admin + README + .env.example
+# 另附 SHA256SUMS。Docker 多架构镜像见 docker.yml。
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build ${{ matrix.target }} (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            pkg_os: linux
+            pkg_arch: x86_64
+          - os: ubuntu-22.04
+            target: aarch64-unknown-linux-gnu
+            pkg_os: linux
+            pkg_arch: aarch64
+            cross_gcc: aarch64-linux-gnu-gcc
+            apt: gcc-aarch64-linux-gnu
+          - os: ubuntu-22.04
+            target: armv7-unknown-linux-gnueabihf
+            pkg_os: linux
+            pkg_arch: armv7
+            cross_gcc: arm-linux-gnueabihf-gcc
+            apt: gcc-arm-linux-gnueabihf
+          - os: macos-14
+            target: x86_64-apple-darwin
+            pkg_os: macos
+            pkg_arch: x86_64
+          - os: macos-14
+            target: aarch64-apple-darwin
+            pkg_os: macos
+            pkg_arch: aarch64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            pkg_os: windows
+            pkg_arch: x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.89"
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: install cross gcc (linux)
+        if: matrix.apt != ''
+        run: sudo apt-get update && sudo apt-get install -y ${{ matrix.apt }}
+      - name: build
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.cross_gcc }}
+          CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER: ${{ matrix.cross_gcc }}
+        run: cargo build --release --target ${{ matrix.target }} --bins
+      - name: package (unix)
+        if: matrix.pkg_os != 'windows'
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME}"
+          PKG="muse-iptv-${VERSION}-${{ matrix.pkg_os }}-${{ matrix.pkg_arch }}"
+          mkdir -p "$PKG"
+          BIN="target/${{ matrix.target }}/release"
+          cp "$BIN/iptv-api" "$BIN/iptv-worker" "$BIN/iptv-portal" "$BIN/iptv-admin" "$PKG/"
+          cp README.md .env.example "$PKG/"
+          tar -czf "$PKG.tar.gz" "$PKG"
+          sha256sum "$PKG.tar.gz" >> SHA256SUMS
+          echo "PKG=$PKG.tar.gz" >> "$GITHUB_ENV"
+      - name: package (windows)
+        if: matrix.pkg_os == 'windows'
+        shell: pwsh
+        run: |
+          $Version = "${{ github.ref_name }}"
+          $Pkg = "muse-iptv-$Version-windows-x86_64"
+          New-Item -ItemType Directory -Force -Path $Pkg | Out-Null
+          $Bin = "target/${{ matrix.target }}/release"
+          Copy-Item "$Bin/iptv-api.exe","$Bin/iptv-worker.exe","$Bin/iptv-portal.exe","$Bin/iptv-admin.exe" $Pkg
+          Copy-Item README.md,.env.example $Pkg
+          Compress-Archive -Path $Pkg -DestinationPath "$Pkg.zip"
+          (Get-FileHash -Algorithm SHA256 "$Pkg.zip").Hash.ToLower() + "  $Pkg.zip" | Out-File -Append -Encoding ascii SHA256SUMS
+          echo "PKG=$Pkg.zip" >> $env:GITHUB_ENV
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pkg-${{ matrix.pkg_os }}-${{ matrix.pkg_arch }}
+          path: |
+            muse-iptv-*.tar.gz
+            muse-iptv-*.zip
+            SHA256SUMS
+
+  release:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: pkg-*
+          merge-multiple: true
+      - name: merge SHA256SUMS
+        run: |
+          # 各 build job 的 SHA256SUMS 同名，下载时会互相覆盖，故在此按包文件重新计算汇总。
+          ls -la muse-iptv-*
+          sha256sum muse-iptv-*.tar.gz muse-iptv-*.zip > SHA256SUMS
+          cat SHA256SUMS
+      - name: create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Muse-IPTV ${{ github.ref_name }}
+          body: |
+            Muse-IPTV ${{ github.ref_name }} — 全 Rust IPTV 播放平台（开发文档 v1.2）。
+            包含 6 个架构包（linux x86_64/aarch64/armv7、macOS x86_64/arm64、windows x86_64），每个包 4 个二进制：iptv-api / iptv-worker / iptv-portal / iptv-admin。
+            一键安装：`curl -fsSL https://raw.githubusercontent.com/judy-gotv/Muse-IPTV/main/install.sh | sh`
+            Windows：`irm https://raw.githubusercontent.com/judy-gotv/Muse-IPTV/main/install.ps1 | iex`
+            Docker：`ghcr.io/judy-gotv/muse-iptv:${{ github.ref_name }}`（amd64/arm64）
+          files: |
+            muse-iptv-*.tar.gz
+            muse-iptv-*.zip
+            SHA256SUMS

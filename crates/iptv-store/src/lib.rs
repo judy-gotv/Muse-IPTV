@@ -1,0 +1,352 @@
+//! 存储层（开发文档 §1.1、§9、§10）。
+//!
+//! 实现方式：`sqlx::AnyPool`，同一套 SQL 跑 PostgreSQL / MySQL / SQLite，
+//! 只改 `DATABASE_URL`，业务代码不改（§10.4）。
+//!
+//! # 可移植性约定（§10.2 的坑位，写代码前先读）
+//! - 时间一律存 epoch 秒 `BIGINT`（docs/CONTRACTS.md）：`sqlx::Any` 只支持
+//!   `bool/i16/i32/i64/f32/f64/String/Vec<u8>`，没有 `DateTime`/`Json` 类型，
+//!   因此文档 §9 的 `TIMESTAMPTZ` / `DATETIME(6)` 在迁移文件里映射为 `BIGINT`
+//!   epoch 秒，`JSONB` / `JSON` 映射为 `TEXT`（JSON 字符串），`INET` 映射为
+//!   `TEXT`。主键与索引仍按方言区分（PG `BIGSERIAL` 与部分索引、MySQL
+//!   `BIGINT AUTO_INCREMENT`、SQLite `INTEGER PRIMARY KEY AUTOINCREMENT`）。
+//! - 占位符一律 `?`，由 sqlx Any 按方言转 `$n`。
+//! - 布尔存 `INTEGER` 0/1，避免三驱动的 bool 编解码差异。
+//! - 新增行取 id：PG 用 `INSERT ... RETURNING id`，MySQL 用
+//!   `SELECT LAST_INSERT_ID()`，SQLite 用 `SELECT last_insert_rowid()`
+//!   （§10.2 坑 #5），见 `insert_id!` 宏。
+//! - `system_setting` 表的列名用 `setting_key` / `setting_value`（`key` 在
+//!   MySQL 是保留字，同一套 SQL 不能在三方言下都裸写 `key`）。
+// 作者: Passwd Word
+
+use chrono::{DateTime, Utc};
+use iptv_dto::*;
+use sqlx::any::AnyRow;
+use sqlx::{AnyPool, Row};
+use std::collections::HashMap;
+
+mod admin;
+mod channels;
+mod epg;
+mod plans;
+mod playback;
+mod portal;
+mod settings;
+mod sources;
+mod tokens;
+mod users;
+
+/// 数据库方言（由 `DATABASE_URL` 的 scheme 判定）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dialect {
+    Postgres,
+    MySql,
+    Sqlite,
+}
+
+impl std::fmt::Display for Dialect {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Dialect::Postgres => "postgres",
+            Dialect::MySql => "mysql",
+            Dialect::Sqlite => "sqlite",
+        })
+    }
+}
+
+/// 存储入口。`Arc<Store>` 由 `iptv-api::AppState` 持有。
+pub struct Store {
+    pool: AnyPool,
+    dialect: Dialect,
+    /// 最近一次 `upsert_channels` 的差异缓存，供 `get_sync_diff` 重建
+    /// （CONTRACTS.md：“由 upsert_channels 的结果重建”；进程内缓存，
+    /// 重启后为空，见 `get_sync_diff`）。
+    last_diffs: std::sync::Mutex<HashMap<i64, SyncDiff>>,
+}
+
+impl Store {
+    /// 按 URL scheme 判定方言并建池。
+    /// 支持 `postgres://` / `postgresql://`、`mysql://` / `mariadb://`、`sqlite://`。
+    pub async fn connect(database_url: &str) -> anyhow::Result<Self> {
+        // sqlx::Any 的驱动必须先注册（否则 "No drivers installed"），
+        // 该函数内部用 Once 保证只注册一次，多次调用安全。
+        sqlx::any::install_default_drivers();
+        let lower = database_url.trim().to_ascii_lowercase();
+        let dialect = if lower.starts_with("postgres") {
+            Dialect::Postgres
+        } else if lower.starts_with("mysql") || lower.starts_with("mariadb") {
+            Dialect::MySql
+        } else if lower.starts_with("sqlite") {
+            Dialect::Sqlite
+        } else {
+            anyhow::bail!(
+                "不支持的 DATABASE_URL（仅支持 postgres://、mysql://、sqlite://）：{database_url}"
+            );
+        };
+        // SQLite 首次启动要建库文件：sqlx 默认 create_if_missing=false，
+        // 不带 mode 参数的 sqlite URL 一律补 ?mode=rwc（显式带 mode 的不动）。
+        let url_owned;
+        let url = if lower.starts_with("sqlite") && !database_url.contains("mode=") {
+            url_owned = if database_url.contains('?') {
+                format!("{database_url}&mode=rwc")
+            } else {
+                format!("{database_url}?mode=rwc")
+            };
+            url_owned.as_str()
+        } else {
+            database_url
+        };
+        let pool = sqlx::any::AnyPoolOptions::new()
+            .max_connections(5)
+            .connect(url)
+            .await?;
+        Ok(Self {
+            pool,
+            dialect,
+            last_diffs: std::sync::Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// 按方言依次执行内嵌的 V1/V2/V3 迁移（`migrations/{dialect}/`）。
+    /// 幂等：V1 用 `CREATE TABLE IF NOT EXISTS`，V2 种子用各方言的
+    /// 忽略冲突写法，重复执行不会产生重复数据。
+    pub async fn migrate(&self) -> anyhow::Result<()> {
+        let files: &[&str] = match self.dialect {
+            Dialect::Postgres => &[
+                include_str!("../../../migrations/postgres/V1__init.sql"),
+                include_str!("../../../migrations/postgres/V2__seed.sql"),
+                include_str!("../../../migrations/postgres/V3__i18n_tables.sql"),
+            ],
+            Dialect::MySql => &[
+                include_str!("../../../migrations/mysql/V1__init.sql"),
+                include_str!("../../../migrations/mysql/V2__seed.sql"),
+                include_str!("../../../migrations/mysql/V3__i18n_tables.sql"),
+            ],
+            Dialect::Sqlite => &[
+                include_str!("../../../migrations/sqlite/V1__init.sql"),
+                include_str!("../../../migrations/sqlite/V2__seed.sql"),
+                include_str!("../../../migrations/sqlite/V3__i18n_tables.sql"),
+            ],
+        };
+        if self.dialect == Dialect::Sqlite {
+            sqlx::query("PRAGMA foreign_keys = ON")
+                .execute(&self.pool)
+                .await?;
+        }
+        for sql in files {
+            self.exec_script(sql).await?;
+        }
+        Ok(())
+    }
+
+    /// 逐条执行迁移脚本（按 `;` 切分；脚本内不得在字符串字面量里写 `;`）。
+    async fn exec_script(&self, sql: &str) -> anyhow::Result<()> {
+        for chunk in sql.split(';') {
+            let cleaned: String = chunk
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("--"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let stmt = cleaned.trim();
+            if stmt.is_empty() {
+                continue;
+            }
+            sqlx::query(stmt).execute(&self.pool).await?;
+        }
+        Ok(())
+    }
+
+    pub fn dialect(&self) -> Dialect {
+        self.dialect
+    }
+
+    pub fn pool(&self) -> &AnyPool {
+        &self.pool
+    }
+
+    /// 非 PG 方言取 id：必须在**同一连接**上执行 INSERT 与取 id
+    /// （`last_insert_rowid()` / `LAST_INSERT_ID()` 均为连接级函数，
+    /// 换连接会取错 id）。`insert_id!` 宏内用 `pool.acquire()` 保证同连接。
+    async fn last_insert_id_on(
+        conn: &mut sqlx::pool::PoolConnection<sqlx::Any>,
+        dialect: Dialect,
+    ) -> anyhow::Result<i64> {
+        match dialect {
+            Dialect::Postgres => anyhow::bail!("Postgres 插入必须走 RETURNING id"),
+            Dialect::MySql => Ok(sqlx::query_scalar("SELECT LAST_INSERT_ID()")
+                .fetch_one(&mut **conn)
+                .await?),
+            Dialect::Sqlite => Ok(sqlx::query_scalar("SELECT last_insert_rowid()")
+                .fetch_one(&mut **conn)
+                .await?),
+        }
+    }
+}
+
+/// 新增行取 id（§10.2 坑 #5）。
+/// PG 用 `INSERT ... RETURNING id`；MySQL/SQLite 在同一连接上执行
+/// INSERT 后取 `LAST_INSERT_ID()` / `last_insert_rowid()`（连接级函数，
+/// 换连接会取错 id，因此这里用 `pool.acquire()` 显式拿同一连接）。
+macro_rules! insert_id {
+    ($store:expr, $sql:literal, $($arg:expr),* $(,)?) => {{
+        match $store.dialect {
+            Dialect::Postgres => {
+                sqlx::query_scalar::<_, i64>(concat!($sql, " RETURNING id"))
+                    $(.bind($arg))*
+                    .fetch_one(&$store.pool)
+                    .await
+                    .map_err(anyhow::Error::from)
+            }
+            _ => {
+                let mut conn = $store.pool.acquire().await?;
+                sqlx::query($sql)
+                    $(.bind($arg))*
+                    .execute(&mut *conn)
+                    .await?;
+                Self::last_insert_id_on(&mut conn, $store.dialect).await
+            }
+        }
+    }};
+}
+pub(crate) use insert_id;
+
+// ---------------------------------------------------------------------------
+// 行读取 / 时间 / JSON 辅助
+// ---------------------------------------------------------------------------
+
+pub(crate) fn epoch(dt: DateTime<Utc>) -> i64 {
+    dt.timestamp()
+}
+
+pub(crate) fn from_epoch(secs: i64) -> DateTime<Utc> {
+    DateTime::from_timestamp(secs, 0).unwrap_or(DateTime::UNIX_EPOCH)
+}
+
+pub(crate) fn opt_epoch(v: Option<i64>) -> Option<DateTime<Utc>> {
+    v.map(from_epoch)
+}
+
+pub(crate) fn r_i64(row: &AnyRow, col: &str) -> anyhow::Result<i64> {
+    Ok(row.try_get(col)?)
+}
+
+pub(crate) fn r_opt_i64(row: &AnyRow, col: &str) -> anyhow::Result<Option<i64>> {
+    Ok(row.try_get(col)?)
+}
+
+pub(crate) fn r_string(row: &AnyRow, col: &str) -> anyhow::Result<String> {
+    Ok(row.try_get(col)?)
+}
+
+pub(crate) fn r_opt_string(row: &AnyRow, col: &str) -> anyhow::Result<Option<String>> {
+    Ok(row.try_get(col)?)
+}
+
+pub(crate) fn r_bool(row: &AnyRow, col: &str) -> anyhow::Result<bool> {
+    Ok(row.try_get::<i64, _>(col)? != 0)
+}
+
+pub(crate) fn r_opt_bool(row: &AnyRow, col: &str) -> anyhow::Result<Option<bool>> {
+    Ok(row.try_get::<Option<i64>, _>(col)?.map(|v| v != 0))
+}
+
+pub(crate) fn r_ts(row: &AnyRow, col: &str) -> anyhow::Result<DateTime<Utc>> {
+    Ok(from_epoch(row.try_get::<i64, _>(col)?))
+}
+
+pub(crate) fn r_opt_ts(row: &AnyRow, col: &str) -> anyhow::Result<Option<DateTime<Utc>>> {
+    Ok(opt_epoch(row.try_get::<Option<i64>, _>(col)?))
+}
+
+pub(crate) fn r_json(row: &AnyRow, col: &str) -> serde_json::Value {
+    row.try_get::<String, _>(col)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or(serde_json::Value::Null)
+}
+
+pub(crate) fn r_opt_json(row: &AnyRow, col: &str) -> Option<serde_json::Value> {
+    row.try_get::<Option<String>, _>(col)
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str(&s).ok())
+}
+
+pub(crate) fn json_text(v: &serde_json::Value) -> String {
+    serde_json::to_string(v).unwrap_or_else(|_| "null".to_string())
+}
+
+pub(crate) fn str_list(v: &serde_json::Value) -> Vec<String> {
+    v.as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+pub(crate) fn i64_list(v: &serde_json::Value) -> Vec<i64> {
+    v.as_array()
+        .map(|a| a.iter().filter_map(|x| x.as_i64()).collect())
+        .unwrap_or_default()
+}
+
+pub(crate) fn page_bounds(q: &PageQuery) -> (i64, i64) {
+    let size = i64::from(q.page_size.clamp(1, 100));
+    let page = i64::from(q.page.max(1));
+    (size, (page - 1) * size)
+}
+
+pub(crate) fn like_pattern(q: &Option<String>) -> Option<String> {
+    q.as_ref()
+        .map(|s| format!("%{}%", s.replace('%', "\\%").replace('_', "\\_")))
+}
+
+// ---------------------------------------------------------------------------
+// CONTRACTS.md 定义的跨方法结构
+// ---------------------------------------------------------------------------
+
+/// `upsert_channels` 的同步结果（§7.3 四态）。
+#[derive(Debug, Clone, Default)]
+pub struct SyncOutcome {
+    pub added: i64,
+    pub updated: i64,
+    pub removed: i64,
+    pub added_channels: Vec<Channel>,
+    pub metadata_changed: Vec<Channel>,
+    pub url_changed: Vec<Channel>,
+    pub missing: Vec<Channel>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewAuditLog {
+    pub actor: String,
+    pub actor_role: Option<String>,
+    pub action: String,
+    pub object_type: String,
+    pub object_id: String,
+    pub before_json: Option<serde_json::Value>,
+    pub after_json: Option<serde_json::Value>,
+    pub ip_address: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewPlaybackEvent {
+    pub session_uid: String,
+    pub token_id: i64,
+    pub channel_id: i64,
+    pub event_type: String,
+    pub detail: serde_json::Value,
+}
+
+#[derive(Debug, Clone)]
+pub struct EpgProgramInput {
+    pub channel_id: i64,
+    pub tvg_id: Option<String>,
+    pub title: String,
+    pub description: Option<String>,
+    pub category: Option<String>,
+    pub start_at: DateTime<Utc>,
+    pub stop_at: DateTime<Utc>,
+}

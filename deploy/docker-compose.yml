@@ -1,0 +1,47 @@
+# Muse-IPTV 一键部署（Docker Compose）
+# 作者: Passwd Word
+# 用法：cp .env.example .env && 编辑 .env 后 docker compose -f deploy/docker-compose.yml up -d
+services:
+  iptv:
+    image: ghcr.io/judy-gotv/muse-iptv:latest
+    container_name: muse-iptv
+    restart: unless-stopped
+    ports:
+      - "${IPTV_PORT:-8080}:8080"
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-sqlite:///app/data/iptv.db}
+      REDIS_URL: ${REDIS_URL:-}
+      PLAY_SECRET: ${PLAY_SECRET:-}
+      ADMIN_SECRET: ${ADMIN_SECRET:-}
+      PORTAL_BASE_URL: ${PORTAL_BASE_URL:-http://127.0.0.1:8081}
+      IPTV_ADMIN_USER: ${IPTV_ADMIN_USER:-admin}
+      IPTV_ADMIN_PASSWORD: ${IPTV_ADMIN_PASSWORD:-}
+    volumes:
+      - iptv-data:/app/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8080/healthz || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # 可选：PostgreSQL（生产推荐）。启用时把 DATABASE_URL 改成
+  # postgres://iptv:iptv@postgres:5432/iptv 并取消下面注释。
+  # postgres:
+  #   image: postgres:16-alpine
+  #   environment:
+  #     POSTGRES_USER: iptv
+  #     POSTGRES_PASSWORD: iptv
+  #     POSTGRES_DB: iptv
+  #   volumes:
+  #     - pg-data:/var/lib/postgresql/data
+
+  # 可选：Redis（并发计数走 Redis Lua；不配则内存兜底）。
+  # redis:
+  #   image: redis:7-alpine
+  #   volumes:
+  #     - redis-data:/data
+
+volumes:
+  iptv-data:
+  # pg-data:
+  # redis-data:

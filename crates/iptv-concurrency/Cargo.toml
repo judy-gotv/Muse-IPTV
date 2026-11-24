@@ -1,0 +1,19 @@
+# 并发额度控制 Redis Lua + 内存兜底（§6）
+# 作者: Passwd Word
+[package]
+name = "iptv-concurrency"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+iptv-core = { path = "../iptv-core" }
+iptv-dto = { path = "../iptv-dto" }
+redis = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+anyhow = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
