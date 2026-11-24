@@ -51,9 +51,12 @@ impl Store {
     }
 
     pub async fn list_plans(&self) -> anyhow::Result<Vec<Plan>> {
-        let rows = sqlx::query(&format!("SELECT {PLAN_COLS} FROM plan ORDER BY id ASC"))
-            .fetch_all(&self.pool)
-            .await?;
+        let rows = sqlx::query(&ph(
+            &format!("SELECT {PLAN_COLS} FROM plan ORDER BY id ASC"),
+            self.dialect,
+        ))
+        .fetch_all(&self.pool)
+        .await?;
         let mut out = Vec::with_capacity(rows.len());
         for r in &rows {
             out.push(row_to_plan(r)?);
@@ -62,10 +65,13 @@ impl Store {
     }
 
     pub async fn get_plan(&self, id: i64) -> anyhow::Result<Option<Plan>> {
-        let row = sqlx::query(&format!("SELECT {PLAN_COLS} FROM plan WHERE id = ?"))
-            .bind(id)
-            .fetch_optional(&self.pool)
-            .await?;
+        let row = sqlx::query(&ph(
+            &format!("SELECT {PLAN_COLS} FROM plan WHERE id = ?"),
+            self.dialect,
+        ))
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
         row.map(|r| row_to_plan(&r)).transpose()
     }
 
@@ -78,8 +84,9 @@ impl Store {
             req.icon.clone(),
             i64::from(req.is_default.unwrap_or(false))
         )?;
-        let row = sqlx::query(&format!(
-            "SELECT {GROUP_COLS} FROM channel_group WHERE id = ?"
+        let row = sqlx::query(&ph(
+            &format!("SELECT {GROUP_COLS} FROM channel_group WHERE id = ?"),
+            self.dialect,
         ))
         .bind(id)
         .fetch_one(&self.pool)
@@ -88,8 +95,9 @@ impl Store {
     }
 
     pub async fn list_groups(&self) -> anyhow::Result<Vec<ChannelGroup>> {
-        let rows = sqlx::query(&format!(
-            "SELECT {GROUP_COLS} FROM channel_group ORDER BY sort_weight ASC, id ASC"
+        let rows = sqlx::query(&ph(
+            &format!("SELECT {GROUP_COLS} FROM channel_group ORDER BY sort_weight ASC, id ASC"),
+            self.dialect,
         ))
         .fetch_all(&self.pool)
         .await?;

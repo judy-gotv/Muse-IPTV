@@ -75,8 +75,9 @@ impl Store {
     }
 
     pub async fn get_source(&self, id: i64) -> anyhow::Result<Option<PlaylistSource>> {
-        let row = sqlx::query(&format!(
-            "SELECT {SOURCE_COLS} FROM playlist_source WHERE id = ?"
+        let row = sqlx::query(&ph(
+            &format!("SELECT {SOURCE_COLS} FROM playlist_source WHERE id = ?"),
+            self.dialect,
         ))
         .bind(id)
         .fetch_optional(&self.pool)
@@ -85,8 +86,9 @@ impl Store {
     }
 
     pub async fn list_sources(&self) -> anyhow::Result<Vec<PlaylistSource>> {
-        let rows = sqlx::query(&format!(
-            "SELECT {SOURCE_COLS} FROM playlist_source ORDER BY id ASC"
+        let rows = sqlx::query(&ph(
+            &format!("SELECT {SOURCE_COLS} FROM playlist_source ORDER BY id ASC"),
+            self.dialect,
         ))
         .fetch_all(&self.pool)
         .await?;
@@ -106,7 +108,7 @@ impl Store {
     ) -> anyhow::Result<()> {
         let now = Utc::now();
         sqlx::query(
-            "UPDATE playlist_source SET last_sync_at = ?, next_sync_at = ?, last_status = ?, last_error = ?, updated_at = ? WHERE id = ?",
+            &ph("UPDATE playlist_source SET last_sync_at = ?, next_sync_at = ?, last_status = ?, last_error = ?, updated_at = ? WHERE id = ?", self.dialect),
         )
         .bind(epoch(now))
         .bind(epoch(next_sync_at))
@@ -146,7 +148,7 @@ impl Store {
     ) -> anyhow::Result<()> {
         let now = Utc::now();
         sqlx::query(
-            "UPDATE sync_log SET finished_at = ?, status = ?, added = ?, updated = ?, removed = ?, error = ? WHERE id = ?",
+            &ph("UPDATE sync_log SET finished_at = ?, status = ?, added = ?, updated = ?, removed = ?, error = ? WHERE id = ?", self.dialect),
         )
         .bind(epoch(now))
         .bind(status)
@@ -166,13 +168,16 @@ impl Store {
         q: &PageQuery,
     ) -> anyhow::Result<Paged<SyncLog>> {
         let (limit, offset) = page_bounds(q);
-        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sync_log WHERE source_id = ?")
-            .bind(source_id)
-            .fetch_one(&self.pool)
-            .await?;
-        let rows = sqlx::query(&format!(
-            "SELECT {SYNC_LOG_COLS} FROM sync_log WHERE source_id = ? ORDER BY started_at DESC, id DESC LIMIT ? OFFSET ?"
+        let total: i64 = sqlx::query_scalar(&ph(
+            "SELECT COUNT(*) FROM sync_log WHERE source_id = ?",
+            self.dialect,
         ))
+        .bind(source_id)
+        .fetch_one(&self.pool)
+        .await?;
+        let rows = sqlx::query(&ph(&format!(
+            "SELECT {SYNC_LOG_COLS} FROM sync_log WHERE source_id = ? ORDER BY started_at DESC, id DESC LIMIT ? OFFSET ?"
+        ), self.dialect))
         .bind(source_id)
         .bind(limit)
         .bind(offset)

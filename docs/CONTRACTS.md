@@ -17,7 +17,7 @@ impl Store {
 
 时间存库：epoch 秒（`i64`）；读出时 `DateTime::from_timestamp(secs, 0)` 转 UTC。
 JSON 字段（features / allowed_groups / http_headers 等）存 TEXT。
-占位符一律 `?`（sqlx Any 会按方言转 `$n`）。
+占位符一律 `?`，执行前由 `iptv-store::ph()` 按方言改写（PG `$1..$n`；sqlx Any 不替我们改写，2026-11-25 CI 契约测试实测）。
 新增行取 id：PG 用 `INSERT ... RETURNING id`，MySQL 用 `SELECT LAST_INSERT_ID()`，
 SQLite 用 `SELECT last_insert_rowid()`（§10.2 坑 #5）。
 

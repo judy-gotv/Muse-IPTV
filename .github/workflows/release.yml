@@ -29,17 +29,21 @@ jobs:
             pkg_arch: aarch64
             cross_gcc: aarch64-linux-gnu-gcc
             apt: gcc-aarch64-linux-gnu
+            deb_arch: arm64
+            triple: aarch64-linux-gnu
           - os: ubuntu-22.04
             target: armv7-unknown-linux-gnueabihf
             pkg_os: linux
             pkg_arch: armv7
             cross_gcc: arm-linux-gnueabihf-gcc
             apt: gcc-arm-linux-gnueabihf
-          - os: macos-14
+            deb_arch: armhf
+            triple: arm-linux-gnueabihf
+          - os: macos-15
             target: x86_64-apple-darwin
             pkg_os: macos
             pkg_arch: x86_64
-          - os: macos-14
+          - os: macos-15
             target: aarch64-apple-darwin
             pkg_os: macos
             pkg_arch: aarch64
@@ -57,9 +61,18 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
-      - name: install cross gcc (linux)
+      - name: install cross toolchain (linux)
         if: matrix.apt != ''
-        run: sudo apt-get update && sudo apt-get install -y ${{ matrix.apt }}
+        run: |
+          # 交叉编译要目标平台的 OpenSSL（openssl-sys 构建脚本在宿主上找不到
+          # arm64/armhf 的 libssl 就会 exit 101；2026-11-25 Release 实测）。
+          # 装 multiarch 的 libssl-dev，并把目标平台的 pkg-config 写进
+          # GITHUB_ENV，后续 build 步骤用它定位目标 OpenSSL。
+          sudo dpkg --add-architecture ${{ matrix.deb_arch }}
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.apt }} libssl-dev:${{ matrix.deb_arch }} pkg-config-${{ matrix.triple }}
+          echo "PKG_CONFIG=${{ matrix.triple }}-pkg-config" >> "$GITHUB_ENV"
+          echo "PKG_CONFIG_ALLOW_CROSS=1" >> "$GITHUB_ENV"
       - name: build
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.cross_gcc }}

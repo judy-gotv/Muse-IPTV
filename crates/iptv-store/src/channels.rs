@@ -5,7 +5,6 @@
 use super::*;
 use iptv_core::{content_hash, normalize_play_url};
 use iptv_m3u::NormalizedChannel;
-use sqlx::QueryBuilder;
 use std::collections::HashMap;
 
 pub(crate) fn row_to_channel(row: &AnyRow) -> anyhow::Result<Channel> {
@@ -142,10 +141,13 @@ impl Store {
     }
 
     pub async fn get_channel(&self, id: i64) -> anyhow::Result<Option<Channel>> {
-        let row = sqlx::query(&format!("SELECT {CHANNEL_COLS} FROM channel WHERE id = ?"))
-            .bind(id)
-            .fetch_optional(&self.pool)
-            .await?;
+        let row = sqlx::query(&ph(
+            &format!("SELECT {CHANNEL_COLS} FROM channel WHERE id = ?"),
+            self.dialect,
+        ))
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
         row.map(|r| row_to_channel(&r)).transpose()
     }
 
@@ -157,41 +159,47 @@ impl Store {
     ) -> anyhow::Result<Paged<Channel>> {
         let (limit, offset) = page_bounds(q);
         let pat = like_pattern(&q.q);
-        let mut count_qb =
-            QueryBuilder::<sqlx::Any>::new("SELECT COUNT(*) FROM channel WHERE 1 = 1");
-        let mut list_qb = QueryBuilder::<sqlx::Any>::new(format!(
-            "SELECT {CHANNEL_COLS} FROM channel WHERE 1 = 1"
-        ));
+        // 不用 sqlx::QueryBuilder：Any 的 push_bind 在 PG 下仍写 `?`
+        // （见 lib.rs `ph`），这里手拼字符串 + `ph()` + 按顺序 `.bind()`。
+        let mut count_sql = String::from("SELECT COUNT(*) FROM channel WHERE 1 = 1");
+        let mut list_sql = format!("SELECT {CHANNEL_COLS} FROM channel WHERE 1 = 1");
+        if group.is_some() {
+            count_sql.push_str(" AND group_title = ?");
+            list_sql.push_str(" AND group_title = ?");
+        }
+        if status.is_some() {
+            count_sql.push_str(" AND status = ?");
+            list_sql.push_str(" AND status = ?");
+        }
+        if pat.is_some() {
+            count_sql.push_str(" AND (name LIKE ? OR tvg_id LIKE ?)");
+            list_sql.push_str(" AND (name LIKE ? OR tvg_id LIKE ?)");
+        }
+        let count_sql = ph(&count_sql, self.dialect);
+        let mut cq = sqlx::query_scalar::<_, i64>(&count_sql);
         if let Some(g) = group {
-            count_qb.push(" AND group_title = ").push_bind(g);
-            list_qb.push(" AND group_title = ").push_bind(g);
+            cq = cq.bind(g);
         }
         if let Some(s) = &status {
-            let v = channel_status_str(s);
-            count_qb.push(" AND status = ").push_bind(v);
-            list_qb.push(" AND status = ").push_bind(v);
+            cq = cq.bind(channel_status_str(s));
         }
         if let Some(p) = &pat {
-            count_qb
-                .push(" AND (name LIKE ")
-                .push_bind(p)
-                .push(" OR tvg_id LIKE ")
-                .push_bind(p)
-                .push(")");
-            list_qb
-                .push(" AND (name LIKE ")
-                .push_bind(p)
-                .push(" OR tvg_id LIKE ")
-                .push_bind(p)
-                .push(")");
+            cq = cq.bind(p).bind(p);
         }
-        let total: i64 = count_qb.build_query_scalar().fetch_one(&self.pool).await?;
-        list_qb
-            .push(" ORDER BY sort_weight DESC, id ASC LIMIT ")
-            .push_bind(limit)
-            .push(" OFFSET ")
-            .push_bind(offset);
-        let rows = list_qb.build().fetch_all(&self.pool).await?;
+        let total: i64 = cq.fetch_one(&self.pool).await?;
+        list_sql.push_str(" ORDER BY sort_weight DESC, id ASC LIMIT ? OFFSET ?");
+        let list_sql = ph(&list_sql, self.dialect);
+        let mut lq = sqlx::query(&list_sql);
+        if let Some(g) = group {
+            lq = lq.bind(g);
+        }
+        if let Some(s) = &status {
+            lq = lq.bind(channel_status_str(s));
+        }
+        if let Some(p) = &pat {
+            lq = lq.bind(p).bind(p);
+        }
+        let rows = lq.bind(limit).bind(offset).fetch_all(&self.pool).await?;
         let mut items = Vec::with_capacity(rows.len());
         for r in &rows {
             items.push(row_to_channel(r)?);
@@ -222,7 +230,7 @@ impl Store {
         let visibility = req.visibility.clone().unwrap_or(cur.visibility);
         let sort_weight = req.sort_weight.unwrap_or(cur.sort_weight);
         sqlx::query(
-            "UPDATE channel SET tvg_id = ?, name = ?, display_name = ?, logo_url = ?, group_title = ?, status = ?, visibility = ?, sort_weight = ?, updated_at = ? WHERE id = ?",
+            &ph("UPDATE channel SET tvg_id = ?, name = ?, display_name = ?, logo_url = ?, group_title = ?, status = ?, visibility = ?, sort_weight = ?, updated_at = ? WHERE id = ?", self.dialect),
         )
         .bind(tvg_id)
         .bind(name)
@@ -240,11 +248,14 @@ impl Store {
     }
 
     pub async fn delete_channel(&self, id: i64) -> anyhow::Result<bool> {
-        sqlx::query("DELETE FROM channel_endpoint WHERE channel_id = ?")
-            .bind(id)
-            .execute(&self.pool)
-            .await?;
-        let n = sqlx::query("DELETE FROM channel WHERE id = ?")
+        sqlx::query(&ph(
+            "DELETE FROM channel_endpoint WHERE channel_id = ?",
+            self.dialect,
+        ))
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        let n = sqlx::query(&ph("DELETE FROM channel WHERE id = ?", self.dialect))
             .bind(id)
             .execute(&self.pool)
             .await?
@@ -253,9 +264,9 @@ impl Store {
     }
 
     pub async fn list_endpoints(&self, channel_id: i64) -> anyhow::Result<Vec<ChannelEndpoint>> {
-        let rows = sqlx::query(&format!(
+        let rows = sqlx::query(&ph(&format!(
             "SELECT {ENDPOINT_COLS} FROM channel_endpoint WHERE channel_id = ? ORDER BY priority ASC, id ASC"
-        ))
+        ), self.dialect))
         .bind(channel_id)
         .fetch_all(&self.pool)
         .await?;
@@ -268,7 +279,8 @@ impl Store {
 
     /// 门户频道列表：仅 `active` 且 `public` 的频道；按 Token 的
     /// `allowed_groups` 过滤分组，排除 `denied_channels`。
-    /// `allowed_groups` 为空表示未授权任何分组，返回空页。
+    /// `allowed_groups` 为空 = 全部组放行（与 iptv-core::authorize_channel
+    /// 一致）。
     pub async fn list_channels_for_token(
         &self,
         token: &UserToken,
@@ -277,72 +289,85 @@ impl Store {
     ) -> anyhow::Result<Paged<Channel>> {
         let (limit, offset) = page_bounds(q);
         let pat = like_pattern(&q.q);
-        let mut count_qb = QueryBuilder::<sqlx::Any>::new(
+        // 不用 sqlx::QueryBuilder：Any 的 push_bind 在 PG 下仍写 `?`
+        // （见 lib.rs `ph`），这里手拼字符串 + `ph()` + 按顺序 `.bind()`。
+        // count 与 list 两条 SQL 的条件顺序一致，绑定顺序也一致。
+        let mut count_sql = String::from(
             "SELECT COUNT(*) FROM channel WHERE status = 'active' AND visibility = 'public'",
         );
-        let mut list_qb = QueryBuilder::<sqlx::Any>::new(format!(
+        let mut list_sql = format!(
             "SELECT {CHANNEL_COLS} FROM channel WHERE status = 'active' AND visibility = 'public'"
-        ));
+        );
         // 空 allowed_groups = 全部组（与 iptv-core::authorize_channel 一致；
         // 之前这里空列表直接返回 0 条，与播放鉴权放行矛盾）。
         if !token.allowed_groups.is_empty() {
-            count_qb.push(" AND group_title IN (");
-            list_qb.push(" AND group_title IN (");
-            {
-                let mut csep = count_qb.separated(", ");
-                let mut lsep = list_qb.separated(", ");
-                for g in &token.allowed_groups {
-                    csep.push_bind(g);
-                    lsep.push_bind(g);
-                }
-            }
-            count_qb.push(")");
-            list_qb.push(")");
+            push_in_list(
+                &mut count_sql,
+                " AND group_title IN (",
+                token.allowed_groups.len(),
+            );
+            push_in_list(
+                &mut list_sql,
+                " AND group_title IN (",
+                token.allowed_groups.len(),
+            );
         }
         if !token.denied_channels.is_empty() {
-            count_qb.push(" AND id NOT IN (");
-            list_qb.push(" AND id NOT IN (");
-            {
-                let mut csep = count_qb.separated(", ");
-                let mut lsep = list_qb.separated(", ");
-                for id in &token.denied_channels {
-                    csep.push_bind(*id);
-                    lsep.push_bind(*id);
-                }
-            }
-            count_qb.push(")");
-            list_qb.push(")");
+            push_in_list(
+                &mut count_sql,
+                " AND id NOT IN (",
+                token.denied_channels.len(),
+            );
+            push_in_list(
+                &mut list_sql,
+                " AND id NOT IN (",
+                token.denied_channels.len(),
+            );
+        }
+        if group.is_some() {
+            count_sql.push_str(" AND group_title = ?");
+            list_sql.push_str(" AND group_title = ?");
+        }
+        if pat.is_some() {
+            // 搜索同时匹配原始名与译名（§12.7：channel_i18n 有译名时也命中）。
+            count_sql.push_str(
+                " AND (name LIKE ? OR tvg_id LIKE ? OR id IN (SELECT channel_id FROM channel_i18n WHERE name LIKE ?))",
+            );
+            list_sql.push_str(
+                " AND (name LIKE ? OR tvg_id LIKE ? OR id IN (SELECT channel_id FROM channel_i18n WHERE name LIKE ?))",
+            );
+        }
+        let count_sql = ph(&count_sql, self.dialect);
+        let mut cq = sqlx::query_scalar::<_, i64>(&count_sql);
+        for g in &token.allowed_groups {
+            cq = cq.bind(g);
+        }
+        for id in &token.denied_channels {
+            cq = cq.bind(*id);
         }
         if let Some(g) = group {
-            count_qb.push(" AND group_title = ").push_bind(g);
-            list_qb.push(" AND group_title = ").push_bind(g);
+            cq = cq.bind(g);
         }
         if let Some(p) = &pat {
-            // 搜索同时匹配原始名与译名（§12.7：channel_i18n 有译名时也命中）。
-            count_qb
-                .push(" AND (name LIKE ")
-                .push_bind(p)
-                .push(" OR tvg_id LIKE ")
-                .push_bind(p)
-                .push(" OR id IN (SELECT channel_id FROM channel_i18n WHERE name LIKE ")
-                .push_bind(p)
-                .push("))");
-            list_qb
-                .push(" AND (name LIKE ")
-                .push_bind(p)
-                .push(" OR tvg_id LIKE ")
-                .push_bind(p)
-                .push(" OR id IN (SELECT channel_id FROM channel_i18n WHERE name LIKE ")
-                .push_bind(p)
-                .push("))");
+            cq = cq.bind(p).bind(p).bind(p);
         }
-        let total: i64 = count_qb.build_query_scalar().fetch_one(&self.pool).await?;
-        list_qb
-            .push(" ORDER BY sort_weight DESC, id ASC LIMIT ")
-            .push_bind(limit)
-            .push(" OFFSET ")
-            .push_bind(offset);
-        let rows = list_qb.build().fetch_all(&self.pool).await?;
+        let total: i64 = cq.fetch_one(&self.pool).await?;
+        list_sql.push_str(" ORDER BY sort_weight DESC, id ASC LIMIT ? OFFSET ?");
+        let list_sql = ph(&list_sql, self.dialect);
+        let mut lq = sqlx::query(&list_sql);
+        for g in &token.allowed_groups {
+            lq = lq.bind(g);
+        }
+        for id in &token.denied_channels {
+            lq = lq.bind(*id);
+        }
+        if let Some(g) = group {
+            lq = lq.bind(g);
+        }
+        if let Some(p) = &pat {
+            lq = lq.bind(p).bind(p).bind(p);
+        }
+        let rows = lq.bind(limit).bind(offset).fetch_all(&self.pool).await?;
         let mut items = Vec::with_capacity(rows.len());
         for r in &rows {
             items.push(row_to_channel(r)?);
@@ -372,8 +397,9 @@ impl Store {
         let mut outcome = SyncOutcome::default();
 
         // 现有频道 + 各自主地址。
-        let existing_rows = sqlx::query(&format!(
-            "SELECT {CHANNEL_COLS} FROM channel WHERE source_id = ? ORDER BY id ASC"
+        let existing_rows = sqlx::query(&ph(
+            &format!("SELECT {CHANNEL_COLS} FROM channel WHERE source_id = ? ORDER BY id ASC"),
+            self.dialect,
         ))
         .bind(source_id)
         .fetch_all(&self.pool)
@@ -384,17 +410,17 @@ impl Store {
         }
         let mut endpoints: HashMap<i64, Vec<ChannelEndpoint>> = HashMap::new();
         if !existing.is_empty() {
-            let mut qb = QueryBuilder::<sqlx::Any>::new(format!(
-                "SELECT {ENDPOINT_COLS} FROM channel_endpoint WHERE channel_id IN ("
-            ));
-            {
-                let mut sep = qb.separated(", ");
-                for ch in &existing {
-                    sep.push_bind(ch.id);
-                }
+            // 不用 sqlx::QueryBuilder（见 lib.rs `ph`）：手拼 IN 列表。
+            let mut sql =
+                format!("SELECT {ENDPOINT_COLS} FROM channel_endpoint WHERE channel_id IN (");
+            push_in_list(&mut sql, "", existing.len());
+            sql.push_str(" ORDER BY priority ASC");
+            let sql = ph(&sql, self.dialect);
+            let mut q = sqlx::query(&sql);
+            for ch in &existing {
+                q = q.bind(ch.id);
             }
-            qb.push(") ORDER BY priority ASC");
-            for r in qb.build().fetch_all(&self.pool).await? {
+            for r in q.fetch_all(&self.pool).await? {
                 let e = row_to_endpoint(&r)?;
                 endpoints.entry(e.channel_id).or_default().push(e);
             }
@@ -447,7 +473,7 @@ impl Store {
                         channel_status_str(&cur.status)
                     };
                     sqlx::query(
-                        "UPDATE channel SET name = ?, logo_url = ?, group_title = ?, content_hash = ?, status = ?, updated_at = ? WHERE id = ?",
+                        &ph("UPDATE channel SET name = ?, logo_url = ?, group_title = ?, content_hash = ?, status = ?, updated_at = ? WHERE id = ?", self.dialect),
                     )
                     .bind(&item.name)
                     .bind(item.logo.clone())
@@ -464,9 +490,10 @@ impl Store {
                             .get(&cur.id)
                             .and_then(|v| v.iter().find(|e| e.is_primary))
                         {
-                            sqlx::query(
+                            sqlx::query(&ph(
                                 "UPDATE channel_endpoint SET url = ?, protocol = ? WHERE id = ?",
-                            )
+                                self.dialect,
+                            ))
                             .bind(&item.url)
                             .bind(proto)
                             .bind(ep.id)
@@ -553,16 +580,19 @@ impl Store {
             }
             // 注意：OnMissing 未派生 Copy，循环里用 == 比较，不移出字段。
             if source.on_missing == iptv_dto::OnMissing::Delete {
-                sqlx::query("DELETE FROM channel_endpoint WHERE channel_id = ?")
-                    .bind(cur.id)
-                    .execute(&self.pool)
-                    .await?;
-                sqlx::query("DELETE FROM channel WHERE id = ?")
+                sqlx::query(&ph(
+                    "DELETE FROM channel_endpoint WHERE channel_id = ?",
+                    self.dialect,
+                ))
+                .bind(cur.id)
+                .execute(&self.pool)
+                .await?;
+                sqlx::query(&ph("DELETE FROM channel WHERE id = ?", self.dialect))
                     .bind(cur.id)
                     .execute(&self.pool)
                     .await?;
             } else {
-                sqlx::query("UPDATE channel SET status = 'disabled', updated_at = ? WHERE id = ? AND status = 'active'")
+                sqlx::query(&ph("UPDATE channel SET status = 'disabled', updated_at = ? WHERE id = ? AND status = 'active'", self.dialect))
                     .bind(epoch(now))
                     .bind(cur.id)
                     .execute(&self.pool)

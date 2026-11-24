@@ -70,8 +70,9 @@ impl Store {
         &self,
         session_uid: &str,
     ) -> anyhow::Result<Option<PlaybackSession>> {
-        let row = sqlx::query(&format!(
-            "SELECT {PLAYBACK_COLS} FROM playback_session WHERE session_uid = ?"
+        let row = sqlx::query(&ph(
+            &format!("SELECT {PLAYBACK_COLS} FROM playback_session WHERE session_uid = ?"),
+            self.dialect,
         ))
         .bind(session_uid)
         .fetch_optional(&self.pool)
@@ -89,9 +90,9 @@ impl Store {
             sqlx::query_scalar("SELECT COUNT(*) FROM playback_session WHERE status = 'active'")
                 .fetch_one(&self.pool)
                 .await?;
-        let rows = sqlx::query(&format!(
+        let rows = sqlx::query(&ph(&format!(
             "SELECT {PLAYBACK_COLS} FROM playback_session WHERE status = 'active' ORDER BY started_at DESC, id DESC LIMIT ? OFFSET ?"
-        ))
+        ), self.dialect))
         .bind(limit)
         .bind(offset)
         .fetch_all(&self.pool)
@@ -114,7 +115,7 @@ impl Store {
         now: DateTime<Utc>,
     ) -> anyhow::Result<bool> {
         let n = sqlx::query(
-            "UPDATE playback_session SET last_heartbeat_at = ? WHERE session_uid = ? AND status = 'active'",
+            &ph("UPDATE playback_session SET last_heartbeat_at = ? WHERE session_uid = ? AND status = 'active'", self.dialect),
         )
         .bind(epoch(now))
         .bind(session_uid)
@@ -131,7 +132,7 @@ impl Store {
         status: &str,
     ) -> anyhow::Result<bool> {
         let n = sqlx::query(
-            "UPDATE playback_session SET status = ?, ended_at = ? WHERE session_uid = ? AND status = 'active'",
+            &ph("UPDATE playback_session SET status = ?, ended_at = ? WHERE session_uid = ? AND status = 'active'", self.dialect),
         )
         .bind(status)
         .bind(epoch(now))
@@ -146,9 +147,9 @@ impl Store {
         &self,
         token_id: i64,
     ) -> anyhow::Result<Vec<PlaybackSession>> {
-        let rows = sqlx::query(&format!(
+        let rows = sqlx::query(&ph(&format!(
             "SELECT {PLAYBACK_COLS} FROM playback_session WHERE token_id = ? AND status = 'active' ORDER BY started_at ASC"
-        ))
+        ), self.dialect))
         .bind(token_id)
         .fetch_all(&self.pool)
         .await?;
@@ -163,7 +164,7 @@ impl Store {
     /// 返回过期条数；`ended_at` 写为 cutoff（即最后一次心跳的超时点）。
     pub async fn expire_stale_sessions(&self, cutoff: DateTime<Utc>) -> anyhow::Result<u64> {
         let n = sqlx::query(
-            "UPDATE playback_session SET status = 'expired', ended_at = ? WHERE status = 'active' AND last_heartbeat_at < ?",
+            &ph("UPDATE playback_session SET status = 'expired', ended_at = ? WHERE status = 'active' AND last_heartbeat_at < ?", self.dialect),
         )
         .bind(epoch(cutoff))
         .bind(epoch(cutoff))
@@ -179,14 +180,16 @@ impl Store {
         q: &PageQuery,
     ) -> anyhow::Result<Paged<PlaybackEvent>> {
         let (limit, offset) = page_bounds(q);
-        let total: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM playback_event WHERE token_id = ?")
-                .bind(token_id)
-                .fetch_one(&self.pool)
-                .await?;
-        let rows = sqlx::query(&format!(
-            "SELECT {EVENT_COLS} FROM playback_event WHERE token_id = ? ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?"
+        let total: i64 = sqlx::query_scalar(&ph(
+            "SELECT COUNT(*) FROM playback_event WHERE token_id = ?",
+            self.dialect,
         ))
+        .bind(token_id)
+        .fetch_one(&self.pool)
+        .await?;
+        let rows = sqlx::query(&ph(&format!(
+            "SELECT {EVENT_COLS} FROM playback_event WHERE token_id = ? ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?"
+        ), self.dialect))
         .bind(token_id)
         .bind(limit)
         .bind(offset)
@@ -207,7 +210,7 @@ impl Store {
     pub async fn record_event(&self, ev: &NewPlaybackEvent) -> anyhow::Result<()> {
         let now = Utc::now();
         sqlx::query(
-            "INSERT INTO playback_event (session_uid, token_id, channel_id, event_type, detail, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            &ph("INSERT INTO playback_event (session_uid, token_id, channel_id, event_type, detail, created_at) VALUES (?, ?, ?, ?, ?, ?)", self.dialect),
         )
         .bind(&ev.session_uid)
         .bind(ev.token_id)

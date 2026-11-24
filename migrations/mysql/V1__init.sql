@@ -11,8 +11,8 @@ CREATE TABLE IF NOT EXISTS app_user (
     email TEXT,
     phone TEXT,
     plan_id BIGINT,
-    status TEXT NOT NULL DEFAULT 'active',
-    locale TEXT NOT NULL DEFAULT 'zh-Hant-TW',
+    status VARCHAR(32) NOT NULL DEFAULT 'active',
+    locale VARCHAR(16) NOT NULL DEFAULT 'zh-Hant-TW',
     remark TEXT,
     expires_at BIGINT,
     created_at BIGINT NOT NULL,
@@ -31,9 +31,9 @@ CREATE TABLE IF NOT EXISTS user_token (
     max_bound_devices INTEGER NOT NULL DEFAULT 1,
     status VARCHAR(16) NOT NULL DEFAULT 'active',
     expires_at BIGINT,
-    allowed_groups TEXT NOT NULL DEFAULT '[]',
-    denied_channels TEXT NOT NULL DEFAULT '[]',
-    features TEXT NOT NULL DEFAULT '{}',
+    allowed_groups VARCHAR(4096) NOT NULL DEFAULT '[]',
+    denied_channels VARCHAR(4096) NOT NULL DEFAULT '[]',
+    features VARCHAR(4096) NOT NULL DEFAULT '{}',
     created_at BIGINT NOT NULL,
     updated_at BIGINT NOT NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
@@ -69,7 +69,7 @@ CREATE TABLE IF NOT EXISTS playlist_source (
     name VARCHAR(255) NOT NULL,
     url TEXT,
     sync_interval_sec BIGINT NOT NULL DEFAULT 3600,
-    http_headers TEXT NOT NULL DEFAULT '{}',
+    http_headers VARCHAR(4096) NOT NULL DEFAULT '{}',
     epg_url TEXT,
     on_missing VARCHAR(16) NOT NULL DEFAULT 'disable',
     auto_enable_new INTEGER NOT NULL DEFAULT 1,
@@ -187,7 +187,7 @@ CREATE TABLE IF NOT EXISTS playback_event (
     token_id BIGINT NOT NULL,
     channel_id BIGINT NOT NULL,
     event_type VARCHAR(32) NOT NULL,
-    detail TEXT NOT NULL DEFAULT '{}',
+    detail VARCHAR(4096) NOT NULL DEFAULT '{}',
     created_at BIGINT NOT NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
@@ -224,7 +224,7 @@ CREATE TABLE IF NOT EXISTS plan (
     name VARCHAR(128) NOT NULL UNIQUE,
     max_concurrent_sessions INTEGER NOT NULL DEFAULT 1,
     max_bound_devices INTEGER NOT NULL DEFAULT 1,
-    channel_groups TEXT NOT NULL DEFAULT '[]',
+    channel_groups VARCHAR(4096) NOT NULL DEFAULT '[]',
     duration_days INTEGER NOT NULL DEFAULT 30,
     price_cents BIGINT NOT NULL DEFAULT 0,
     currency VARCHAR(8) NOT NULL DEFAULT 'CNY',

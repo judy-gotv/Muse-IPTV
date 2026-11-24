@@ -45,9 +45,10 @@ impl Store {
             None::<i64>
         )?;
         // 设备绑定：同一 (token, device) 只记一条，刷新 last_seen_at。
-        let n = sqlx::query(
+        let n = sqlx::query(&ph(
             "UPDATE device_binding SET last_seen_at = ? WHERE token_id = ? AND device_id = ?",
-        )
+            self.dialect,
+        ))
         .bind(epoch(now))
         .bind(token_id)
         .bind(device_id)
@@ -56,7 +57,7 @@ impl Store {
         .rows_affected();
         if n == 0 {
             sqlx::query(
-                "INSERT INTO device_binding (token_id, device_id, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?)",
+                &ph("INSERT INTO device_binding (token_id, device_id, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?)", self.dialect),
             )
             .bind(token_id)
             .bind(device_id)
@@ -74,8 +75,9 @@ impl Store {
         &self,
         hash: &[u8; 32],
     ) -> anyhow::Result<Option<PortalSession>> {
-        let row = sqlx::query(&format!(
-            "SELECT {PORTAL_COLS} FROM portal_session WHERE session_hash = ?"
+        let row = sqlx::query(&ph(
+            &format!("SELECT {PORTAL_COLS} FROM portal_session WHERE session_hash = ?"),
+            self.dialect,
         ))
         .bind(hash.to_vec())
         .fetch_optional(&self.pool)
@@ -85,9 +87,10 @@ impl Store {
 
     pub async fn revoke_portal_session(&self, id: i64) -> anyhow::Result<bool> {
         let now = Utc::now();
-        let n = sqlx::query(
+        let n = sqlx::query(&ph(
             "UPDATE portal_session SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL",
-        )
+            self.dialect,
+        ))
         .bind(epoch(now))
         .bind(id)
         .execute(&self.pool)
@@ -105,7 +108,7 @@ impl Store {
         let n = match except_id {
             Some(except) => {
                 sqlx::query(
-                    "UPDATE portal_session SET revoked_at = ? WHERE token_id = ? AND revoked_at IS NULL AND id <> ?",
+                    &ph("UPDATE portal_session SET revoked_at = ? WHERE token_id = ? AND revoked_at IS NULL AND id <> ?", self.dialect),
                 )
                 .bind(epoch(now))
                 .bind(token_id)
@@ -116,7 +119,7 @@ impl Store {
             }
             None => {
                 sqlx::query(
-                    "UPDATE portal_session SET revoked_at = ? WHERE token_id = ? AND revoked_at IS NULL",
+                    &ph("UPDATE portal_session SET revoked_at = ? WHERE token_id = ? AND revoked_at IS NULL", self.dialect),
                 )
                 .bind(epoch(now))
                 .bind(token_id)
@@ -129,9 +132,9 @@ impl Store {
     }
 
     pub async fn list_portal_sessions(&self, token_id: i64) -> anyhow::Result<Vec<PortalSession>> {
-        let rows = sqlx::query(&format!(
+        let rows = sqlx::query(&ph(&format!(
             "SELECT {PORTAL_COLS} FROM portal_session WHERE token_id = ? AND revoked_at IS NULL ORDER BY last_seen_at DESC"
-        ))
+        ), self.dialect))
         .bind(token_id)
         .fetch_all(&self.pool)
         .await?;
@@ -149,7 +152,7 @@ impl Store {
         expires_at: DateTime<Utc>,
     ) -> anyhow::Result<()> {
         sqlx::query(
-            "UPDATE portal_session SET last_seen_at = ?, expires_at = ? WHERE id = ? AND revoked_at IS NULL",
+            &ph("UPDATE portal_session SET last_seen_at = ?, expires_at = ? WHERE id = ? AND revoked_at IS NULL", self.dialect),
         )
         .bind(epoch(now))
         .bind(epoch(expires_at))
@@ -160,11 +163,12 @@ impl Store {
     }
 
     pub async fn bound_device_count(&self, token_id: i64) -> anyhow::Result<i64> {
-        Ok(
-            sqlx::query_scalar("SELECT COUNT(*) FROM device_binding WHERE token_id = ?")
-                .bind(token_id)
-                .fetch_one(&self.pool)
-                .await?,
-        )
+        Ok(sqlx::query_scalar(&ph(
+            "SELECT COUNT(*) FROM device_binding WHERE token_id = ?",
+            self.dialect,
+        ))
+        .bind(token_id)
+        .fetch_one(&self.pool)
+        .await?)
     }
 }

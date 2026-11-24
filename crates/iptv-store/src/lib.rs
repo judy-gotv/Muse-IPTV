@@ -10,7 +10,12 @@
 //!   epoch 秒，`JSONB` / `JSON` 映射为 `TEXT`（JSON 字符串），`INET` 映射为
 //!   `TEXT`。主键与索引仍按方言区分（PG `BIGSERIAL` 与部分索引、MySQL
 //!   `BIGINT AUTO_INCREMENT`、SQLite `INTEGER PRIMARY KEY AUTOINCREMENT`）。
-//! - 占位符一律 `?`，由 sqlx Any 按方言转 `$n`。
+//! - 占位符：SQL 文本里一律写 `?`，执行前由 `ph()` 按方言改写
+//!   （PostgreSQL 只认 `$1..$n`；sqlx::Any **不会**替我们改写，原样发
+//!   过去 PG 报 `syntax error at or near ","`，2026-11-25 CI 契约测试
+//!   实测）。`sqlx::query` / `query_scalar` 调用点一律包 `ph()`；
+//!   `QueryBuilder::push_bind` 同样写 `?`，故列表查询不用它，见 `DynSql`
+//!   模式（手拼字符串 + `ph()` + 按顺序 `.bind()`）。
 //! - 布尔存 `INTEGER` 0/1，避免三驱动的 bool 编解码差异。
 //! - 新增行取 id：PG 用 `INSERT ... RETURNING id`，MySQL 用
 //!   `SELECT LAST_INSERT_ID()`，SQLite 用 `SELECT last_insert_rowid()`
@@ -183,6 +188,60 @@ impl Store {
     }
 }
 
+/// 把 SQL 文本里的 `?` 占位符按方言改写：PostgreSQL 要 `$1..$n`，
+/// MySQL/SQLite 保持 `?`。
+///
+/// sqlx 0.8 的 `Any` 驱动不改写占位符（源码核实：`AnyConnection` 把 SQL
+/// 原样交给后端驱动，`AnyArguments` 也没有改写 `format_placeholder` 的
+/// 实现），所以带 `?` 的 SQL 发到 PG 会报 `syntax error at or near ","`。
+/// 改写时跳过单引号字符串字面量里的 `?`（如 `'[]'`、`'active'`）；
+/// SQL 文本里不得在字符串字面量外写裸 `?`（JSON `?` 运算符等三方言
+/// 也不通用，应用层不要用）。
+pub(crate) fn ph(sql: &str, dialect: Dialect) -> std::borrow::Cow<'_, str> {
+    use std::borrow::Cow;
+    if dialect != Dialect::Postgres || !sql.contains('?') {
+        return Cow::Borrowed(sql);
+    }
+    let mut out = String::with_capacity(sql.len() + 8);
+    let mut n = 0usize;
+    let mut chars = sql.chars();
+    while let Some(c) = chars.next() {
+        if c == '\'' {
+            // 单引号字符串：原样抄到闭合引号，'' 是转义的单引号。
+            out.push(c);
+            while let Some(c2) = chars.next() {
+                out.push(c2);
+                if c2 == '\'' {
+                    if chars.clone().next() == Some('\'') {
+                        out.push(chars.next().unwrap());
+                    } else {
+                        break;
+                    }
+                }
+            }
+        } else if c == '?' {
+            n += 1;
+            out.push('$');
+            out.push_str(&n.to_string());
+        } else {
+            out.push(c);
+        }
+    }
+    Cow::Owned(out)
+}
+
+/// 往动态 SQL 里追加 `... IN (?, ?, ...)` 片段（n 个占位符）。
+pub(crate) fn push_in_list(sql: &mut String, prefix: &str, n: usize) {
+    sql.push_str(prefix);
+    for i in 0..n {
+        if i > 0 {
+            sql.push_str(", ");
+        }
+        sql.push('?');
+    }
+    sql.push(')');
+}
+
 /// 新增行取 id（§10.2 坑 #5）。
 /// PG 用 `INSERT ... RETURNING id`；MySQL/SQLite 在同一连接上执行
 /// INSERT 后取 `LAST_INSERT_ID()` / `last_insert_rowid()`（连接级函数，
@@ -191,7 +250,10 @@ macro_rules! insert_id {
     ($store:expr, $sql:literal, $($arg:expr),* $(,)?) => {{
         match $store.dialect {
             Dialect::Postgres => {
-                sqlx::query_scalar::<_, i64>(concat!($sql, " RETURNING id"))
+                sqlx::query_scalar::<_, i64>(&ph(
+                    concat!($sql, " RETURNING id"),
+                    $store.dialect,
+                ))
                     $(.bind($arg))*
                     .fetch_one(&$store.pool)
                     .await
@@ -349,4 +411,42 @@ pub struct EpgProgramInput {
     pub category: Option<String>,
     pub start_at: DateTime<Utc>,
     pub stop_at: DateTime<Utc>,
+}
+
+#[cfg(test)]
+mod ph_tests {
+    use super::*;
+
+    #[test]
+    fn ph_rewrites_postgres_placeholders() {
+        assert_eq!(
+            ph("SELECT * FROM t WHERE a = ? AND b = ?", Dialect::Postgres).as_ref(),
+            "SELECT * FROM t WHERE a = $1 AND b = $2"
+        );
+        // 字符串字面量里的 ? 不动。
+        assert_eq!(
+            ph("SELECT * FROM t WHERE a = '?' AND b = ?", Dialect::Postgres).as_ref(),
+            "SELECT * FROM t WHERE a = '?' AND b = $1"
+        );
+        // '' 转义的单引号不提前闭合字符串。
+        assert_eq!(
+            ph(
+                "SELECT * FROM t WHERE a = 'it''s ?' AND b = ?",
+                Dialect::Postgres
+            )
+            .as_ref(),
+            "SELECT * FROM t WHERE a = 'it''s ?' AND b = $1"
+        );
+        // MySQL / SQLite 保持原样。
+        assert_eq!(
+            ph("SELECT * FROM t WHERE a = ?", Dialect::MySql).as_ref(),
+            "SELECT * FROM t WHERE a = ?"
+        );
+        assert_eq!(
+            ph("SELECT * FROM t WHERE a = ?", Dialect::Sqlite).as_ref(),
+            "SELECT * FROM t WHERE a = ?"
+        );
+        // 无占位符时原样返回。
+        assert_eq!(ph("SELECT 1", Dialect::Postgres).as_ref(), "SELECT 1");
+    }
 }

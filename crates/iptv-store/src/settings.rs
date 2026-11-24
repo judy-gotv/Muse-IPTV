@@ -7,10 +7,13 @@ use super::*;
 
 impl Store {
     pub async fn get_setting(&self, key: &str) -> anyhow::Result<Option<serde_json::Value>> {
-        let row = sqlx::query("SELECT setting_value FROM system_setting WHERE setting_key = ?")
-            .bind(key)
-            .fetch_optional(&self.pool)
-            .await?;
+        let row = sqlx::query(&ph(
+            "SELECT setting_value FROM system_setting WHERE setting_key = ?",
+            self.dialect,
+        ))
+        .bind(key)
+        .fetch_optional(&self.pool)
+        .await?;
         match row {
             Some(r) => {
                 let s: String = r.try_get("setting_value")?;
@@ -24,9 +27,10 @@ impl Store {
     /// §10.2 坑 #5 同源问题；单键更新竞态可接受，见 `set_setting` 注释）。
     pub async fn set_setting(&self, key: &str, value: &serde_json::Value) -> anyhow::Result<()> {
         let now = Utc::now();
-        let n = sqlx::query(
+        let n = sqlx::query(&ph(
             "UPDATE system_setting SET setting_value = ?, updated_at = ? WHERE setting_key = ?",
-        )
+            self.dialect,
+        ))
         .bind(json_text(value))
         .bind(epoch(now))
         .bind(key)
@@ -35,7 +39,7 @@ impl Store {
         .rows_affected();
         if n == 0 {
             sqlx::query(
-                "INSERT INTO system_setting (setting_key, setting_value, updated_at) VALUES (?, ?, ?)",
+                &ph("INSERT INTO system_setting (setting_key, setting_value, updated_at) VALUES (?, ?, ?)", self.dialect),
             )
             .bind(key)
             .bind(json_text(value))

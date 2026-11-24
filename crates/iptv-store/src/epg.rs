@@ -42,8 +42,9 @@ impl Store {
             None::<String>,
             epoch(now)
         )?;
-        let row = sqlx::query(&format!(
-            "SELECT {EPG_SOURCE_COLS} FROM epg_source WHERE id = ?"
+        let row = sqlx::query(&ph(
+            &format!("SELECT {EPG_SOURCE_COLS} FROM epg_source WHERE id = ?"),
+            self.dialect,
         ))
         .bind(id)
         .fetch_one(&self.pool)
@@ -52,8 +53,9 @@ impl Store {
     }
 
     pub async fn list_epg_sources(&self) -> anyhow::Result<Vec<EpgSource>> {
-        let rows = sqlx::query(&format!(
-            "SELECT {EPG_SOURCE_COLS} FROM epg_source ORDER BY id ASC"
+        let rows = sqlx::query(&ph(
+            &format!("SELECT {EPG_SOURCE_COLS} FROM epg_source ORDER BY id ASC"),
+            self.dialect,
         ))
         .fetch_all(&self.pool)
         .await?;
@@ -70,13 +72,16 @@ impl Store {
         let now = Utc::now();
         let mut n: u64 = 0;
         for item in &items {
-            sqlx::query("DELETE FROM epg_program WHERE channel_id = ? AND start_at = ?")
-                .bind(item.channel_id)
-                .bind(epoch(item.start_at))
-                .execute(&self.pool)
-                .await?;
+            sqlx::query(&ph(
+                "DELETE FROM epg_program WHERE channel_id = ? AND start_at = ?",
+                self.dialect,
+            ))
+            .bind(item.channel_id)
+            .bind(epoch(item.start_at))
+            .execute(&self.pool)
+            .await?;
             sqlx::query(
-                "INSERT INTO epg_program (channel_id, tvg_id, title, description, category, start_at, stop_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                &ph("INSERT INTO epg_program (channel_id, tvg_id, title, description, category, start_at, stop_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", self.dialect),
             )
             .bind(item.channel_id)
             .bind(item.tvg_id.clone())
@@ -99,9 +104,9 @@ impl Store {
         from: DateTime<Utc>,
         to: DateTime<Utc>,
     ) -> anyhow::Result<Vec<EpgProgram>> {
-        let rows = sqlx::query(&format!(
+        let rows = sqlx::query(&ph(&format!(
             "SELECT {PROGRAM_COLS} FROM epg_program WHERE channel_id = ? AND start_at >= ? AND start_at < ? ORDER BY start_at ASC"
-        ))
+        ), self.dialect))
         .bind(channel_id)
         .bind(epoch(from))
         .bind(epoch(to))
@@ -119,9 +124,9 @@ impl Store {
         channel_id: i64,
         now: DateTime<Utc>,
     ) -> anyhow::Result<Option<EpgProgram>> {
-        let row = sqlx::query(&format!(
+        let row = sqlx::query(&ph(&format!(
             "SELECT {PROGRAM_COLS} FROM epg_program WHERE channel_id = ? AND start_at <= ? AND stop_at > ? ORDER BY start_at DESC LIMIT 1"
-        ))
+        ), self.dialect))
         .bind(channel_id)
         .bind(epoch(now))
         .bind(epoch(now))

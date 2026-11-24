@@ -67,10 +67,13 @@ impl Store {
             epoch(now),
             epoch(now)
         )?;
-        let row = sqlx::query(&format!("SELECT {ADMIN_COLS} FROM admin_user WHERE id = ?"))
-            .bind(id)
-            .fetch_one(&self.pool)
-            .await?;
+        let row = sqlx::query(&ph(
+            &format!("SELECT {ADMIN_COLS} FROM admin_user WHERE id = ?"),
+            self.dialect,
+        ))
+        .bind(id)
+        .fetch_one(&self.pool)
+        .await?;
         row_to_admin(&row)
     }
 
@@ -80,8 +83,11 @@ impl Store {
         &self,
         username: &str,
     ) -> anyhow::Result<Option<(AdminUser, String, Option<String>)>> {
-        let row = sqlx::query(&format!(
+        let row = sqlx::query(&ph(
+            &format!(
             "SELECT {ADMIN_COLS}, password_hash, totp_secret FROM admin_user WHERE username = ?"
+        ),
+            self.dialect,
         ))
         .bind(username)
         .fetch_optional(&self.pool)
@@ -98,8 +104,9 @@ impl Store {
     }
 
     pub async fn list_admins(&self) -> anyhow::Result<Vec<AdminUser>> {
-        let rows = sqlx::query(&format!(
-            "SELECT {ADMIN_COLS} FROM admin_user ORDER BY id ASC"
+        let rows = sqlx::query(&ph(
+            &format!("SELECT {ADMIN_COLS} FROM admin_user ORDER BY id ASC"),
+            self.dialect,
         ))
         .fetch_all(&self.pool)
         .await?;
@@ -111,11 +118,14 @@ impl Store {
     }
 
     pub async fn set_admin_totp(&self, id: i64, secret: &str) -> anyhow::Result<()> {
-        sqlx::query("UPDATE admin_user SET totp_secret = ?, totp_enabled = 1 WHERE id = ?")
-            .bind(secret)
-            .bind(id)
-            .execute(&self.pool)
-            .await?;
+        sqlx::query(&ph(
+            "UPDATE admin_user SET totp_secret = ?, totp_enabled = 1 WHERE id = ?",
+            self.dialect,
+        ))
+        .bind(secret)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -144,36 +154,58 @@ impl Store {
         to: Option<DateTime<Utc>>,
         q: &PageQuery,
     ) -> anyhow::Result<Paged<AuditLog>> {
-        use sqlx::QueryBuilder;
         let (limit, offset) = page_bounds(q);
-        let mut count_qb =
-            QueryBuilder::<sqlx::Any>::new("SELECT COUNT(*) FROM audit_log WHERE 1 = 1");
-        let mut list_qb = QueryBuilder::<sqlx::Any>::new(format!(
-            "SELECT {AUDIT_COLS} FROM audit_log WHERE 1 = 1"
-        ));
+        // 不用 sqlx::QueryBuilder：Any 的 push_bind 在 PG 下仍写 `?`
+        // （见 lib.rs `ph`），这里手拼字符串 + `ph()` + 按顺序 `.bind()`。
+        let mut count_sql = String::from("SELECT COUNT(*) FROM audit_log WHERE 1 = 1");
+        let mut list_sql = format!("SELECT {AUDIT_COLS} FROM audit_log WHERE 1 = 1");
+        if actor.is_some() {
+            count_sql.push_str(" AND actor = ?");
+            list_sql.push_str(" AND actor = ?");
+        }
+        if action.is_some() {
+            count_sql.push_str(" AND action = ?");
+            list_sql.push_str(" AND action = ?");
+        }
+        if from.is_some() {
+            count_sql.push_str(" AND created_at >= ?");
+            list_sql.push_str(" AND created_at >= ?");
+        }
+        if to.is_some() {
+            count_sql.push_str(" AND created_at <= ?");
+            list_sql.push_str(" AND created_at <= ?");
+        }
+        let count_sql = ph(&count_sql, self.dialect);
+        let mut cq = sqlx::query_scalar::<_, i64>(&count_sql);
         if let Some(a) = actor {
-            count_qb.push(" AND actor = ").push_bind(a);
-            list_qb.push(" AND actor = ").push_bind(a);
+            cq = cq.bind(a);
         }
         if let Some(a) = action {
-            count_qb.push(" AND action = ").push_bind(a);
-            list_qb.push(" AND action = ").push_bind(a);
+            cq = cq.bind(a);
         }
         if let Some(f) = from {
-            count_qb.push(" AND created_at >= ").push_bind(epoch(f));
-            list_qb.push(" AND created_at >= ").push_bind(epoch(f));
+            cq = cq.bind(epoch(f));
         }
         if let Some(t) = to {
-            count_qb.push(" AND created_at <= ").push_bind(epoch(t));
-            list_qb.push(" AND created_at <= ").push_bind(epoch(t));
+            cq = cq.bind(epoch(t));
         }
-        let total: i64 = count_qb.build_query_scalar().fetch_one(&self.pool).await?;
-        list_qb
-            .push(" ORDER BY created_at DESC, id DESC LIMIT ")
-            .push_bind(limit)
-            .push(" OFFSET ")
-            .push_bind(offset);
-        let rows = list_qb.build().fetch_all(&self.pool).await?;
+        let total: i64 = cq.fetch_one(&self.pool).await?;
+        list_sql.push_str(" ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?");
+        let list_sql = ph(&list_sql, self.dialect);
+        let mut lq = sqlx::query(&list_sql);
+        if let Some(a) = actor {
+            lq = lq.bind(a);
+        }
+        if let Some(a) = action {
+            lq = lq.bind(a);
+        }
+        if let Some(f) = from {
+            lq = lq.bind(epoch(f));
+        }
+        if let Some(t) = to {
+            lq = lq.bind(epoch(t));
+        }
+        let rows = lq.bind(limit).bind(offset).fetch_all(&self.pool).await?;
         let mut items = Vec::with_capacity(rows.len());
         for r in &rows {
             items.push(row_to_audit(r)?);
@@ -188,11 +220,14 @@ impl Store {
 
     /// 审计保留 180 天（§13）：删掉 `before` 之前的审计，返回删除条数。
     pub async fn delete_old_audit(&self, before: DateTime<Utc>) -> anyhow::Result<u64> {
-        let n = sqlx::query("DELETE FROM audit_log WHERE created_at < ?")
-            .bind(epoch(before))
-            .execute(&self.pool)
-            .await?
-            .rows_affected();
+        let n = sqlx::query(&ph(
+            "DELETE FROM audit_log WHERE created_at < ?",
+            self.dialect,
+        ))
+        .bind(epoch(before))
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
         Ok(n)
     }
 
@@ -201,7 +236,7 @@ impl Store {
         let now = Utc::now();
         let now_e = epoch(now);
         let online_users: i64 = sqlx::query_scalar(
-            "SELECT COUNT(DISTINCT token_id) FROM portal_session WHERE revoked_at IS NULL AND expires_at > ?",
+            &ph("SELECT COUNT(DISTINCT token_id) FROM portal_session WHERE revoked_at IS NULL AND expires_at > ?", self.dialect),
         )
         .bind(now_e)
         .fetch_one(&self.pool)
@@ -222,7 +257,7 @@ impl Store {
             .fetch_one(&self.pool)
             .await?;
         let active_tokens: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM user_token WHERE status = 'active' AND (expires_at IS NULL OR expires_at > ?)",
+            &ph("SELECT COUNT(*) FROM user_token WHERE status = 'active' AND (expires_at IS NULL OR expires_at > ?)", self.dialect),
         )
         .bind(now_e)
         .fetch_one(&self.pool)

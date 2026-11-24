@@ -2,7 +2,6 @@
 // 作者: Passwd Word
 
 use super::*;
-use sqlx::QueryBuilder;
 
 pub(crate) fn row_to_user(row: &AnyRow) -> anyhow::Result<AppUser> {
     Ok(AppUser {
@@ -57,10 +56,13 @@ impl Store {
     }
 
     pub async fn get_user(&self, id: i64) -> anyhow::Result<Option<AppUser>> {
-        let row = sqlx::query(&format!("SELECT {USER_COLS} FROM app_user WHERE id = ?"))
-            .bind(id)
-            .fetch_optional(&self.pool)
-            .await?;
+        let row = sqlx::query(&ph(
+            &format!("SELECT {USER_COLS} FROM app_user WHERE id = ?"),
+            self.dialect,
+        ))
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
         row.map(|r| row_to_user(&r)).transpose()
     }
 
@@ -71,36 +73,37 @@ impl Store {
     ) -> anyhow::Result<Paged<AppUser>> {
         let (limit, offset) = page_bounds(q);
         let pat = like_pattern(&q.q);
-        let mut count_qb =
-            QueryBuilder::<sqlx::Any>::new("SELECT COUNT(*) FROM app_user WHERE 1 = 1");
-        let mut list_qb =
-            QueryBuilder::<sqlx::Any>::new(format!("SELECT {USER_COLS} FROM app_user WHERE 1 = 1"));
+        // 不用 sqlx::QueryBuilder：Any 的 push_bind 在 PG 下仍写 `?`
+        // （见 lib.rs `ph`），这里手拼字符串 + `ph()` + 按顺序 `.bind()`。
+        let mut count_sql = String::from("SELECT COUNT(*) FROM app_user WHERE 1 = 1");
+        let mut list_sql = format!("SELECT {USER_COLS} FROM app_user WHERE 1 = 1");
+        if status.is_some() {
+            count_sql.push_str(" AND status = ?");
+            list_sql.push_str(" AND status = ?");
+        }
+        if pat.is_some() {
+            count_sql.push_str(" AND (display_name LIKE ? OR email LIKE ?)");
+            list_sql.push_str(" AND (display_name LIKE ? OR email LIKE ?)");
+        }
+        let count_sql = ph(&count_sql, self.dialect);
+        let mut cq = sqlx::query_scalar::<_, i64>(&count_sql);
         if let Some(s) = &status {
-            let v = status_str(s);
-            count_qb.push(" AND status = ").push_bind(v);
-            list_qb.push(" AND status = ").push_bind(v);
+            cq = cq.bind(status_str(s));
         }
         if let Some(p) = &pat {
-            count_qb
-                .push(" AND (display_name LIKE ")
-                .push_bind(p)
-                .push(" OR email LIKE ")
-                .push_bind(p)
-                .push(")");
-            list_qb
-                .push(" AND (display_name LIKE ")
-                .push_bind(p)
-                .push(" OR email LIKE ")
-                .push_bind(p)
-                .push(")");
+            cq = cq.bind(p).bind(p);
         }
-        let total: i64 = count_qb.build_query_scalar().fetch_one(&self.pool).await?;
-        list_qb
-            .push(" ORDER BY id DESC LIMIT ")
-            .push_bind(limit)
-            .push(" OFFSET ")
-            .push_bind(offset);
-        let rows = list_qb.build().fetch_all(&self.pool).await?;
+        let total: i64 = cq.fetch_one(&self.pool).await?;
+        list_sql.push_str(" ORDER BY id DESC LIMIT ? OFFSET ?");
+        let list_sql = ph(&list_sql, self.dialect);
+        let mut lq = sqlx::query(&list_sql);
+        if let Some(s) = &status {
+            lq = lq.bind(status_str(s));
+        }
+        if let Some(p) = &pat {
+            lq = lq.bind(p).bind(p);
+        }
+        let rows = lq.bind(limit).bind(offset).fetch_all(&self.pool).await?;
         let mut items = Vec::with_capacity(rows.len());
         for r in &rows {
             items.push(row_to_user(r)?);
@@ -132,7 +135,7 @@ impl Store {
         let remark = req.remark.clone().or(cur.remark);
         let expires_at = req.expires_at.or(cur.expires_at);
         sqlx::query(
-            "UPDATE app_user SET display_name = ?, email = ?, phone = ?, plan_id = ?, status = ?, locale = ?, remark = ?, expires_at = ?, updated_at = ? WHERE id = ?",
+            &ph("UPDATE app_user SET display_name = ?, email = ?, phone = ?, plan_id = ?, status = ?, locale = ?, remark = ?, expires_at = ?, updated_at = ? WHERE id = ?", self.dialect),
         )
         .bind(display_name)
         .bind(email)

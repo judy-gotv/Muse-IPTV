@@ -3,7 +3,6 @@
 // 作者: Passwd Word
 
 use super::*;
-use sqlx::QueryBuilder;
 
 pub(crate) fn row_to_token(row: &AnyRow) -> anyhow::Result<UserToken> {
     Ok(UserToken {
@@ -73,8 +72,9 @@ impl Store {
     }
 
     pub async fn find_token_by_hash(&self, hash: &[u8; 32]) -> anyhow::Result<Option<UserToken>> {
-        let row = sqlx::query(&format!(
-            "SELECT {TOKEN_COLS} FROM user_token WHERE token_hash = ?"
+        let row = sqlx::query(&ph(
+            &format!("SELECT {TOKEN_COLS} FROM user_token WHERE token_hash = ?"),
+            self.dialect,
         ))
         .bind(hash.to_vec())
         .fetch_optional(&self.pool)
@@ -83,10 +83,13 @@ impl Store {
     }
 
     pub async fn get_token(&self, id: i64) -> anyhow::Result<Option<UserToken>> {
-        let row = sqlx::query(&format!("SELECT {TOKEN_COLS} FROM user_token WHERE id = ?"))
-            .bind(id)
-            .fetch_optional(&self.pool)
-            .await?;
+        let row = sqlx::query(&ph(
+            &format!("SELECT {TOKEN_COLS} FROM user_token WHERE id = ?"),
+            self.dialect,
+        ))
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
         row.map(|r| row_to_token(&r)).transpose()
     }
 
@@ -98,41 +101,47 @@ impl Store {
     ) -> anyhow::Result<Paged<UserToken>> {
         let (limit, offset) = page_bounds(q);
         let pat = like_pattern(&q.q);
-        let mut count_qb =
-            QueryBuilder::<sqlx::Any>::new("SELECT COUNT(*) FROM user_token WHERE 1 = 1");
-        let mut list_qb = QueryBuilder::<sqlx::Any>::new(format!(
-            "SELECT {TOKEN_COLS} FROM user_token WHERE 1 = 1"
-        ));
+        // 不用 sqlx::QueryBuilder：Any 的 push_bind 在 PG 下仍写 `?`
+        // （见 lib.rs `ph`），这里手拼字符串 + `ph()` + 按顺序 `.bind()`。
+        let mut count_sql = String::from("SELECT COUNT(*) FROM user_token WHERE 1 = 1");
+        let mut list_sql = format!("SELECT {TOKEN_COLS} FROM user_token WHERE 1 = 1");
+        if user_id.is_some() {
+            count_sql.push_str(" AND user_id = ?");
+            list_sql.push_str(" AND user_id = ?");
+        }
+        if status.is_some() {
+            count_sql.push_str(" AND status = ?");
+            list_sql.push_str(" AND status = ?");
+        }
+        if pat.is_some() {
+            count_sql.push_str(" AND (name LIKE ? OR token_prefix LIKE ?)");
+            list_sql.push_str(" AND (name LIKE ? OR token_prefix LIKE ?)");
+        }
+        let count_sql = ph(&count_sql, self.dialect);
+        let mut cq = sqlx::query_scalar::<_, i64>(&count_sql);
         if let Some(uid) = user_id {
-            count_qb.push(" AND user_id = ").push_bind(uid);
-            list_qb.push(" AND user_id = ").push_bind(uid);
+            cq = cq.bind(uid);
         }
         if let Some(s) = &status {
-            let v = token_status_str(s);
-            count_qb.push(" AND status = ").push_bind(v);
-            list_qb.push(" AND status = ").push_bind(v);
+            cq = cq.bind(token_status_str(s));
         }
         if let Some(p) = &pat {
-            count_qb
-                .push(" AND (name LIKE ")
-                .push_bind(p)
-                .push(" OR token_prefix LIKE ")
-                .push_bind(p)
-                .push(")");
-            list_qb
-                .push(" AND (name LIKE ")
-                .push_bind(p)
-                .push(" OR token_prefix LIKE ")
-                .push_bind(p)
-                .push(")");
+            cq = cq.bind(p).bind(p);
         }
-        let total: i64 = count_qb.build_query_scalar().fetch_one(&self.pool).await?;
-        list_qb
-            .push(" ORDER BY id DESC LIMIT ")
-            .push_bind(limit)
-            .push(" OFFSET ")
-            .push_bind(offset);
-        let rows = list_qb.build().fetch_all(&self.pool).await?;
+        let total: i64 = cq.fetch_one(&self.pool).await?;
+        list_sql.push_str(" ORDER BY id DESC LIMIT ? OFFSET ?");
+        let list_sql = ph(&list_sql, self.dialect);
+        let mut lq = sqlx::query(&list_sql);
+        if let Some(uid) = user_id {
+            lq = lq.bind(uid);
+        }
+        if let Some(s) = &status {
+            lq = lq.bind(token_status_str(s));
+        }
+        if let Some(p) = &pat {
+            lq = lq.bind(p).bind(p);
+        }
+        let rows = lq.bind(limit).bind(offset).fetch_all(&self.pool).await?;
         let mut items = Vec::with_capacity(rows.len());
         for r in &rows {
             items.push(row_to_token(r)?);
@@ -168,7 +177,7 @@ impl Store {
         let denied_channels = req.denied_channels.clone().unwrap_or(cur.denied_channels);
         let features = req.features.clone().unwrap_or(cur.features);
         sqlx::query(
-            "UPDATE user_token SET name = ?, device_type = ?, max_concurrent_sessions = ?, max_bound_devices = ?, status = ?, expires_at = ?, locale = ?, allowed_groups = ?, denied_channels = ?, features = ?, updated_at = ? WHERE id = ?",
+            &ph("UPDATE user_token SET name = ?, device_type = ?, max_concurrent_sessions = ?, max_bound_devices = ?, status = ?, expires_at = ?, locale = ?, allowed_groups = ?, denied_channels = ?, features = ?, updated_at = ? WHERE id = ?", self.dialect),
         )
         .bind(name)
         .bind(device_type)

@@ -5,6 +5,7 @@ FROM rust:1.89-bookworm AS builder
 WORKDIR /app
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY crates ./crates
+COPY xtask ./xtask
 COPY locales ./locales
 COPY migrations ./migrations
 RUN cargo build --release --bins
