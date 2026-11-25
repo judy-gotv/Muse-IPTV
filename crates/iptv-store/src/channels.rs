@@ -408,17 +408,50 @@ impl Store {
         for r in &existing_rows {
             existing.push(row_to_channel(r)?);
         }
+        // 全局 tvg_id 匹配：唯一索引 uq_channel_tvg 是全局的（不限 source_id），
+        // 手动建的频道（source_id 为 NULL）或别源的同名频道也在此列。只按本源
+        // 加载去重会误判新增、走纯 INSERT 撞唯一约束（PG contract.rs:124）。
+        let mut tvg_ids: Vec<&str> = Vec::new();
+        for item in &items {
+            if let Some(t) = item.tvg_id.as_deref().filter(|s| !s.trim().is_empty()) {
+                if !tvg_ids.contains(&t) {
+                    tvg_ids.push(t);
+                }
+            }
+        }
+        let mut global_matches: Vec<Channel> = Vec::new();
+        if !tvg_ids.is_empty() {
+            let mut sql = format!("SELECT {CHANNEL_COLS} FROM channel WHERE tvg_id IN (");
+            push_in_list(&mut sql, "", tvg_ids.len());
+            let sql = ph(&sql, self.dialect);
+            let mut q = sqlx::query(&sql);
+            for t in &tvg_ids {
+                q = q.bind(*t);
+            }
+            for r in q.fetch_all(&self.pool).await? {
+                global_matches.push(row_to_channel(&r)?);
+            }
+        }
+        // 端点按本源频道 + 全局匹配频道的并集加载（UPDATE 分支要靠它判断
+        // URL 是否变更；全局匹配的频道不在本源集合里，不补会误判 URL 变更
+        // 并重复插入主地址）。
+        let mut ep_ids: Vec<i64> = existing.iter().map(|c| c.id).collect();
+        for ch in &global_matches {
+            if !ep_ids.contains(&ch.id) {
+                ep_ids.push(ch.id);
+            }
+        }
         let mut endpoints: HashMap<i64, Vec<ChannelEndpoint>> = HashMap::new();
-        if !existing.is_empty() {
+        if !ep_ids.is_empty() {
             // 不用 sqlx::QueryBuilder（见 lib.rs `ph`）：手拼 IN 列表。
             let mut sql =
                 format!("SELECT {ENDPOINT_COLS} FROM channel_endpoint WHERE channel_id IN (");
-            push_in_list(&mut sql, "", existing.len());
+            push_in_list(&mut sql, "", ep_ids.len());
             sql.push_str(" ORDER BY priority ASC");
             let sql = ph(&sql, self.dialect);
             let mut q = sqlx::query(&sql);
-            for ch in &existing {
-                q = q.bind(ch.id);
+            for id in &ep_ids {
+                q = q.bind(*id);
             }
             for r in q.fetch_all(&self.pool).await? {
                 let e = row_to_endpoint(&r)?;
@@ -443,6 +476,14 @@ impl Store {
         let mut by_key: HashMap<String, Channel> = HashMap::new();
         for ch in &existing {
             by_key.insert(key_of_existing(ch), ch.clone());
+        }
+        // 全局匹配补进同一张去重表（本源优先；键冲突即同一行，唯一索引保证）。
+        // 注意：`existing` 仍只含本源频道——下面的“订阅里消失”逻辑只对本源
+        // 频道生效，全局匹配的频道不会被误停用/误删。
+        for ch in &global_matches {
+            by_key
+                .entry(key_of_existing(ch))
+                .or_insert_with(|| ch.clone());
         }
         let mut seen_keys: Vec<String> = Vec::with_capacity(items.len());
 

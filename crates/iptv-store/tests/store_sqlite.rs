@@ -264,6 +264,57 @@ async fn upsert_channels_add_update_missing() {
 }
 
 #[tokio::test]
+async fn upsert_matches_manual_channel_by_tvg_id() {
+    // 回归：PG 契约 contract.rs:124——手动建的频道（source_id 为 NULL）
+    // 再被订阅同步同名时应算 1 次元数据变更，而非新增撞 uq_channel_tvg。
+    let fx = setup().await;
+    let s = &fx.store;
+    let src = s
+        .create_source(&CreateSourceRequest {
+            name: "回归源".to_string(),
+            url: Some("https://example.com/list.m3u".to_string()),
+            sync_interval_sec: None,
+            http_headers: None,
+            epg_url: None,
+            on_missing: None,
+            auto_enable_new: Some(true),
+            enabled: None,
+        })
+        .await
+        .unwrap();
+    let manual = s
+        .create_channel(&channel_req(
+            "CCTV-1",
+            "央视",
+            "https://x.example/cctv1.m3u8",
+        ))
+        .await
+        .unwrap();
+    assert!(manual.source_id.is_none());
+    let out = s
+        .upsert_channels(
+            src.id,
+            vec![NormalizedChannel {
+                tvg_id: Some("CCTV-1.cn".to_string()),
+                name: "CCTV-1 综合".to_string(),
+                logo: None,
+                group: Some("央视".to_string()),
+                url: "https://x.example/cctv1.m3u8".to_string(),
+                catchup: None,
+                catchup_source: None,
+            }],
+        )
+        .await
+        .unwrap();
+    assert_eq!((out.added, out.updated, out.removed), (0, 1, 0));
+    assert_eq!(out.metadata_changed.len(), 1);
+    assert_eq!(out.metadata_changed[0].id, manual.id);
+    // 同 URL：不应误判 URL 变更、重复插入主地址。
+    let eps = s.list_endpoints(manual.id).await.unwrap();
+    assert_eq!(eps.len(), 1);
+}
+
+#[tokio::test]
 async fn playback_session_lifecycle_and_expiry() {
     let fx = setup().await;
     let s = &fx.store;

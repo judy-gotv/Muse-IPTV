@@ -297,11 +297,22 @@ pub(crate) fn r_opt_i64(row: &AnyRow, col: &str) -> anyhow::Result<Option<i64>> 
 }
 
 pub(crate) fn r_string(row: &AnyRow, col: &str) -> anyhow::Result<String> {
-    Ok(row.try_get(col)?)
+    if let Ok(v) = row.try_get::<String, _>(col) {
+        return Ok(v);
+    }
+    // MySQL 的 TEXT 列在 sqlx 下按 BLOB 上报，String 解码报
+    // "Rust type String is not compatible with SQL type BLOB"；
+    // 兜底按字节读再转 UTF-8（非法字节有损替换）。
+    let bytes = row.try_get::<Vec<u8>, _>(col)?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 pub(crate) fn r_opt_string(row: &AnyRow, col: &str) -> anyhow::Result<Option<String>> {
-    Ok(row.try_get(col)?)
+    if let Ok(v) = row.try_get::<Option<String>, _>(col) {
+        return Ok(v);
+    }
+    let bytes = row.try_get::<Option<Vec<u8>>, _>(col)?;
+    Ok(bytes.map(|b| String::from_utf8_lossy(&b).into_owned()))
 }
 
 pub(crate) fn r_bool(row: &AnyRow, col: &str) -> anyhow::Result<bool> {
@@ -321,17 +332,29 @@ pub(crate) fn r_opt_ts(row: &AnyRow, col: &str) -> anyhow::Result<Option<DateTim
 }
 
 pub(crate) fn r_json(row: &AnyRow, col: &str) -> serde_json::Value {
-    row.try_get::<String, _>(col)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
+    // 与 r_string 同理：MySQL TEXT 列按 BLOB 上报，String 解码失败时
+    // 兜底按字节读（否则这里会静默返回 Null，把设置/审计 JSON 读丢）。
+    let text: Option<String> = match row.try_get::<String, _>(col) {
+        Ok(s) => Some(s),
+        Err(_) => row
+            .try_get::<Vec<u8>, _>(col)
+            .ok()
+            .and_then(|b| String::from_utf8(b).ok()),
+    };
+    text.and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or(serde_json::Value::Null)
 }
 
 pub(crate) fn r_opt_json(row: &AnyRow, col: &str) -> Option<serde_json::Value> {
-    row.try_get::<Option<String>, _>(col)
-        .ok()
-        .flatten()
-        .and_then(|s| serde_json::from_str(&s).ok())
+    let text: Option<String> = match row.try_get::<Option<String>, _>(col) {
+        Ok(v) => v,
+        Err(_) => row
+            .try_get::<Option<Vec<u8>>, _>(col)
+            .ok()
+            .flatten()
+            .and_then(|b| String::from_utf8(b).ok()),
+    };
+    text.and_then(|s| serde_json::from_str(&s).ok())
 }
 
 pub(crate) fn json_text(v: &serde_json::Value) -> String {
