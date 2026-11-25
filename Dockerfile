@@ -1,7 +1,7 @@
 # Muse-IPTV 全 Rust 播放平台 — 多架构镜像（amd64 / arm64）
 # 作者: Passwd Word
 # 构建：docker buildx build --platform linux/amd64,linux/arm64 -t ghcr.io/judy-gotv/muse-iptv:latest .
-FROM rust:1.89-bookworm AS builder
+FROM rust:1.100-bookworm AS builder
 WORKDIR /app
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY crates ./crates
@@ -13,8 +13,12 @@ COPY migrations ./migrations
 # LEPTOS_OUTPUT_NAME，见 crates/*/Cargo.toml 的 [package.metadata.leptos]），
 # 再构建其余三个二进制。没有这一步，shell 引用的 /pkg/*.js 全是 404，
 # 语言切换与全部 WASM 交互都是死的（v0.1.1 现场复现）。
+# 工具链须 ≥1.97（cargo-leptos 0.3.12 的 cargo-util-schemas 0.14.3 要
+# 1.97），rustc 1.89 下编译失败 exit 101（v0.1.2 首建全红）；--locked
+# 锁定其发布时 Cargo.lock，避免日后依赖再抬 MSRV 又红。版本见
+# rust-toolchain.toml（基础镜像 rust:1.100-bookworm 与之对应）。
 RUN rustup target add wasm32-unknown-unknown \
-    && cargo install cargo-leptos --version "=0.3.12" \
+    && cargo install cargo-leptos --version "=0.3.12" --locked \
     && cargo leptos build --release -p iptv-portal \
     && cargo leptos build --release -p iptv-admin \
     && cargo build --release -p iptv-api -p iptv-worker -p iptv-gateway

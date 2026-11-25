@@ -56,7 +56,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: "1.89"
+          toolchain: "1.100"
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
         with:
@@ -65,10 +65,14 @@ jobs:
       # 没有这一步，shell 引用的 /pkg/*.js 全是 404，语言切换与全部 WASM
       # 交互都是死的（v0.1.1 现场复现）；输出名见各包 Cargo.toml 的
       # [package.metadata.leptos]。
+      # 工具链须 ≥1.97：cargo-leptos 0.3.12 的传递依赖（cargo-util-schemas
+      # 0.14.3 要 1.97、kstring 2.0.5 要 1.96）在 rustc 1.89 下编译失败
+      # exit 101（v0.1.2 首建全红）；--locked 锁定其发布时 Cargo.lock，
+      # 避免日后依赖再抬 MSRV 又红。工具链版本见 rust-toolchain.toml。
       - name: install cargo-leptos + wasm target
         run: |
           rustup target add wasm32-unknown-unknown
-          cargo install cargo-leptos --version "=0.3.12"
+          cargo install cargo-leptos --version "=0.3.12" --locked
       - name: install cross toolchain (linux)
         if: matrix.apt != ''
         run: |
