@@ -36,7 +36,10 @@ COPY --from=builder /out/iptv-portal /usr/local/bin/iptv-portal
 COPY --from=builder /out/iptv-admin /usr/local/bin/iptv-admin
 COPY --from=builder /out/iptv-gateway /usr/local/bin/iptv-gateway
 # B4：前端 hydrate 产物（/app/site/pkg/*.js），portal/admin 由 LEPTOS_SITE_ROOT 指向它。
-COPY --from=builder /app/target/site /app/site
+# builder 已把两项目的 pkg/ 合并到 /out/site/pkg/（见上）；/app/target/site 不存在
+# （两项目 site-root 各为 target/site-portal 与 target/site-admin），直接 COPY 它会在
+# buildx 算缓存键时报 "/app/target/site": not found（v0.1.2 Docker(tag) 实测）。
+COPY --from=builder /out/site /app/site
 COPY deploy/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 VOLUME ["/app/data"]
