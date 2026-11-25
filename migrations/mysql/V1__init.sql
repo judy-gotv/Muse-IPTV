@@ -294,10 +294,10 @@ CREATE TABLE IF NOT EXISTS system_setting (
 CREATE TABLE IF NOT EXISTS i18n_override (
     id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
     locale VARCHAR(16) NOT NULL,
-    key VARCHAR(255) NOT NULL,
+    `key` VARCHAR(255) NOT NULL,
     value TEXT NOT NULL,
     updated_at BIGINT NOT NULL,
-    UNIQUE (locale, key)
+    UNIQUE (locale, `key`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE UNIQUE INDEX uq_channel_tvg ON channel(tvg_id);

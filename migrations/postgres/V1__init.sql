@@ -91,7 +91,7 @@ CREATE TABLE IF NOT EXISTS channel (
     language VARCHAR(32),
     country VARCHAR(32),
     source_id BIGINT,
-    content_hash CHAR(64),
+    content_hash VARCHAR(64),
     status VARCHAR(16) NOT NULL DEFAULT 'active',
     visibility VARCHAR(16) NOT NULL DEFAULT 'public',
     sort_weight INTEGER NOT NULL DEFAULT 0,
