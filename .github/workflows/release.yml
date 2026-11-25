@@ -191,23 +191,36 @@ jobs:
           echo "PKG_CONFIG=${{ matrix.triple }}-pkg-config" >> "$GITHUB_ENV"
           echo "PKG_CONFIG_ALLOW_CROSS=1" >> "$GITHUB_ENV"
       - name: build
+        # Windows 默认 shell 是 pwsh，跑不了下面的 bash if（Release 45658769423
+        # windows job 实测：ParserError Missing '(' after 'if'，build 0s 即死），
+        # 必须显式 bash（windows-latest 自带 Git Bash）。
+        shell: bash
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.cross_gcc }}
           CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER: ${{ matrix.cross_gcc }}
         run: |
-          # B4：先由 cargo-leptos 构建 portal/admin 的前端（target/site/pkg/）
-          # 与服务端二进制（编译时烘入 LEPTOS_OUTPUT_NAME）；其余三个二进制
-          # 走普通 cargo build。交叉 job（aarch64/armv7）的服务端目标不是
-          # 宿主：cargo-leptos 只负责在宿主上产出前端 pkg/，服务端二进制用
-          # 普通 cargo build + LEPTOS_OUTPUT_NAME 环境变量烘入输出名。
+          # B4：先由 cargo-leptos 构建 portal/admin 的前端（target/site-portal/pkg/
+          # 与 target/site-admin/pkg/）；其余三个二进制走普通 cargo build。
+          # 注意 cargo-leptos 除产前端外还会编链接宿主服务端二进制——交叉 job 上
+          # 该宿主链接会被 install cross toolchain 步写入的 PKG_CONFIG（目标平台
+          # pkg-config 包装器）带偏，链上目标平台的 libssl 而报 incompatible
+          # with elf64-x86-64（Release 45658769423 aarch64 实测），故交叉分支跑
+          # leptos 时先 unset 这两个变量，让 openssl-sys 走宿主 pkg-config；服务端
+          # 二进制仍由其后的普通 cargo build --target 产出。
+          # 宿主 job：leptos 产出的服务端二进制在 target/release/，不在
+          # target/<triple>/release/，打包步骤会报 cannot stat（同上实测：x86_64
+          # 与两 macOS job 全死于 package），故宿主分支也补一次 --target 构建，
+          # 把 portal/admin 放进 target/<triple>/release/。
           if [ -n "${{ matrix.cross_gcc }}" ]; then
-            cargo leptos build --release -p iptv-portal
-            cargo leptos build --release -p iptv-admin
+            env -u PKG_CONFIG -u PKG_CONFIG_ALLOW_CROSS cargo leptos build --release -p iptv-portal
+            env -u PKG_CONFIG -u PKG_CONFIG_ALLOW_CROSS cargo leptos build --release -p iptv-admin
             LEPTOS_OUTPUT_NAME=iptv-portal cargo build --release --target ${{ matrix.target }} -p iptv-portal
             LEPTOS_OUTPUT_NAME=iptv-admin cargo build --release --target ${{ matrix.target }} -p iptv-admin
           else
             cargo leptos build --release -p iptv-portal
             cargo leptos build --release -p iptv-admin
+            LEPTOS_OUTPUT_NAME=iptv-portal cargo build --release --target ${{ matrix.target }} -p iptv-portal
+            LEPTOS_OUTPUT_NAME=iptv-admin cargo build --release --target ${{ matrix.target }} -p iptv-admin
           fi
           cargo build --release --target ${{ matrix.target }} -p iptv-api -p iptv-worker -p iptv-gateway
       - name: package (unix)
