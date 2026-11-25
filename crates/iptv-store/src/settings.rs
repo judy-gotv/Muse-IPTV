@@ -16,7 +16,7 @@ impl Store {
         .await?;
         match row {
             Some(r) => {
-                let s: String = r.try_get("setting_value")?;
+                let s = r_string(&r, "setting_value")?;
                 Ok(serde_json::from_str(&s).ok())
             }
             None => Ok(None),
@@ -59,7 +59,7 @@ impl Store {
         let mut out = Vec::with_capacity(rows.len());
         for r in &rows {
             let key: String = r.try_get("setting_key")?;
-            let value: String = r.try_get("setting_value")?;
+            let value = r_string(r, "setting_value")?;
             out.push(SystemSetting {
                 key,
                 value: serde_json::from_str(&value).unwrap_or(serde_json::Value::Null),

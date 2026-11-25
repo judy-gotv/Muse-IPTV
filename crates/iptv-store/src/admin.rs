@@ -95,8 +95,8 @@ impl Store {
         match row {
             Some(r) => {
                 let admin = row_to_admin(&r)?;
-                let hash: String = r.try_get("password_hash")?;
-                let secret: Option<String> = r.try_get("totp_secret")?;
+                let hash = r_string(&r, "password_hash")?;
+                let secret = r_opt_string(&r, "totp_secret")?;
                 Ok(Some((admin, hash, secret)))
             }
             None => Ok(None),
