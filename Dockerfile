@@ -17,8 +17,18 @@ COPY migrations ./migrations
 # 1.97），rustc 1.89 下编译失败 exit 101（v0.1.2 首建全红）；--locked
 # 锁定其发布时 Cargo.lock，避免日后依赖再抬 MSRV 又红。版本见
 # rust-toolchain.toml（基础镜像 rust:1.100-bookworm 与之对应）。
+# B5（2026-11-26，用户选方案 B）：cargo-leptos 找不到 PATH 上的 wasm-bindgen
+# 时会下载预编译二进制，wasm-bindgen 0.2.130 的预编译版要求 GLIBC_2.38，
+# 而 bookworm 只有 glibc 2.36，cargo leptos build 在前端收尾阶段 exit 1，
+# 两个 Docker run（main/tag）都红在 build-push（v0.1.2 第 80 轮定位）。
+# cargo-leptos 0.3.12 的 Exe::get 优先用 PATH 上的 wasm-bindgen（which），
+# 找到就不再下载。于是先从源码装 wasm-bindgen-cli（版本须与 Cargo.lock 里
+# 的 wasm-bindgen 0.2.130 一致），编出来的二进制链接本机 glibc 2.36，
+# 不再碰预编译包。代价：构建变慢，arm64 在 QEMU 下从源码编译更慢。
+# 不用 --locked：wasm-bindgen-cli 发布包里没有 Cargo.lock，--locked 会报错。
 RUN rustup target add wasm32-unknown-unknown \
     && cargo install cargo-leptos --version "=0.3.12" --locked \
+    && cargo install wasm-bindgen-cli --version "=0.2.130" \
     && cargo leptos build --release -p iptv-portal \
     && cargo leptos build --release -p iptv-admin \
     && cargo build --release -p iptv-api -p iptv-worker -p iptv-gateway
