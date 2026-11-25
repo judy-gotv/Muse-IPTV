@@ -6,10 +6,9 @@ services:
     image: ghcr.io/judy-gotv/muse-iptv:latest
     container_name: muse-iptv
     restart: unless-stopped
+    # 对外只暴露网关一个端口 :8081（门户 /、后台 /admin、API /api/* 与 /healthz 全走它）。
     ports:
-      - "${IPTV_PORT:-8080}:8080"
-      - "${IPTV_PORTAL_PORT:-8081}:8081"
-      - "${IPTV_ADMIN_PORT:-8082}:8082"
+      - "${IPTV_PORT:-8081}:8081"
     environment:
       DATABASE_URL: ${DATABASE_URL:-sqlite:///app/data/iptv.db}
       REDIS_URL: ${REDIS_URL:-}
@@ -21,7 +20,7 @@ services:
     volumes:
       - iptv-data:/app/data
     healthcheck:
-      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8080/healthz || exit 1"]
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8081/healthz || exit 1"]
       interval: 30s
       timeout: 5s
       retries: 3

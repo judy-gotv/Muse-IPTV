@@ -1,7 +1,7 @@
 # Muse-IPTV Release：打 tag v* 即全架构打包
 # 作者: Passwd Word
 # 架构（6 个包）：linux x86_64 / aarch64 / armv7、macOS x86_64 / arm64、windows x86_64
-# 每个包：iptv-api + iptv-worker + iptv-portal + iptv-admin + README + .env.example
+# 每个包：iptv-api + iptv-worker + iptv-portal + iptv-admin + iptv-gateway + README + .env.example
 # 另附 SHA256SUMS。Docker 多架构镜像见 docker.yml。
 name: Release
 
@@ -191,7 +191,7 @@ jobs:
           PKG="muse-iptv-${VERSION}-${{ matrix.pkg_os }}-${{ matrix.pkg_arch }}"
           mkdir -p "$PKG"
           BIN="target/${{ matrix.target }}/release"
-          cp "$BIN/iptv-api" "$BIN/iptv-worker" "$BIN/iptv-portal" "$BIN/iptv-admin" "$PKG/"
+          cp "$BIN/iptv-api" "$BIN/iptv-worker" "$BIN/iptv-portal" "$BIN/iptv-admin" "$BIN/iptv-gateway" "$PKG/"
           cp README.md .env.example "$PKG/"
           tar -czf "$PKG.tar.gz" "$PKG"
           sha256sum "$PKG.tar.gz" >> SHA256SUMS
@@ -204,7 +204,7 @@ jobs:
           $Pkg = "muse-iptv-$Version-windows-x86_64"
           New-Item -ItemType Directory -Force -Path $Pkg | Out-Null
           $Bin = "target/${{ matrix.target }}/release"
-          Copy-Item "$Bin/iptv-api.exe","$Bin/iptv-worker.exe","$Bin/iptv-portal.exe","$Bin/iptv-admin.exe" $Pkg
+          Copy-Item "$Bin/iptv-api.exe","$Bin/iptv-worker.exe","$Bin/iptv-portal.exe","$Bin/iptv-admin.exe","$Bin/iptv-gateway.exe" $Pkg
           Copy-Item README.md,.env.example $Pkg
           Compress-Archive -Path $Pkg -DestinationPath "$Pkg.zip"
           (Get-FileHash -Algorithm SHA256 "$Pkg.zip").Hash.ToLower() + "  $Pkg.zip" | Out-File -Append -Encoding ascii SHA256SUMS
@@ -239,7 +239,7 @@ jobs:
           name: Muse-IPTV ${{ github.ref_name }}
           body: |
             Muse-IPTV ${{ github.ref_name }} — 全 Rust IPTV 播放平台（开发文档 v1.2）。
-            包含 6 个架构包（linux x86_64/aarch64/armv7、macOS x86_64/arm64、windows x86_64），每个包 4 个二进制：iptv-api / iptv-worker / iptv-portal / iptv-admin。
+            包含 6 个架构包（linux x86_64/aarch64/armv7、macOS x86_64/arm64、windows x86_64），每个包 5 个二进制：iptv-api / iptv-worker / iptv-portal / iptv-admin / iptv-gateway（单端口 :8081，门户 /、后台 /admin、API /api/* 与 /healthz 全走它）。
             一键安装：`curl -fsSL https://raw.githubusercontent.com/judy-gotv/Muse-IPTV/main/install.sh | sh`
             Windows：`irm https://raw.githubusercontent.com/judy-gotv/Muse-IPTV/main/install.ps1 | iex`
             Docker：`ghcr.io/judy-gotv/muse-iptv:${{ github.ref_name }}`（amd64/arm64）

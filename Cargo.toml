@@ -17,6 +17,7 @@ members = [
     "crates/iptv-ui",
     "crates/iptv-portal",
     "crates/iptv-admin",
+    "crates/iptv-gateway",
     # xtask 必须是成员，`cargo run -p xtask` / `cargo xtask` 才能解析到它
     # （只在 exclude 里时 -p 找不到包；xtask 无业务依赖，不影响主构建）。
     "xtask",
@@ -65,6 +66,7 @@ thiserror = "2"
 anyhow = "1"
 chrono = { version = "0.4", features = ["serde", "clock"] }
 # --- misc ---
+dotenvy = "0.15"
 redis = { version = "0.27", features = ["tokio-comp"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 qrcode = "0.14"

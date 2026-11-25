@@ -77,6 +77,10 @@ fn parts_accept_language() -> Option<String> {
 fn http_client() -> reqwest::Client {
     reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
+        // 绝不能跟随重定向：API 的票据兑换成功返回 302（§4.3，带 Location 与
+        // Set-Cookie），跟随了会 GET 到 API 上不存在的 /me、丢掉 Set-Cookie，
+        // 再把 404 当 JSON 解，兑换永远失败（冒烟实测）。
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .unwrap_or_else(|_| reqwest::Client::new())
 }

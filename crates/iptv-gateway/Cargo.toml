@@ -1,0 +1,18 @@
+# 单端口网关（iptv-gateway）
+# 作者: Passwd Word
+[package]
+name = "iptv-gateway"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Muse-IPTV 单端口网关：对外只暴露一个端口，按路径分流到 API / 门户 / 后台"
+
+[dependencies]
+axum.workspace = true
+tokio.workspace = true
+reqwest.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+dotenvy.workspace = true

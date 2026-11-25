@@ -23,12 +23,19 @@ use serde::Deserialize;
 
 #[tokio::main]
 async fn main() {
+    // 先读工作目录的 .env（不存在则忽略；已有环境变量优先，不会被覆盖）。
+    dotenvy::dotenv().ok();
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
     let conf = leptos::config::get_configuration(None).expect("leptos config");
     let leptos_options = conf.leptos_options;
-    let addr = leptos_options.site_addr;
+    // 单端口部署时用专属变量定内部监听地址（.env 里门户/后台各写一行）；
+    // 没设则回落到 Leptos 的 LEPTOS_SITE_ADDR（默认 127.0.0.1:3000）。
+    let addr = std::env::var("IPTV_PORTAL_ADDR")
+        .ok()
+        .and_then(|s| s.parse::<std::net::SocketAddr>().ok())
+        .unwrap_or(leptos_options.site_addr);
     let routes = generate_route_list(App);
     let app = Router::new()
         .route("/design.css", get(design_css))

@@ -1541,6 +1541,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "chrono",
+ "dotenvy",
  "fluent-bundle",
  "iptv-core",
  "iptv-design",
@@ -1568,6 +1569,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "chrono",
+ "dotenvy",
  "hex",
  "hmac",
  "image",
@@ -1682,6 +1684,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "iptv-gateway"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "dotenvy",
+ "reqwest",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "iptv-i18n"
 version = "0.1.0"
 dependencies = [
@@ -1710,6 +1724,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "chrono",
+ "dotenvy",
  "fluent-bundle",
  "iptv-core",
  "iptv-design",
@@ -1766,6 +1781,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "dotenvy",
  "iptv-auth",
  "iptv-concurrency",
  "iptv-core",

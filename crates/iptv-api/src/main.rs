@@ -11,6 +11,8 @@ use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // 先读工作目录的 .env（不存在则忽略；已有环境变量优先，不会被覆盖）。
+    dotenvy::dotenv().ok();
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .init();

@@ -24,8 +24,9 @@ irm https://raw.githubusercontent.com/judy-gotv/Muse-IPTV/main/install.ps1 | iex
 
 ## Docker 部署
 
-镜像 `ghcr.io/judy-gotv/muse-iptv:latest`（amd64/arm64），一个容器跑全部四个服务：
-API :8080、门户 :8081、后台 :8082，数据在 `/app/data`（默认 SQLite）。
+镜像 `ghcr.io/judy-gotv/muse-iptv:latest`（amd64/arm64），一个容器跑全部五个服务，
+对外只暴露**网关一个端口 :8081**：门户 `/`、后台 `/admin`、API `/api/*` 与 `/healthz`
+全走它；API :8080 与门户/后台 :18081/:18082 只在容器内，宿主看不到。数据在 `/app/data`（默认 SQLite）。
 
 ```sh
 docker pull ghcr.io/judy-gotv/muse-iptv:latest
@@ -34,7 +35,7 @@ docker pull ghcr.io/judy-gotv/muse-iptv:latest
 docker run -d \
   --name muse-iptv \
   --restart unless-stopped \
-  -p 8080:8080 -p 8081:8081 -p 8082:8082 \
+  -p 8081:8081 \
   -v muse-iptv-data:/app/data \
   -e IPTV_ADMIN_USER=admin \
   -e IPTV_ADMIN_PASSWORD=改成你的密码 \
@@ -42,10 +43,44 @@ docker run -d \
 ```
 
 - 门户：`http://服务器IP:8081`（票据登录 / 粘贴 Token 登录）
-- 后台：`http://服务器IP:8082`（管理员登录）
-- 健康检查：`curl http://127.0.0.1:8080/healthz`
+- 后台：`http://服务器IP:8081/admin`（管理员登录）
+- 健康检查：`curl http://127.0.0.1:8081/healthz`
+- OpenAPI：`http://服务器IP:8081/api/v1/openapi.json`；指标：`http://服务器IP:8081/metrics`
 - 看日志：`docker logs -f muse-iptv`；停掉：`docker stop muse-iptv`
 - 升级：`docker pull ghcr.io/judy-gotv/muse-iptv:latest` 后 `docker rm -f muse-iptv`，再按上面命令重跑（数据在 volume 里，不丢）。
+
+### 域名反代（只指一个端口）
+
+网关后面直接挂域名，nginx 与 Caddy 各一行配置：
+
+```nginx
+# nginx：域名反代到网关 :8081（/admin、/api、/p 全在同一个 server 里）
+server {
+    listen 443 ssl;
+    server_name tv.example.com;
+    # ssl_certificate / ssl_certificate_key ……
+    location / {
+        proxy_pass http://127.0.0.1:8081;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_buffering off;          # /p/* 视频分片边下边播，不等整包
+        client_max_body_size 20m;     # 后台 M3U 上传上限
+    }
+}
+```
+
+```caddy
+# Caddy：同一件事一行就够
+tv.example.com {
+    reverse_proxy 127.0.0.1:8081
+}
+```
+
+反代后把 `PORTAL_BASE_URL` 改成域名（`https://tv.example.com`），票据链接才会指到域名上；
+改完重启容器生效。网关收到 `X-Forwarded-For` 会追加直连 IP 再往后传，API 的限流与播放 IP 统计看到的仍是真实客户端 IP。
 
 ### Docker Compose
 
@@ -62,31 +97,36 @@ docker compose -f deploy/docker-compose.yml up -d
 | `DATABASE_URL` | `sqlite:///app/data/iptv.db` | 改 PostgreSQL/MySQL 见 `.env.example` |
 | `PLAY_SECRET` / `ADMIN_SECRET` | 为空则随机生成 | 不固定则重启后旧播放链接与会话失效 |
 | `PORTAL_BASE_URL` | `http://127.0.0.1:8081` | 票据链接用的门户地址；远程访问改成服务器 IP/域名 |
-| `IPTV_PORT` / `IPTV_PORTAL_PORT` / `IPTV_ADMIN_PORT` | 8080 / 8081 / 8082 | compose 映射到宿主的端口 |
+| `IPTV_PORT` | 8081 | compose 映射到宿主的端口（只映射网关一个） |
+| `GATEWAY_BIND_ADDR` | `0.0.0.0:8081` | 网关监听地址 |
+| `IPTV_PORTAL_ADDR` / `IPTV_ADMIN_ADDR` | `0.0.0.0:18081` / `0.0.0.0:18082` | 门户/后台内部监听地址（.env 方式部署时用） |
 
-注意：`:v0.1.0` 镜像的入口脚本没给门户/后台定端口（两个服务会抢 `127.0.0.1:3000`），请用 `:latest`。
 
 ## 快速开始（源码）
 
 ```sh
-cp .env.example .env   # 改 IPTV_ADMIN_PASSWORD
-cargo run -p iptv-api      # 后端 :8080（默认 SQLite ./data/iptv.db）
+cp .env.example .env   # 改 IPTV_ADMIN_PASSWORD（各二进制启动时自动读工作目录的 .env）
+cargo run -p iptv-api      # 后端，内部 :8080（默认 SQLite ./data/iptv.db）
 cargo run -p iptv-worker   # 同步/探测/清理
-LEPTOS_SITE_ADDR=0.0.0.0:8081 cargo run -p iptv-portal   # 门户 :8081
-LEPTOS_SITE_ADDR=0.0.0.0:8082 cargo run -p iptv-admin    # 后台 :8082
+cargo run -p iptv-portal   # 门户，内部 :18081（.env 里 IPTV_PORTAL_ADDR）
+cargo run -p iptv-admin    # 后台，内部 :18082（.env 里 IPTV_ADMIN_ADDR）
+cargo run -p iptv-gateway  # 网关，对外 :8081（.env 里 GATEWAY_BIND_ADDR）
 ```
 
-- 健康检查：`curl http://127.0.0.1:8080/healthz`
-- OpenAPI：`http://127.0.0.1:8080/api/v1/openapi.json`
-- 指标：`http://127.0.0.1:8080/metrics`
+对外只用网关一个端口：门户 `http://127.0.0.1:8081`、后台 `http://127.0.0.1:8081/admin`。
+
+- 健康检查：`curl http://127.0.0.1:8081/healthz`
+- OpenAPI：`http://127.0.0.1:8081/api/v1/openapi.json`
+- 指标：`http://127.0.0.1:8081/metrics`
 
 ## 架构（文档 §1）
 
 ```text
-反向代理 / TLS（Rustls）
-  ├─ 用户端门户 Leptos SSR+WASM  /t/{ticket}        → :8081
-  ├─ 后端 API 服务 Axum（鉴权/并发/频道/播放）      → :8080
-  └─ 管理后台 Leptos SSR+WASM  /admin/*             → :8082
+单端口网关 iptv-gateway（对外 :8081，内部按路径分流）
+  ├─ 用户端门户 Leptos SSR+WASM  /、/t/{ticket}     → 内部 :18081
+  ├─ 后端 API 服务 Axum（鉴权/并发/频道/播放）      → 内部 :8080
+  │     /api/*、/p/*、/healthz、/metrics
+  └─ 管理后台 Leptos SSR+WASM  /admin/*             → 内部 :18082
         │                │
         ▼                ▼
   关系型数据库 SQLx Any       Redis（会话/并发/限流）
@@ -95,8 +135,8 @@ LEPTOS_SITE_ADDR=0.0.0.0:8082 cargo run -p iptv-admin    # 后台 :8082
   ClickHouse / ScyllaDB（可选分析库）  Worker（同步/EPG/探测）
 ```
 
-Workspace 14 个 crate（文档 §1.1）：`iptv-core` / `iptv-dto` / `iptv-store` /
-`iptv-m3u` / `iptv-epg` / `iptv-auth` / `iptv-concurrency` / `iptv-i18n` /
+Workspace 15 个 crate（文档 §1.1）：`iptv-core` / `iptv-dto` / `iptv-store` /
+`iptv-m3u` / `iptv-epg` / `iptv-auth` / `iptv-concurrency` / `iptv-i18n` / `iptv-gateway` /
 `iptv-design` / `iptv-api` / `iptv-worker` / `iptv-ui` / `iptv-portal` / `iptv-admin`，
 另有 `xtask`（`cargo xtask i18n-check`）。
 
