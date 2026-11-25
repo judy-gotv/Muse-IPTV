@@ -83,6 +83,17 @@ jobs:
           # [options] 后限定 arch=amd64；deb822 按 stanza 处理，已有
           # Architectures 就改写为 amd64，缺失则在 Types 行后插入；
           # 改前改后都打印全部源文件，日志里留证据。
+          # 第 5 轮：apt-get update 已通（第 4 轮 ports 修复生效，无 404），
+          # 死在 apt-get install：pkg-config-aarch64-linux-gnu /
+          # pkg-config-arm-linux-gnueabihf 在 jammy 里不存在（Release
+          # 45543091514 实测 E: Unable to locate package）。这两个包名
+          # 本来就不存在——交叉 pkg-config 包装器不是单独的包，而是
+          # pkg-config 本包自带的 dpkg hook 生成的：jammy 的 pkg-config
+          # 文件清单含 /usr/share/pkg-config-crosswrapper、
+          # /usr/share/pkg-config-dpkghook 与
+          # /etc/dpkg/dpkg.cfg.d/pkg-config-hook-config，装交叉 gcc 后
+          # hook 自动建 /usr/bin/<triplet>-pkg-config 软链。故 install
+          # 只装 pkg-config（amd64 本包），删 pkg-config-${triple}。
           sudo dpkg --add-architecture ${{ matrix.deb_arch }}
           echo '=== apt sources before ==='
           for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
@@ -163,7 +174,8 @@ jobs:
             echo "deb [arch=${{ matrix.deb_arch }}] http://ports.ubuntu.com/ubuntu-ports/ $suite main restricted universe multiverse" | sudo tee -a /etc/apt/sources.list.d/ports-${{ matrix.deb_arch }}.list > /dev/null
           done
           sudo apt-get update
-          sudo apt-get install -y ${{ matrix.apt }} libssl-dev:${{ matrix.deb_arch }} pkg-config-${{ matrix.triple }}
+          sudo apt-get install -y ${{ matrix.apt }} pkg-config libssl-dev:${{ matrix.deb_arch }}
+          ls -l "/usr/bin/${{ matrix.triple }}-pkg-config" || echo "WARNING: cross pkg-config wrapper missing"
           echo "PKG_CONFIG=${{ matrix.triple }}-pkg-config" >> "$GITHUB_ENV"
           echo "PKG_CONFIG_ALLOW_CROSS=1" >> "$GITHUB_ENV"
       - name: build
