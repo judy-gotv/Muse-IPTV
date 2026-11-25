@@ -586,6 +586,8 @@ pub struct PlaybackStartResponse {
     /// 短时效 HMAC 播放地址（§6.4 / §8，默认 300s，上游真实地址不下发）。
     pub play_url: String,
     pub expires_in_sec: i64,
+    /// 客户端心跳间隔（§6.3，读系统设置 `heartbeat_interval_sec`，默认 30s）。
+    pub heartbeat_interval_sec: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -663,6 +665,9 @@ pub struct AdminUser {
     pub role: AdminRole,
     pub totp_enabled: bool,
     pub totp_required: bool,
+    /// 是否已配给 TOTP 密钥（secret 非空）。未配给 + totp_required 时，
+    /// 登录放行密码（视为配置未完成），由超管在后台配给，不得锁死账号。
+    pub totp_provisioned: bool,
     pub created_at: DateTime<Utc>,
 }
 
@@ -679,6 +684,22 @@ pub struct CreateAdminRequest {
     pub password: String,
     pub role: AdminRole,
     pub totp_required: bool,
+}
+
+/// 建管理员的返回：totp_required 时服务端当场生成密钥，密钥/URI/二维码
+/// 仅返回一次（调用方必须立即展示并让用户扫码配置，之后不再可取）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateAdminResponse {
+    pub admin: AdminUser,
+    pub totp_secret: Option<String>,
+    pub totp_uri: Option<String>,
+    pub qr_png: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateAdminRequest {
+    pub role: Option<AdminRole>,
+    pub totp_required: Option<bool>,
 }
 
 /// 审计日志（§3.2：操作者、对象、变更前后快照，保留 180 天 §13）。

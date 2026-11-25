@@ -29,6 +29,9 @@ param(
   [switch]$NoService
 )
 $ErrorActionPreference = "Stop"
+# 计划任务以 SYSTEM 身份开机自启，注册需要管理员权限；用法本就要求管理员 PowerShell。
+$__isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+if (-not $__isAdmin) { throw "请用管理员身份运行 PowerShell 再执行本脚本（右键 PowerShell → 以管理员身份运行）。" }
 $Repo = "judy-gotv/Muse-IPTV"
 $TaskNames = @("Muse-IPTV API", "Muse-IPTV Worker", "Muse-IPTV Portal", "Muse-IPTV Admin", "Muse-IPTV Gateway")
 
@@ -208,11 +211,14 @@ New-Item -ItemType Directory -Force -Path $Tmp | Out-Null
 Invoke-WebRequest -Uri $Url -OutFile (Join-Path $Tmp $File)
 Invoke-WebRequest -Uri "https://github.com/$Repo/releases/download/$Version/SHA256SUMS" -OutFile (Join-Path $Tmp "SHA256SUMS")
 # 校验 SHA-256
-$expected = (Select-String -Path (Join-Path $Tmp "SHA256SUMS") -Pattern $File).Line.Split()[0]
+$__shaMatch = Select-String -Path (Join-Path $Tmp "SHA256SUMS") -Pattern $File
+if (-not $__shaMatch) { throw "SHA-256 校验失败：SHA256SUMS 里找不到 $File（该 Release 可能未附 SHA256SUMS，或文件名与 Release 资产不符）。" }
+$expected = $__shaMatch.Line.Split()[0]
 $actual = (Get-FileHash -Algorithm SHA256 (Join-Path $Tmp $File)).Hash.ToLower()
 if ($expected -ne $actual) { throw "SHA-256 校验失败：期望 $expected，实际 $actual" }
 Write-Host "SHA-256 校验通过"
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
+New-Item -ItemType Directory -Force -Path (Join-Path $InstallDir "data") | Out-Null
 # 升级时先停任务，否则运行中的 exe 占着文件，解压覆盖会失败。
 if ($installed) {
   foreach ($t in $TaskNames) {
@@ -239,7 +245,7 @@ if (-not (Test-Path $EnvFile)) {
   $play = -join ((1..32) | ForEach-Object { "{0:x2}" -f (Get-Random -Maximum 256) })
   $adminSecret = -join ((1..32) | ForEach-Object { "{0:x2}" -f (Get-Random -Maximum 256) })
   @"
-DATABASE_URL=sqlite://$InstallDir/data/iptv.db
+DATABASE_URL=sqlite://$($InstallDir.Replace('\','/'))/data/iptv.db
 PLAY_SECRET=$play
 ADMIN_SECRET=$adminSecret
 # 对外只暴露网关一个端口（默认 :8081）：门户 /、后台 /admin、
@@ -251,6 +257,8 @@ IPTV_PORTAL_ADDR=0.0.0.0:18081
 IPTV_ADMIN_ADDR=0.0.0.0:18082
 IPTV_PORTAL_BASE=http://127.0.0.1:18081
 IPTV_ADMIN_BASE=http://127.0.0.1:18082
+# B4：前端 hydrate 产物位置（portal/admin 由此找 site/pkg/*.js）。
+LEPTOS_SITE_ROOT=$InstallDir\site
 IPTV_ADMIN_USER=$adminUserFinal
 IPTV_ADMIN_PASSWORD=$adminPassFinal
 "@ | Out-File -Encoding utf8 $EnvFile
@@ -265,6 +273,8 @@ IPTV_ADMIN_PASSWORD=$adminPassFinal
   if (-not (Get-EnvValue $EnvFile "IPTV_ADMIN_ADDR")) { Set-EnvValue $EnvFile "IPTV_ADMIN_ADDR" "0.0.0.0:18082" }
   if (-not (Get-EnvValue $EnvFile "IPTV_PORTAL_BASE")) { Set-EnvValue $EnvFile "IPTV_PORTAL_BASE" "http://127.0.0.1:18081" }
   if (-not (Get-EnvValue $EnvFile "IPTV_ADMIN_BASE")) { Set-EnvValue $EnvFile "IPTV_ADMIN_BASE" "http://127.0.0.1:18082" }
+  # B4：升级补前端产物位置（旧 .env 没有这一行时才写）。
+  if (-not (Get-EnvValue $EnvFile "LEPTOS_SITE_ROOT")) { Set-EnvValue $EnvFile "LEPTOS_SITE_ROOT" "$InstallDir\site" }
   Write-Host "配置文件已存在：$EnvFile（保留原密钥与管理员密码，已按单端口布局迁移）"
 }
 $Version | Out-File -Encoding utf8 $VersionFile
@@ -286,8 +296,11 @@ if (-not $NoService) {
   $actionPortal = New-ScheduledTaskAction -Execute $portal -WorkingDirectory $InstallDir
   $actionAdmin = New-ScheduledTaskAction -Execute $admin -WorkingDirectory $InstallDir
   $actionGateway = New-ScheduledTaskAction -Execute $gateway -WorkingDirectory $InstallDir
-  $trigger = New-ScheduledTaskTrigger -AtLogOn
-  $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Highest
+  # 真正的开机自启：AtStartup + SYSTEM 账号（无须用户登录；此前 AtLogOn +
+  # Interactive 只在用户登录时才跑，不算开机自启）。服务以 $InstallDir 为
+  # 工作目录读 .env，不依赖用户环境变量。
+  $trigger = New-ScheduledTaskTrigger -AtStartup
+  $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
   Register-ScheduledTask -TaskName "Muse-IPTV API" -Action $actionApi -Trigger $trigger -Principal $principal -Force | Out-Null
   Register-ScheduledTask -TaskName "Muse-IPTV Worker" -Action $actionWorker -Trigger $trigger -Principal $principal -Force | Out-Null
   Register-ScheduledTask -TaskName "Muse-IPTV Portal" -Action $actionPortal -Trigger $trigger -Principal $principal -Force | Out-Null
@@ -304,3 +317,5 @@ if (-not $NoService) {
 }
 Show-Summary $Port
 if ($installed) { Write-Host "升级完成：Muse-IPTV $Version" } else { Write-Host "安装完成：Muse-IPTV $Version" }
+# 清理下载临时目录（此前固定目录从不清理）。
+Remove-Item $Tmp -Recurse -Force -ErrorAction SilentlyContinue

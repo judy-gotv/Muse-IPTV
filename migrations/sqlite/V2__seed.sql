@@ -15,7 +15,6 @@ INSERT OR IGNORE INTO system_setting (setting_key, setting_value, updated_at) VA
 INSERT OR IGNORE INTO system_setting (setting_key, setting_value, updated_at) VALUES ('remember_device_ttl_days', '90', 0);
 INSERT OR IGNORE INTO system_setting (setting_key, setting_value, updated_at) VALUES ('ticket_ttl_sec', '60', 0);
 INSERT OR IGNORE INTO system_setting (setting_key, setting_value, updated_at) VALUES ('audit_retention_days', '180', 0);
-INSERT OR IGNORE INTO system_setting (setting_key, setting_value, updated_at) VALUES ('max_upload_mb', '20', 0);
 
 INSERT OR IGNORE INTO channel_group (name, sort_weight, is_default) VALUES ('央视', 10, 1);
 INSERT OR IGNORE INTO channel_group (name, sort_weight, is_default) VALUES ('卫视', 20, 0);

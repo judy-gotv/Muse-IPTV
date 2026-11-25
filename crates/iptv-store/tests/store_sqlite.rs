@@ -83,6 +83,14 @@ fn channel_req(name: &str, group: &str, url: &str) -> CreateChannelRequest {
 }
 
 #[tokio::test]
+async fn migrate_is_idempotent() {
+    // B1 回归：API 与 Worker 启动都调 migrate()，同一库上重复执行必须成功。
+    let fx = setup().await;
+    fx.store.migrate().await.expect("second migrate");
+    fx.store.migrate().await.expect("third migrate");
+}
+
+#[tokio::test]
 async fn user_and_token_roundtrip() {
     let fx = setup().await;
     let s = &fx.store;

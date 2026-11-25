@@ -1,6 +1,10 @@
 //! 管理后台二进制（开发文档 §5）。
 //!
-//! Leptos SSR：`leptos_routes` + `shell()`；没有 `pkg/` 时仍可 SSR 渲染。
+//! Leptos SSR + hydrate：`leptos_routes` + `shell()`；hydrate 产物由
+//! cargo-leptos 构建（见 Dockerfile / release.yml），打进镜像与 Release
+//! 包的 `site/`，运行时由 `LEPTOS_SITE_ROOT` 指向（默认 `target/site`）。
+//! 输出名 `iptv-admin` 见 `crates/iptv-admin/Cargo.toml` 的
+//! `[package.metadata.leptos]`（此前缺失导致 shell 引用空名的 /pkg/.js）。
 //! 变更处理器是纯 Axum POST，无 hydrate 也能工作：管理员登录（Argon2 +
 //! TOTP，服务端校验）、退出、语言切换、各资源的创建 / 删除 / 同步 / 下线；
 //! 创建 Token 与生成登录票据后返回一次性展示页（明文 Token 只显示一次，§5.2）。
@@ -17,7 +21,7 @@
 use axum::{
     extract::{Form, Multipart, Path},
     http::{header, HeaderMap},
-    response::{Html, Redirect},
+    response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
     Router,
 };
@@ -62,11 +66,18 @@ async fn main() {
         .route("/admin/sessions/{id}/kick", post(kick_session))
         .route("/admin/plans", post(create_plan))
         .route("/admin/admins", post(create_admin))
+        .route("/admin/admins/{id}/update", post(update_admin))
+        .route("/admin/admins/{id}/delete", post(delete_admin))
+        .route("/admin/admins/{id}/reset-totp", post(reset_admin_totp))
         .route("/admin/settings", post(update_settings))
         .leptos_routes(&leptos_options, routes, {
             let leptos_options = leptos_options.clone();
             move || shell(leptos_options.clone())
         })
+        // B4：leptos_routes 只注册 leptos 路由与 server fn，不带静态文件
+        // 服务；/pkg/*.js 与 /pkg/*.wasm 必须由这个 fallback 经 ServeDir
+        // 从 LEPTOS_SITE_ROOT 指出，否则 hydrate 产物永远 404（空体）。
+        .fallback(leptos_axum::file_and_error_handler(shell))
         .with_state(leptos_options);
     tracing::info!("admin listening on {addr}");
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
@@ -107,11 +118,30 @@ struct BackendResult {
     error: Option<String>,
 }
 
+/// 从入站请求头取原始客户端 IP（网关写好的 X-Forwarded-For 首项，或
+/// X-Real-IP），调 API 时原样转发，API 才能按真实 IP 做限流分桶（M2）。
+fn forwarded_for(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.split(',').next())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            headers
+                .get("x-real-ip")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
+}
+
 async fn backend_json(
     method: reqwest::Method,
     path: &str,
     body: Option<serde_json::Value>,
     sid: Option<&str>,
+    xff: Option<&str>,
 ) -> BackendResult {
     let url = format!("{}{path}", api_base());
     let mut req = client().request(method, &url);
@@ -120,6 +150,9 @@ async fn backend_json(
     }
     if let Some(s) = sid {
         req = req.header("Cookie", format!("iptv_admin_sid={s}"));
+    }
+    if let Some(x) = xff {
+        req = req.header("X-Forwarded-For", x);
     }
     let Ok(res) = req.send().await else {
         return BackendResult {
@@ -200,8 +233,14 @@ fn split_csv(s: &Option<String>) -> Vec<String> {
         .collect()
 }
 
-/// 一次性展示页（Token / 票据只显示一次，§5.2）。
-fn onetime_page(title: &str, rows: &[(String, String)], qr_png: Option<&str>) -> Html<String> {
+/// 一次性展示页（Token / 票据 / TOTP 密钥只显示一次，§5.2）。
+/// `back` 为返回链接（路径，文案）。
+fn onetime_page(
+    title: &str,
+    rows: &[(String, String)],
+    qr_png: Option<&str>,
+    back: (&str, &str),
+) -> Html<String> {
     let mut body = format!(
         "<!DOCTYPE html><html lang=\"zh-Hant\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><link rel=\"stylesheet\" href=\"/design.css\"><title>{title}</title></head><body><div class=\"page\"><div class=\"card\"><h1>{title}</h1><p style=\"color:var(--c-destructive)\">This secret is shown only once. Save it now.</p>"
     );
@@ -215,7 +254,10 @@ fn onetime_page(title: &str, rows: &[(String, String)], qr_png: Option<&str>) ->
             "<p><img class=\"qr-img\" src=\"{qr}\" alt=\"QR code\"></p>"
         ));
     }
-    body.push_str("<p><a class=\"btn btn-filled\" href=\"/admin/tokens\">Back to Tokens</a></p></div></div></body></html>");
+    body.push_str(&format!(
+        "<p><a class=\"btn btn-filled\" href=\"{}\">{}</a></p></div></div></body></html>",
+        back.0, back.1
+    ));
     Html(body)
 }
 
@@ -230,7 +272,7 @@ struct LoginForm {
     totp_code: Option<String>,
 }
 
-async fn login(Form(form): Form<LoginForm>) -> (HeaderMap, Redirect) {
+async fn login(headers: HeaderMap, Form(form): Form<LoginForm>) -> (HeaderMap, Redirect) {
     let body = serde_json::json!({
         "username": form.username,
         "password": form.password,
@@ -241,6 +283,7 @@ async fn login(Form(form): Form<LoginForm>) -> (HeaderMap, Redirect) {
         "/api/v1/admin/auth/login",
         Some(body),
         None,
+        forwarded_for(&headers).as_deref(),
     )
     .await;
     if !r.ok {
@@ -337,6 +380,7 @@ async fn create_user(headers: HeaderMap, Form(f): Form<UserForm>) -> (HeaderMap,
         "/api/v1/admin/users",
         Some(body),
         admin_sid(&headers).as_deref(),
+        forwarded_for(&headers).as_deref(),
     )
     .await;
     ok_redirect("/admin/users", &r)
@@ -379,6 +423,7 @@ async fn create_token(headers: HeaderMap, Form(f): Form<TokenForm>) -> Html<Stri
         "/api/v1/admin/tokens",
         Some(body),
         admin_sid(&headers).as_deref(),
+        forwarded_for(&headers).as_deref(),
     )
     .await;
     if !r.ok {
@@ -411,6 +456,7 @@ async fn create_token(headers: HeaderMap, Form(f): Form<TokenForm>) -> Html<Stri
         "Token created",
         &rows,
         r.data.get("qr_png").and_then(|v| v.as_str()),
+        ("/admin/tokens", "Back to Tokens"),
     )
 }
 
@@ -420,6 +466,7 @@ async fn create_login_ticket(headers: HeaderMap, Path(id): Path<i64>) -> Html<St
         &format!("/api/v1/admin/tokens/{id}/login-ticket"),
         Some(serde_json::json!({})),
         admin_sid(&headers).as_deref(),
+        forwarded_for(&headers).as_deref(),
     )
     .await;
     if !r.ok {
@@ -450,6 +497,7 @@ async fn create_login_ticket(headers: HeaderMap, Path(id): Path<i64>) -> Html<St
         "Login ticket",
         &rows,
         r.data.get("qr_png").and_then(|v| v.as_str()),
+        ("/admin/tokens", "Back to Tokens"),
     )
 }
 
@@ -459,6 +507,7 @@ async fn revoke_token_sessions(headers: HeaderMap, Path(id): Path<i64>) -> (Head
         &format!("/api/v1/admin/tokens/{id}/revoke-sessions"),
         Some(serde_json::json!({})),
         admin_sid(&headers).as_deref(),
+        forwarded_for(&headers).as_deref(),
     )
     .await;
     ok_redirect("/admin/tokens", &r)
@@ -500,6 +549,7 @@ async fn create_channel(headers: HeaderMap, Form(f): Form<ChannelForm>) -> (Head
         "/api/v1/admin/channels",
         Some(body),
         admin_sid(&headers).as_deref(),
+        forwarded_for(&headers).as_deref(),
     )
     .await;
     ok_redirect("/admin/channels", &r)
@@ -511,6 +561,7 @@ async fn delete_channel(headers: HeaderMap, Path(id): Path<i64>) -> (HeaderMap, 
         &format!("/api/v1/admin/channels/{id}"),
         None,
         admin_sid(&headers).as_deref(),
+        forwarded_for(&headers).as_deref(),
     )
     .await;
     ok_redirect("/admin/channels", &r)
@@ -536,6 +587,7 @@ async fn create_source(headers: HeaderMap, Form(f): Form<SourceForm>) -> (Header
         "/api/v1/admin/sources",
         Some(body),
         admin_sid(&headers).as_deref(),
+        forwarded_for(&headers).as_deref(),
     )
     .await;
     ok_redirect("/admin/sources", &r)
@@ -606,6 +658,7 @@ async fn trigger_sync(headers: HeaderMap, Path(id): Path<i64>) -> (HeaderMap, Re
         &format!("/api/v1/admin/sources/{id}/sync"),
         Some(serde_json::json!({})),
         admin_sid(&headers).as_deref(),
+        forwarded_for(&headers).as_deref(),
     )
     .await;
     ok_redirect("/admin/sources", &r)
@@ -631,6 +684,7 @@ async fn create_group(headers: HeaderMap, Form(f): Form<GroupForm>) -> (HeaderMa
         "/api/v1/admin/groups",
         Some(body),
         admin_sid(&headers).as_deref(),
+        forwarded_for(&headers).as_deref(),
     )
     .await;
     ok_redirect("/admin/groups", &r)
@@ -652,6 +706,7 @@ async fn create_epg_source(
         "/api/v1/admin/epg/sources",
         Some(body),
         admin_sid(&headers).as_deref(),
+        forwarded_for(&headers).as_deref(),
     )
     .await;
     ok_redirect("/admin/epg", &r)
@@ -663,6 +718,7 @@ async fn kick_session(headers: HeaderMap, Path(id): Path<i64>) -> (HeaderMap, Re
         &format!("/api/v1/admin/sessions/{id}"),
         None,
         admin_sid(&headers).as_deref(),
+        forwarded_for(&headers).as_deref(),
     )
     .await;
     ok_redirect("/admin/sessions", &r)
@@ -694,6 +750,7 @@ async fn create_plan(headers: HeaderMap, Form(f): Form<PlanForm>) -> (HeaderMap,
         "/api/v1/admin/plans",
         Some(body),
         admin_sid(&headers).as_deref(),
+        forwarded_for(&headers).as_deref(),
     )
     .await;
     ok_redirect("/admin/plans", &r)
@@ -707,7 +764,7 @@ struct AdminForm {
     totp_required: Option<String>,
 }
 
-async fn create_admin(headers: HeaderMap, Form(f): Form<AdminForm>) -> (HeaderMap, Redirect) {
+async fn create_admin(headers: HeaderMap, Form(f): Form<AdminForm>) -> Response {
     let body = serde_json::json!({
         "username": f.username,
         "password": f.password,
@@ -719,9 +776,121 @@ async fn create_admin(headers: HeaderMap, Form(f): Form<AdminForm>) -> (HeaderMa
         "/api/v1/admin/admins",
         Some(body),
         admin_sid(&headers).as_deref(),
+        forwarded_for(&headers).as_deref(),
+    )
+    .await;
+    if !r.ok {
+        return ok_redirect("/admin/admins", &r).into_response();
+    }
+    // totp_required 时后端当场配给密钥：只显示一次（密钥 + otpauth URI + 二维码），
+    // 用户须立即用验证器 App 扫码；首次登录输入一枚码后 TOTP 才启用。
+    if let Some(secret) = r.data.get("totp_secret").and_then(|v| v.as_str()) {
+        let rows = vec![
+            (
+                "Username".to_string(),
+                r.data
+                    .get("admin")
+                    .and_then(|a| a.get("username"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            ),
+            ("TOTP secret (shown once)".to_string(), secret.to_string()),
+            (
+                "otpauth URI".to_string(),
+                r.data
+                    .get("totp_uri")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            ),
+        ];
+        return onetime_page(
+            "TOTP provisioned",
+            &rows,
+            r.data.get("qr_png").and_then(|v| v.as_str()),
+            ("/admin/admins", "Back to Admins"),
+        )
+        .into_response();
+    }
+    ok_redirect("/admin/admins", &r).into_response()
+}
+
+#[derive(Deserialize)]
+struct AdminUpdateForm {
+    role: String,
+    totp_required: Option<String>,
+}
+
+async fn update_admin(
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Form(f): Form<AdminUpdateForm>,
+) -> (HeaderMap, Redirect) {
+    let body = serde_json::json!({
+        "role": f.role,
+        "totp_required": f.totp_required.as_deref() == Some("true"),
+    });
+    let r = backend_json(
+        reqwest::Method::PATCH,
+        &format!("/api/v1/admin/admins/{id}"),
+        Some(body),
+        admin_sid(&headers).as_deref(),
+        forwarded_for(&headers).as_deref(),
     )
     .await;
     ok_redirect("/admin/admins", &r)
+}
+
+async fn delete_admin(headers: HeaderMap, Path(id): Path<i64>) -> (HeaderMap, Redirect) {
+    let r = backend_json(
+        reqwest::Method::DELETE,
+        &format!("/api/v1/admin/admins/{id}"),
+        None,
+        admin_sid(&headers).as_deref(),
+        forwarded_for(&headers).as_deref(),
+    )
+    .await;
+    ok_redirect("/admin/admins", &r)
+}
+
+async fn reset_admin_totp(headers: HeaderMap, Path(id): Path<i64>) -> Html<String> {
+    let r = backend_json(
+        reqwest::Method::POST,
+        &format!("/api/v1/admin/admins/{id}/reset-totp"),
+        Some(serde_json::json!({})),
+        admin_sid(&headers).as_deref(),
+        forwarded_for(&headers).as_deref(),
+    )
+    .await;
+    if !r.ok {
+        let e = r.error.unwrap_or_else(|| "reset totp failed".to_string());
+        return Html(format!("<!DOCTYPE html><html><body><p>{e}</p><p><a href=\"/admin/admins\">Back</a></p></body></html>"));
+    }
+    let rows = vec![
+        (
+            "TOTP secret (shown once)".to_string(),
+            r.data
+                .get("totp_secret")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+        ),
+        (
+            "otpauth URI".to_string(),
+            r.data
+                .get("totp_uri")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+        ),
+    ];
+    onetime_page(
+        "TOTP re-provisioned",
+        &rows,
+        r.data.get("qr_png").and_then(|v| v.as_str()),
+        ("/admin/admins", "Back to Admins"),
+    )
 }
 
 #[derive(Deserialize)]
@@ -739,6 +908,7 @@ async fn update_settings(headers: HeaderMap, Form(f): Form<SettingForm>) -> (Hea
         "/api/v1/admin/settings",
         Some(body),
         admin_sid(&headers).as_deref(),
+        forwarded_for(&headers).as_deref(),
     )
     .await;
     ok_redirect("/admin/settings", &r)

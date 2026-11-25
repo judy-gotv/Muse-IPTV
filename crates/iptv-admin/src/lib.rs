@@ -16,16 +16,20 @@ use iptv_design::{
     StatusKind, TextField, Toggle, Toolbar,
 };
 use iptv_dto::{
-    AdminRole, AdminUser, AppUser, AuditLog, Channel, ChannelGroup, Envelope, EpgProgram,
-    EpgSource, Paged, Plan, PlaybackSession, PlaylistSource, StatsOverview, SyncDiff, SyncLog,
-    SystemSetting, UserToken,
+    AdminRole, AdminUser, AppUser, AuditLog, Channel, ChannelGroup, EpgProgram, EpgSource, Paged,
+    Plan, PlaybackSession, PlaylistSource, StatsOverview, SyncDiff, SyncLog, SystemSetting,
+    UserToken,
 };
+// 只在服务端用（admin_get 解 Envelope）。
+#[cfg(feature = "ssr")]
+use iptv_dto::Envelope;
 use iptv_ui::{fmt_dt, t_or, LanguageSwitcher, LocaleCtx};
 use leptos::prelude::*;
 use leptos_meta::{provide_meta_context, MetaTags, Title};
 use leptos_router::components::{Route, Router, Routes};
 use leptos_router::hooks::use_query_map;
 use leptos_router::path;
+#[cfg(feature = "ssr")]
 use serde::de::DeserializeOwned;
 
 // ---------------------------------------------------------------------------
@@ -33,6 +37,8 @@ use serde::de::DeserializeOwned;
 // ---------------------------------------------------------------------------
 
 /// 后端地址：`IPTV_API_BASE`，默认 `http://127.0.0.1:8080`。
+/// 只在服务端存在（main.rs 与 server fn 用；WASM 侧不接触后端地址）。
+#[cfg(feature = "ssr")]
 pub fn api_base() -> String {
     std::env::var("IPTV_API_BASE").unwrap_or_else(|_| "http://127.0.0.1:8080".to_string())
 }
@@ -48,6 +54,7 @@ pub fn cookie_value(header: &str, name: &str) -> Option<String> {
     })
 }
 
+#[cfg(feature = "ssr")]
 fn parts_cookie(name: &str) -> Option<String> {
     let parts = use_context::<axum::http::request::Parts>()?;
     let header = parts
@@ -58,6 +65,19 @@ fn parts_cookie(name: &str) -> Option<String> {
     cookie_value(header, name)
 }
 
+/// WASM 侧读 Cookie：`document.cookie`。hydrate 后与 SSR 渲染的 locale /
+/// 主题 / 角色必须一致，否则页面会闪回默认值。
+#[cfg(not(feature = "ssr"))]
+fn parts_cookie(name: &str) -> Option<String> {
+    // `cookie` 在 HtmlDocument 上（Document 没有这个方法）。
+    use wasm_bindgen::JsCast;
+    let document = web_sys::window()?.document()?;
+    let html = document.dyn_into::<web_sys::HtmlDocument>().ok()?;
+    let cookie = html.cookie().ok()?;
+    cookie_value(&cookie, name)
+}
+
+#[cfg(feature = "ssr")]
 fn parts_accept_language() -> Option<String> {
     let parts = use_context::<axum::http::request::Parts>()?;
     parts
@@ -68,6 +88,13 @@ fn parts_accept_language() -> Option<String> {
         .map(|s| s.to_string())
 }
 
+/// WASM 侧读浏览器语言。
+#[cfg(not(feature = "ssr"))]
+fn parts_accept_language() -> Option<String> {
+    web_sys::window()?.navigator().language()
+}
+
+#[cfg(feature = "ssr")]
 fn http_client() -> reqwest::Client {
     reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
@@ -76,6 +103,7 @@ fn http_client() -> reqwest::Client {
 }
 
 /// GET 后端接口；401 返回 `Ok(None)`（未登录）。
+#[cfg(feature = "ssr")]
 async fn admin_get<T: DeserializeOwned>(path: &str) -> Result<Option<T>, String> {
     let url = format!("{}{path}", api_base());
     let mut req = http_client().get(&url);
@@ -263,6 +291,7 @@ pub async fn admin_settings() -> Result<Option<Vec<SystemSetting>>, ServerFnErro
         .map_err(ServerFnError::new)
 }
 
+#[cfg(feature = "ssr")]
 fn pct_encode(s: &str) -> String {
     let mut out = String::new();
     for b in s.as_bytes() {
@@ -886,7 +915,7 @@ fn SourcesPage() -> impl IntoView {
                         </div>
                         <button class="btn btn-filled" type="submit">{t_or("common.save", "Save")}</button>
                     </form>
-                    <h3>"Upload local M3U (.m3u / .m3u8 / .txt, max 20 MB)"</h3>
+                    <h3>"Upload local M3U (.m3u / .m3u8 / .txt, no size limit)"</h3>
                     <form method="post" action="/admin/sources/upload" enctype="multipart/form-data">
                         <div class="field">
                             <label for="m3u-name">"Source name"</label>
@@ -1310,20 +1339,59 @@ fn AdminsPage() -> impl IntoView {
                             view! {
                                 <div class="table-wrap">
                                     <table class="admin-table">
-                                        <thead><tr><th>ID</th><th>Username</th><th>Role</th><th>TOTP enabled</th><th>TOTP required</th></tr></thead>
+                                        <thead><tr><th>ID</th><th>Username</th><th>Role</th><th>TOTP status</th><th>TOTP required</th><th>Actions</th></tr></thead>
                                         <tbody>
-                                            {list.into_iter().map(|a| view! {
-                                                <tr>
-                                                    <td>{a.id}</td>
-                                                    <td>{a.username}</td>
-                                                    <td>{format!("{:?}", a.role)}</td>
-                                                    <td>{if a.totp_enabled { "✓" } else { "" }}</td>
-                                                    <td>{if a.totp_required { "✓" } else { "" }}</td>
-                                                </tr>
+                                            {list.into_iter().map(|a| {
+                                                // TOTP 状态：已启用 / 待验证（已配给、首次登录输码后启用）/ 未配给。
+                                                let totp_status = if a.totp_enabled {
+                                                    "已启用"
+                                                } else if a.totp_provisioned {
+                                                    "待验证"
+                                                } else {
+                                                    "未配给"
+                                                };
+                                                let is_super_admin = a.role == AdminRole::SuperAdmin;
+                                                let is_operator = a.role == AdminRole::Operator;
+                                                let is_support = a.role == AdminRole::Support;
+                                                let is_readonly = a.role == AdminRole::Readonly;
+                                                let required = a.totp_required;
+                                                let id = a.id;
+                                                view! {
+                                                    <tr>
+                                                        <td>{id}</td>
+                                                        <td>{a.username}</td>
+                                                        <td>{format!("{:?}", a.role)}</td>
+                                                        <td>{totp_status}</td>
+                                                        <td>{if required { "✓" } else { "" }}</td>
+                                                        <td>
+                                                            {is_super.then(|| view! {
+                                                                <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+                                                                    <form method="post" action=format!("/admin/admins/{id}/update") style="display:inline-flex;gap:6px;align-items:center">
+                                                                        <select name="role">
+                                                                            <option value="super_admin" selected=is_super_admin>"Super admin"</option>
+                                                                            <option value="operator" selected=is_operator>"Operator"</option>
+                                                                            <option value="support" selected=is_support>"Support"</option>
+                                                                            <option value="readonly" selected=is_readonly>"Readonly"</option>
+                                                                        </select>
+                                                                        <label><input type="checkbox" name="totp_required" value="true" checked=required/>"Require TOTP"</label>
+                                                                        <button class="btn" type="submit">{t_or("common.save", "Save")}</button>
+                                                                    </form>
+                                                                    <form method="post" action=format!("/admin/admins/{id}/reset-totp") style="display:inline">
+                                                                        <button class="btn" type="submit">"配给/重置 TOTP"</button>
+                                                                    </form>
+                                                                    <form method="post" action=format!("/admin/admins/{id}/delete") style="display:inline">
+                                                                        <button class="btn btn-destructive" type="submit">{t_or("common.delete", "Delete")}</button>
+                                                                    </form>
+                                                                </div>
+                                                            })}
+                                                        </td>
+                                                    </tr>
+                                                }
                                             }).collect_view()}
                                         </tbody>
                                     </table>
                                 </div>
+                                <p style="font-size:var(--text-footnote);color:var(--c-label-secondary)">"TOTP 未配给的账号仍可用密码登录（视为配置未完成，不锁死）；建管理员勾选 Require TOTP 时密钥只显示一次，请立即扫码；配给后首次登录输入一枚码即启用。"</p>
                             }.into_any()
                         }
                     }
@@ -1402,6 +1470,21 @@ fn AuditPage() -> impl IntoView {
 }
 
 /// `/admin/settings` 系统参数、默认语言、可用语言（§5.1/§3.2）。
+/// M1：四个键暂无消费点，标记“预留”而非假装已接入——
+/// `default_max_concurrent_sessions` / `default_max_bound_devices`（套餐与
+/// Token 创建都强制显式填值，无默认值 fallback 的调用点）、
+/// `single_ip_token_limit`（文档未定义它限制哪个操作）、`cdn_domain`
+/// （播放地址是带签名的相对路径，文档未定义 CDN 域名如何拼）。
+fn setting_status(key: &str) -> &'static str {
+    match key {
+        "default_max_concurrent_sessions"
+        | "default_max_bound_devices"
+        | "single_ip_token_limit"
+        | "cdn_domain" => "预留（未接入）",
+        _ => "已接入",
+    }
+}
+
 #[component]
 fn SettingsPage() -> impl IntoView {
     let settings = Resource::new_blocking(|| (), |_| async move { admin_settings().await });
@@ -1422,7 +1505,7 @@ fn SettingsPage() -> impl IntoView {
                         <button class="btn btn-filled" type="submit">{t_or("common.save", "Save")}</button>
                     </form>
                     <p style="font-size:var(--text-footnote);color:var(--c-label-secondary)">
-                        "Keys (§3.2): default_max_concurrent_sessions, heartbeat_interval_sec, session_timeout_sec, max_tokens_per_ip, signature_ttl_sec, cdn_domain, alert_thresholds, default_locale, available_locales."
+                        "Keys (§3.2): default_max_concurrent_sessions, default_max_bound_devices, heartbeat_interval_sec, session_timeout_sec, single_ip_token_limit, play_url_ttl_sec, cdn_domain, alert_threshold_failed_syncs, default_locale, available_locales, portal_session_ttl_days, remember_device_ttl_days, ticket_ttl_sec, audit_retention_days."
                     </p>
                 </div>
             })}
@@ -1435,13 +1518,14 @@ fn SettingsPage() -> impl IntoView {
                             view! {
                                 <div class="table-wrap">
                                     <table class="admin-table">
-                                        <thead><tr><th>Key</th><th>Value</th><th>Updated</th></tr></thead>
+                                        <thead><tr><th>Key</th><th>Value</th><th>Updated</th><th>Status</th></tr></thead>
                                         <tbody>
                                             {list.into_iter().map(|s| view! {
                                                 <tr>
-                                                    <td class="mono">{s.key}</td>
+                                                    <td class="mono">{s.key.clone()}</td>
                                                     <td class="mono">{s.value.to_string()}</td>
                                                     <td>{fmt_dt(s.updated_at)}</td>
+                                                    <td>{setting_status(&s.key)}</td>
                                                 </tr>
                                             }).collect_view()}
                                         </tbody>
@@ -1456,4 +1540,18 @@ fn SettingsPage() -> impl IntoView {
             </Suspense>
         </AdminLayout>
     }
+}
+
+// ---------------------------------------------------------------------------
+// WASM hydrate 入口（B4）
+// ---------------------------------------------------------------------------
+
+/// hydrate 入口：cargo-leptos 生成的 `/pkg/iptv-admin.js` 在加载后调用它，
+/// 把 SSR 出来的 HTML 挂上交互（`#[server]` 函数的客户端存根、资源重取）。
+/// 只在 hydrate 构建里编译；服务端构建不包含它。
+#[cfg(feature = "hydrate")]
+#[wasm_bindgen::prelude::wasm_bindgen]
+pub fn hydrate() {
+    console_error_panic_hook::set_once();
+    leptos::mount::hydrate_body(App);
 }

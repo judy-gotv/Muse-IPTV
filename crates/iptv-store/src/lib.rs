@@ -67,6 +67,10 @@ pub struct Store {
     /// （CONTRACTS.md：“由 upsert_channels 的结果重建”；进程内缓存，
     /// 重启后为空，见 `get_sync_diff`）。
     last_diffs: std::sync::Mutex<HashMap<i64, SyncDiff>>,
+    /// 系统设置缓存（M1）：整表一次读出，60 秒 TTL；`set_setting` 清空。
+    /// 跨进程（API 与 Worker 各自）最多 stale 60 秒，设置类读操作可接受。
+    settings_cache:
+        std::sync::RwLock<Option<(std::time::Instant, HashMap<String, serde_json::Value>)>>,
 }
 
 impl Store {
@@ -109,28 +113,34 @@ impl Store {
             pool,
             dialect,
             last_diffs: std::sync::Mutex::new(HashMap::new()),
+            settings_cache: std::sync::RwLock::new(None),
         })
     }
 
-    /// 按方言依次执行内嵌的 V1/V2/V3 迁移（`migrations/{dialect}/`）。
-    /// 幂等：V1 用 `CREATE TABLE IF NOT EXISTS`，V2 种子用各方言的
-    /// 忽略冲突写法，重复执行不会产生重复数据。
+    /// 按方言依次执行内嵌的 V1–V4 迁移（`migrations/{dialect}/`）。
+    /// 幂等：V1 用 `CREATE TABLE IF NOT EXISTS` + `CREATE INDEX IF NOT EXISTS`
+    /// （MySQL 不支持索引的 `IF NOT EXISTS` 语法，见 `exec_script` 的
+    /// 重复索引容忍），V2 种子用各方言的忽略冲突写法，重复执行不会产生
+    /// 重复数据。API 与 Worker 启动都调本函数，先后启动必须都成功。
     pub async fn migrate(&self) -> anyhow::Result<()> {
         let files: &[&str] = match self.dialect {
             Dialect::Postgres => &[
                 include_str!("../../../migrations/postgres/V1__init.sql"),
                 include_str!("../../../migrations/postgres/V2__seed.sql"),
                 include_str!("../../../migrations/postgres/V3__i18n_tables.sql"),
+                include_str!("../../../migrations/postgres/V4__drop_max_upload_mb.sql"),
             ],
             Dialect::MySql => &[
                 include_str!("../../../migrations/mysql/V1__init.sql"),
                 include_str!("../../../migrations/mysql/V2__seed.sql"),
                 include_str!("../../../migrations/mysql/V3__i18n_tables.sql"),
+                include_str!("../../../migrations/mysql/V4__drop_max_upload_mb.sql"),
             ],
             Dialect::Sqlite => &[
                 include_str!("../../../migrations/sqlite/V1__init.sql"),
                 include_str!("../../../migrations/sqlite/V2__seed.sql"),
                 include_str!("../../../migrations/sqlite/V3__i18n_tables.sql"),
+                include_str!("../../../migrations/sqlite/V4__drop_max_upload_mb.sql"),
             ],
         };
         if self.dialect == Dialect::Sqlite {
@@ -145,6 +155,13 @@ impl Store {
     }
 
     /// 逐条执行迁移脚本（按 `;` 切分；脚本内不得在字符串字面量里写 `;`）。
+    ///
+    /// 幂等容忍：MySQL 没有 `CREATE INDEX IF NOT EXISTS` 语法（MariaDB
+    /// 才有），同一条 `CREATE [UNIQUE] INDEX` 第二次执行会报
+    /// `Duplicate key name`；SQLite/PG 虽已用 `IF NOT EXISTS`，但索引
+    /// 若已存在且定义不同也会报错。因此仅对 `CREATE INDEX` /
+    /// `CREATE UNIQUE INDEX` 语句，把“已存在”类错误当作已应用跳过，
+    /// 其他语句的任何错误仍原样返回。
     async fn exec_script(&self, sql: &str) -> anyhow::Result<()> {
         for chunk in sql.split(';') {
             let cleaned: String = chunk
@@ -156,7 +173,19 @@ impl Store {
             if stmt.is_empty() {
                 continue;
             }
-            sqlx::query(stmt).execute(&self.pool).await?;
+            if let Err(e) = sqlx::query(stmt).execute(&self.pool).await {
+                let upper = stmt.trim_start().to_ascii_uppercase();
+                let is_create_index =
+                    upper.starts_with("CREATE INDEX") || upper.starts_with("CREATE UNIQUE INDEX");
+                let msg = e.to_string().to_ascii_lowercase();
+                let duplicate = msg.contains("already exists")
+                    || msg.contains("duplicate key name")
+                    || msg.contains("duplicate key");
+                if is_create_index && duplicate {
+                    continue;
+                }
+                return Err(e.into());
+            }
         }
         Ok(())
     }

@@ -115,6 +115,17 @@ impl I18n {
     /// §12.2 判定顺序：用户设置 → Cookie → Accept-Language → 默认。
     /// `zh` 不带脚本时按地区猜测（TW/HK/MO → Hant，其余 → Hans）。
     pub fn negotiate(user: Option<&str>, cookie: Option<&str>, accept: Option<&str>) -> String {
+        Self::negotiate_with_default(user, cookie, accept, DEFAULT_LOCALE)
+    }
+
+    /// 同 `negotiate`，但最后的“默认”由调用方传入（M1：API 中间件传系统
+    /// 设置 `default_locale`；读不到时仍回退到 `DEFAULT_LOCALE`）。
+    pub fn negotiate_with_default(
+        user: Option<&str>,
+        cookie: Option<&str>,
+        accept: Option<&str>,
+        default: &str,
+    ) -> String {
         for cand in [user, cookie] {
             if let Some(c) = cand.and_then(normalize_locale) {
                 return c;
@@ -137,11 +148,11 @@ impl I18n {
                     return "zh-Hans-CN".to_string();
                 }
                 if tag.eq_ignore_ascii_case("zh") {
-                    return DEFAULT_LOCALE.to_string();
+                    return default.to_string();
                 }
             }
         }
-        DEFAULT_LOCALE.to_string()
+        default.to_string()
     }
 
     /// 查文案：按回退链逐个 locale 找，找不到返回 key 本身（并记为漏翻信号）。

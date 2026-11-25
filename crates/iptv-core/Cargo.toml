@@ -17,6 +17,10 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 hmac = { workspace = true }
 rand = { workspace = true }
+# B4：token.rs 用 rand::thread_rng()。WASM 构建里 rand 0.8 经 getrandom 0.2
+# 取随机数，wasm32-unknown-unknown 上必须开 getrandom 的 js 特性（用
+# Crypto.getRandomValues），否则编不过；宿主构建上该特性是惰性的。
+getrandom = { workspace = true }
 anyhow = { workspace = true }
 
 [dev-dependencies]

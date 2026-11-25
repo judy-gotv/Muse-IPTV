@@ -8,11 +8,15 @@
 //!
 //! 转发是流式的：请求/响应 body 直接透传不缓冲整包，`/p/*` 视频分片与
 //! M3U multipart 上传都能过；`Range` / `Cookie` / `Set-Cookie` 原样透传；
-//! `X-Forwarded-For` 追加直连客户端 IP（API 的 `client_ip` 取首位，
-//! 限流与播放 IP 统计才能看到真实 IP）。
+//! `X-Forwarded-For` 写成直连客户端 IP（API 的 `client_ip` 取首位，
+//! 限流与播放 IP 统计才能看到真实 IP）。注意：客户端自带的 XFF 不可信
+//! （伪造首项可绕过按 IP 限流），网关默认**覆盖**为直连对端 IP；只有在
+//! 网关前面还有一层自己可信的反代（nginx/Caddy 已写好 XFF）时，才设
+//! `GATEWAY_TRUST_XFF=1` 改为追加。
 //!
 //! 环境变量：
 //! - `GATEWAY_BIND_ADDR`（默认 `0.0.0.0:8081`）：对外监听地址
+//! - `GATEWAY_TRUST_XFF`（默认 `0`）：为 `1` 时信任入站 XFF 并追加对端 IP
 //! - `IPTV_API_BASE`（默认 `http://127.0.0.1:8080`）
 //! - `IPTV_PORTAL_BASE`（默认 `http://127.0.0.1:18081`）
 //! - `IPTV_ADMIN_BASE`（默认 `http://127.0.0.1:18082`）
@@ -71,6 +75,8 @@ struct Gate {
     api: String,
     portal: String,
     admin: String,
+    /// 是否信任入站 XFF（网关前有可信反代时才开，默认 false：直接覆盖）。
+    trust_xff: bool,
 }
 
 impl Gate {
@@ -143,10 +149,16 @@ async fn proxy(
         }
         out = out.header(name, value);
     }
-    // X-Forwarded-For 追加直连客户端 IP（API 取首位 = 真实客户端）。
-    let xff = match incoming_xff {
-        Some(prev) if !prev.trim().is_empty() => format!("{prev}, {}", peer.ip()),
-        _ => peer.ip().to_string(),
+    // X-Forwarded-For：默认直接写成直连对端 IP（客户端自带的 XFF 不可信，
+    // 追加会让伪造的首项被 API 当作真实 IP，绕过按 IP 限流）；只有网关前面
+    // 还有一层可信反代（GATEWAY_TRUST_XFF=1）时才追加到入站 XFF 之后。
+    let xff = if gate.trust_xff {
+        match incoming_xff {
+            Some(prev) if !prev.trim().is_empty() => format!("{prev}, {}", peer.ip()),
+            _ => peer.ip().to_string(),
+        }
+    } else {
+        peer.ip().to_string()
     };
     if let Ok(v) = HeaderValue::from_str(&xff) {
         out = out.header("x-forwarded-for", v);
@@ -206,6 +218,9 @@ async fn main() {
             .unwrap_or_else(|_| "http://127.0.0.1:18081".to_string()),
         admin: std::env::var("IPTV_ADMIN_BASE")
             .unwrap_or_else(|_| "http://127.0.0.1:18082".to_string()),
+        trust_xff: std::env::var("GATEWAY_TRUST_XFF")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false),
     });
     // 注意：`/{*rest}` 通配符不匹配裸根路径 `/`（axum 0.8 通配符要求
     // 至少一段），根路径必须单独注册，否则门户首页会落到 axum 的空 404。

@@ -48,6 +48,32 @@ fn verify(state: &AppState, channel_id: i64, q: &PlayQuery) -> Result<(), ApiErr
     Ok(())
 }
 
+/// m7：播放会话须仍是 active——签名本身 300s 有效，stop 后若不查状态，
+/// 停播的地址在剩余有效期内仍能拉流。返回会话的 channel_id 供调用方复用。
+async fn require_active_session(
+    state: &AppState,
+    session_uid: &str,
+) -> Result<iptv_dto::PlaybackSession, ApiError> {
+    let session = state
+        .store
+        .get_playback_session(session_uid)
+        .await
+        .map_err(ApiError::from)?
+        .ok_or_else(|| {
+            ApiError::new(
+                iptv_dto::ErrorCode::SessionExpired,
+                "playback session not found",
+            )
+        })?;
+    if session.status != "active" {
+        return Err(ApiError::new(
+            iptv_dto::ErrorCode::SessionExpired,
+            "playback session not active",
+        ));
+    }
+    Ok(session)
+}
+
 async fn primary_url(state: &Arc<AppState>, channel_id: i64) -> Result<String, ApiError> {
     // 只校验频道存在（404），地址取主端点记录。
     state
@@ -85,30 +111,31 @@ pub async fn proxy_manifest(
         .and_then(|s| s.parse().ok())
         .ok_or_else(|| ApiError::new(iptv_dto::ErrorCode::NotFound, "bad manifest path"))?;
     verify(&state, channel_id, &q)?;
+    // m7：会话 stop/过期后，签名剩余有效期内的清单地址须失效。
+    let session = require_active_session(&state, &q.session).await?;
+    if session.channel_id != channel_id {
+        return Err(ApiError::new(
+            iptv_dto::ErrorCode::SessionExpired,
+            "playback session channel mismatch",
+        ));
+    }
     let upstream = primary_url(&state, channel_id).await?;
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
-        .user_agent("Muse-IPTV/0.1.0")
+        .user_agent(format!("Muse-IPTV/{}", iptv_core::VERSION))
+        // M3：重定向最多跟 3 跳。
+        .redirect(reqwest::redirect::Policy::limited(3))
         .build()
         .map_err(ApiError::from)?;
-    let body = client
-        .get(&upstream)
-        .send()
-        .await
-        .map_err(|_| {
-            ApiError::new(
-                iptv_dto::ErrorCode::SourceUnavailable,
-                "upstream fetch failed",
-            )
-        })?
-        .text()
-        .await
-        .map_err(|_| {
-            ApiError::new(
-                iptv_dto::ErrorCode::SourceUnavailable,
-                "upstream read failed",
-            )
-        })?;
+    let resp = client.get(&upstream).send().await.map_err(|_| {
+        ApiError::new(
+            iptv_dto::ErrorCode::SourceUnavailable,
+            "upstream fetch failed",
+        )
+    })?;
+    // M4：流式读、边读边累计上限（20 MB），超限立即断流，不先整包进内存。
+    let bytes = read_capped(resp, MANIFEST_MAX_BYTES).await?;
+    let body = String::from_utf8_lossy(&bytes).into_owned();
     let base = reqwest::Url::parse(&upstream)
         .map_err(|_| ApiError::new(iptv_dto::ErrorCode::SourceUnavailable, "bad upstream url"))?;
     let rewritten = rewrite_manifest(&body, &base, &q);
@@ -118,6 +145,32 @@ pub async fn proxy_manifest(
         .header(header::CACHE_CONTROL, "no-store")
         .body(axum::body::Body::from(rewritten))
         .unwrap())
+}
+
+/// 上游清单单响应上限（M4）。清单本身很小，20 MB 是安全兜底。
+const MANIFEST_MAX_BYTES: usize = 20 * 1024 * 1024;
+
+/// 流式读响应体，累计超 `limit` 立即报错中断，不继续消费上游。
+async fn read_capped(resp: reqwest::Response, limit: usize) -> Result<Vec<u8>, ApiError> {
+    use futures_util::StreamExt;
+    let mut buf = Vec::new();
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|_| {
+            ApiError::new(
+                iptv_dto::ErrorCode::SourceUnavailable,
+                "upstream read failed",
+            )
+        })?;
+        if buf.len() + chunk.len() > limit {
+            return Err(ApiError::new(
+                iptv_dto::ErrorCode::SourceUnavailable,
+                "upstream response too large",
+            ));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
 }
 
 /// 把 manifest 里的相对 URI 改写为 `/p/seg` 代理地址（带同一签名）。
@@ -192,31 +245,25 @@ pub async fn proxy_segment(
     Query(q): Query<SegQuery>,
 ) -> Result<Response, ApiError> {
     // session_uid 里的 channel_id 无法从签名反推：验签时用 session 对应的播放会话查 channel。
-    let session = state
-        .store
-        .get_playback_session(&q.session)
-        .await
-        .map_err(ApiError::from)?
-        .ok_or_else(|| {
-            ApiError::new(
-                iptv_dto::ErrorCode::SessionExpired,
-                "playback session not found",
-            )
-        })?;
+    // m7：先查会话状态（stop/过期后分片地址立即失效），再验签名。
+    let session = require_active_session(&state, &q.session).await?;
     let pq = PlayQuery {
         exp: q.exp,
         session: q.session.clone(),
         sig: q.sig.clone(),
     };
     verify(&state, session.channel_id, &pq)?;
-    // SSRF 校验（§13）：目标 host 必须与频道主地址 host 一致。
+    // SSRF 校验（§13）：目标 host、scheme、端口必须与频道主地址一致
+    //（只比 host 时，http↔https 或非标端口可绕过；重定向另由客户端限 3 跳）。
     let upstream = primary_url(&state, session.channel_id).await?;
-    let upstream_host = reqwest::Url::parse(&upstream)
-        .ok()
-        .and_then(|u| u.host_str().map(|s| s.to_string()));
+    let upstream_url = reqwest::Url::parse(&upstream)
+        .map_err(|_| ApiError::new(iptv_dto::ErrorCode::SourceUnavailable, "bad upstream url"))?;
     let target = reqwest::Url::parse(&q.u)
         .map_err(|_| ApiError::new(iptv_dto::ErrorCode::BadRequest, "bad segment url"))?;
-    if target.host_str().map(|s| s.to_string()) != upstream_host {
+    if target.host_str() != upstream_url.host_str()
+        || target.scheme() != upstream_url.scheme()
+        || target.port_or_known_default() != upstream_url.port_or_known_default()
+    {
         return Err(ApiError::new(
             iptv_dto::ErrorCode::Forbidden,
             "segment host not allowed",
@@ -224,7 +271,9 @@ pub async fn proxy_segment(
     }
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
-        .user_agent("Muse-IPTV/0.1.0")
+        .user_agent(format!("Muse-IPTV/{}", iptv_core::VERSION))
+        // M3：重定向最多跟 3 跳。
+        .redirect(reqwest::redirect::Policy::limited(3))
         .build()
         .map_err(ApiError::from)?;
     let mut req = client.get(target);
@@ -240,12 +289,8 @@ pub async fn proxy_segment(
     let status = resp.status();
     let content_type = resp.headers().get(header::CONTENT_TYPE).cloned();
     let content_length = resp.headers().get(header::CONTENT_LENGTH).cloned();
-    let bytes = resp.bytes().await.map_err(|_| {
-        ApiError::new(
-            iptv_dto::ErrorCode::SourceUnavailable,
-            "upstream read failed",
-        )
-    })?;
+    // M4：流式转发（Body::from_stream），不再整段缓冲后才返回。
+    let stream = resp.bytes_stream();
     let mut builder = Response::builder()
         .status(status)
         .header(header::CACHE_CONTROL, "no-store");
@@ -255,5 +300,5 @@ pub async fn proxy_segment(
     if let Some(v) = content_length {
         builder = builder.header(header::CONTENT_LENGTH, v);
     }
-    Ok(builder.body(axum::body::Body::from(bytes)).unwrap())
+    Ok(builder.body(axum::body::Body::from_stream(stream)).unwrap())
 }

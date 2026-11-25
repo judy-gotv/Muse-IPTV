@@ -46,6 +46,9 @@ fn now_epoch() -> i64 {
 pub struct ConcurrencyLimiter {
     redis_client: Option<redis::Client>,
     memory: Mutex<HashMap<i64, HashMap<String, i64>>>, // token_id -> session_uid -> expire_ts
+    /// 会话超时秒数（M1：读系统设置 `session_timeout_sec`，默认 90s；
+    /// `set_ttl_sec` 在启动与设置更新时刷新，运行中可改）。
+    ttl_sec: std::sync::atomic::AtomicI64,
 }
 
 impl ConcurrencyLimiter {
@@ -54,7 +57,19 @@ impl ConcurrencyLimiter {
         Self {
             redis_client,
             memory: Mutex::new(HashMap::new()),
+            ttl_sec: std::sync::atomic::AtomicI64::new(HEARTBEAT_TTL_SEC),
         }
+    }
+
+    /// 当前会话超时（秒）。
+    pub fn ttl_sec(&self) -> i64 {
+        self.ttl_sec.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// 运行时改会话超时（系统设置变更后调用；新值只影响此后签发的 score）。
+    pub fn set_ttl_sec(&self, ttl: i64) {
+        self.ttl_sec
+            .store(ttl.max(1), std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn uses_redis(&self) -> bool {
@@ -77,7 +92,7 @@ impl ConcurrencyLimiter {
                 .arg(session_uid)
                 .arg(max as i64)
                 .arg(now)
-                .arg(HEARTBEAT_TTL_SEC)
+                .arg(self.ttl_sec())
                 .invoke_async(&mut conn)
                 .await?;
             let acquired = res.first().copied().unwrap_or(0) == 1;
@@ -95,7 +110,7 @@ impl ConcurrencyLimiter {
                 current: sessions.len() as i64,
             });
         }
-        sessions.insert(session_uid.to_string(), now + HEARTBEAT_TTL_SEC);
+        sessions.insert(session_uid.to_string(), now + self.ttl_sec());
         Ok(AcquireOutcome {
             acquired: true,
             current: sessions.len() as i64,
@@ -110,13 +125,13 @@ impl ConcurrencyLimiter {
             let now = now_epoch();
             let added: i64 = redis::cmd("ZADD")
                 .arg(&key)
-                .arg(now + HEARTBEAT_TTL_SEC)
+                .arg(now + self.ttl_sec())
                 .arg(session_uid)
                 .query_async(&mut conn)
                 .await?;
             let _: () = redis::cmd("EXPIRE")
                 .arg(&key)
-                .arg(HEARTBEAT_TTL_SEC + 60)
+                .arg(self.ttl_sec() + 60)
                 .query_async(&mut conn)
                 .await?;
             // ZADD 返回 0 表示 member 已存在（即心跳刷新），1 表示新建。
@@ -127,7 +142,7 @@ impl ConcurrencyLimiter {
         let now = now_epoch();
         if let Some(sessions) = map.get_mut(&token_id) {
             if sessions.contains_key(session_uid) {
-                sessions.insert(session_uid.to_string(), now + HEARTBEAT_TTL_SEC);
+                sessions.insert(session_uid.to_string(), now + self.ttl_sec());
                 return Ok(true);
             }
         }

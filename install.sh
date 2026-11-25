@@ -312,6 +312,12 @@ if [ "${SKIP_CP:-0}" != "1" ]; then
   mkdir -p "$BIN_DIR"
   cp "$PKG_DIR/iptv-api" "$PKG_DIR/iptv-worker" "$PKG_DIR/iptv-portal" "$PKG_DIR/iptv-admin" "$PKG_DIR/iptv-gateway" "$BIN_DIR/"
   chmod +x "$BIN_DIR/iptv-api" "$BIN_DIR/iptv-worker" "$BIN_DIR/iptv-portal" "$BIN_DIR/iptv-admin" "$BIN_DIR/iptv-gateway"
+  # B4：前端 hydrate 产物（包内 site/pkg/*.js）。旧包没有 site/ 时跳过，
+  # 门户/后台退回 SSR-only（语言切换等 WASM 交互不可用，见 v0.1.1 教训）。
+  if [ -d "$PKG_DIR/site" ]; then
+    rm -rf "$BIN_DIR/site"
+    cp -r "$PKG_DIR/site" "$BIN_DIR/site"
+  fi
 fi
 
 # 配置
@@ -327,6 +333,8 @@ ADMIN_SECRET=$ADMIN_SECRET
 PORTAL_BASE_URL=http://127.0.0.1:$PORT
 BIND_ADDR=127.0.0.1:8080
 GATEWAY_BIND_ADDR=0.0.0.0:$PORT
+# B4：前端 hydrate 产物位置（portal/admin 由此找 site/pkg/*.js）。
+LEPTOS_SITE_ROOT=$BIN_DIR/site
 IPTV_ADMIN_USER=$ADMIN_USER
 IPTV_ADMIN_PASSWORD=$ADMIN_PASS
 EOF
@@ -344,6 +352,10 @@ else
   fi
   if grep -q '^PORTAL_BASE_URL=http://127.0.0.1:808' "$CONF_DIR/.env"; then
     set_env_key "$CONF_DIR/.env" "PORTAL_BASE_URL" "http://127.0.0.1:$PORT"
+  fi
+  # B4：升级补前端产物位置（旧 .env 没有这一行时才写，不覆盖已有配置）。
+  if ! grep -q '^LEPTOS_SITE_ROOT=' "$CONF_DIR/.env"; then
+    echo "LEPTOS_SITE_ROOT=$BIN_DIR/site" >> "$CONF_DIR/.env"
   fi
   echo "配置文件已存在：$CONF_DIR/.env（保留原密钥与管理员密码，已按单端口布局迁移）"
 fi

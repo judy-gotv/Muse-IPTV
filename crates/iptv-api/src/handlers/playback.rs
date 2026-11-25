@@ -88,7 +88,9 @@ pub async fn start(
             detail: serde_json::json!({ "quality": decision.quality }),
         })
         .await;
-    let exp = now.timestamp() + 300;
+    // M1：播放地址有效期读系统设置 `play_url_ttl_sec`（默认 300s）。
+    let ttl = state.store.get_setting_i64("play_url_ttl_sec").await;
+    let exp = now.timestamp() + ttl;
     let play_url = sign_play_url(
         state.config.play_secret.as_bytes(),
         &format!("/p/{}.m3u8", channel.id),
@@ -103,7 +105,10 @@ pub async fn start(
     ok(PlaybackStartResponse {
         session_uid: uid,
         play_url,
-        expires_in_sec: 300,
+        expires_in_sec: ttl,
+        // M1：心跳间隔读系统设置 `heartbeat_interval_sec`（默认 30s），
+        // 由服务端下发，客户端按此间隔调 `/playback/heartbeat`。
+        heartbeat_interval_sec: state.store.get_setting_i64("heartbeat_interval_sec").await,
     })
 }
 

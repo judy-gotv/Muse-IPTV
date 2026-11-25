@@ -2,6 +2,7 @@
 // 作者: Passwd Word
 
 use super::*;
+use chrono::Duration;
 
 pub(crate) fn row_to_source(row: &AnyRow) -> anyhow::Result<PlaylistSource> {
     Ok(PlaylistSource {
@@ -119,6 +120,30 @@ impl Store {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// 原子认领同步任务（M6）：只有未认领、或认领超过 15 分钟未更新
+    /// （持有者已崩溃）的源才能被认领；返回 true 表示本次认领成功。
+    /// 先查后置的旧写法会让多实例重复跑、崩溃后永久卡 syncing。
+    pub async fn claim_source_sync(
+        &self,
+        id: i64,
+        next_sync_at: DateTime<Utc>,
+    ) -> anyhow::Result<bool> {
+        let now = Utc::now();
+        let stale_before = epoch(now - Duration::seconds(15 * 60));
+        let n = sqlx::query(
+            &ph("UPDATE playlist_source SET last_sync_at = ?, next_sync_at = ?, last_status = 'syncing', last_error = NULL, updated_at = ? WHERE id = ? AND (last_status IS NULL OR last_status <> 'syncing' OR updated_at < ?)", self.dialect),
+        )
+        .bind(epoch(now))
+        .bind(epoch(next_sync_at))
+        .bind(epoch(now))
+        .bind(id)
+        .bind(stale_before)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        Ok(n > 0)
     }
 
     pub async fn create_sync_log(&self, source_id: i64) -> anyhow::Result<i64> {

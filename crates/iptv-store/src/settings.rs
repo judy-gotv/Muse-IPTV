@@ -6,21 +6,78 @@
 use super::*;
 
 impl Store {
+    /// 单键读取（M1：60 秒整表缓存；缓存失效或过期时一次读出整表填缓存）。
+    /// 缺失的键返回 None，由调用方用 `iptv_core::default_setting()` 兜底。
     pub async fn get_setting(&self, key: &str) -> anyhow::Result<Option<serde_json::Value>> {
-        let row = sqlx::query(&ph(
-            "SELECT setting_value FROM system_setting WHERE setting_key = ?",
-            self.dialect,
-        ))
-        .bind(key)
-        .fetch_optional(&self.pool)
-        .await?;
-        match row {
-            Some(r) => {
-                let s = r_string(&r, "setting_value")?;
-                Ok(serde_json::from_str(&s).ok())
-            }
-            None => Ok(None),
+        if let Some(v) = self.get_setting_cached(key) {
+            return Ok(Some(v));
         }
+        // 缓存未命中/过期：整表读出并填缓存（一次查询供后续 60 秒内所有键用）。
+        let all = self.list_settings().await?;
+        let mut map = HashMap::with_capacity(all.len());
+        for s in all {
+            map.insert(s.key, s.value);
+        }
+        let value = map.get(key).cloned();
+        if let Ok(mut cache) = self.settings_cache.write() {
+            *cache = Some((std::time::Instant::now(), map));
+        }
+        Ok(value)
+    }
+
+    /// 缓存命中才返回（不触 DB）；过期缓存视为未命中。
+    fn get_setting_cached(&self, key: &str) -> Option<serde_json::Value> {
+        let cache = self.settings_cache.read().ok()?;
+        let (at, map) = cache.as_ref()?;
+        if at.elapsed() > std::time::Duration::from_secs(60) {
+            return None;
+        }
+        map.get(key).cloned()
+    }
+
+    /// 整型设置：读不到或类型不对时用 `iptv_core::default_setting()` 兜底，
+    /// 再没有则用 0（调用方应保证键在默认表里）。
+    pub async fn get_setting_i64(&self, key: &str) -> i64 {
+        if let Ok(Some(v)) = self.get_setting(key).await {
+            if let Some(n) = v.as_i64() {
+                return n;
+            }
+        }
+        iptv_core::default_setting(key)
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0)
+    }
+
+    /// 字符串设置：读不到时用默认值兜底。
+    pub async fn get_setting_string(&self, key: &str) -> String {
+        if let Ok(Some(v)) = self.get_setting(key).await {
+            if let Some(s) = v.as_str() {
+                return s.to_string();
+            }
+        }
+        iptv_core::default_setting(key)
+            .and_then(|v| v.as_str().map(|s| s.to_string()))
+            .unwrap_or_default()
+    }
+
+    /// 字符串数组设置（如 `available_locales`）：读不到时用默认值兜底。
+    pub async fn get_setting_string_list(&self, key: &str) -> Vec<String> {
+        if let Ok(Some(v)) = self.get_setting(key).await {
+            if let Some(arr) = v.as_array() {
+                return arr
+                    .iter()
+                    .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                    .collect();
+            }
+        }
+        iptv_core::default_setting(key)
+            .and_then(|v| v.as_array().cloned())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// 先 UPDATE，命中 0 行再 INSERT（三种方言都没有统一的 UPSERT 语法，
@@ -46,6 +103,10 @@ impl Store {
             .bind(epoch(now))
             .execute(&self.pool)
             .await?;
+        }
+        // 写后清空本进程缓存，下次读重新加载（跨进程最多 stale 60 秒）。
+        if let Ok(mut cache) = self.settings_cache.write() {
+            *cache = None;
         }
         Ok(())
     }

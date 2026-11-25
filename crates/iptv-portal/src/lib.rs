@@ -16,20 +16,26 @@ use iptv_design::{
     TabBar, TextField, Toggle, Toolbar,
 };
 use iptv_dto::{
-    Channel, DeviceView, Envelope, EpgProgram, MePlan, MeQuota, MeResponse, Paged, PlaybackEvent,
+    Channel, DeviceView, EpgProgram, MePlan, MeQuota, MeResponse, Paged, PlaybackEvent,
     PlaybackStartResponse,
 };
+// 只在服务端用（api_get/api_post 解 Envelope）。
+#[cfg(feature = "ssr")]
+use iptv_dto::Envelope;
 use iptv_ui::{
     fmt_dt, locale, t_or, ChannelCard, DeviceRow, EpgSidebar, LanguageSwitcher, LocaleCtx, Player,
     QuotaRing,
 };
 use leptos::prelude::*;
+#[cfg(feature = "ssr")]
 use leptos_axum::redirect;
 use leptos_meta::{provide_meta_context, MetaTags, Title};
 use leptos_router::components::{Route, Router, Routes};
 use leptos_router::hooks::{use_params_map, use_query_map};
 use leptos_router::path;
+#[cfg(feature = "ssr")]
 use serde::de::DeserializeOwned;
+#[cfg(feature = "ssr")]
 use serde::Serialize;
 
 // ---------------------------------------------------------------------------
@@ -37,6 +43,8 @@ use serde::Serialize;
 // ---------------------------------------------------------------------------
 
 /// 后端地址：`IPTV_API_BASE`，默认 `http://127.0.0.1:8080`。
+/// 只在服务端存在（main.rs 与 server fn 用；WASM 侧不接触后端地址，§4.6）。
+#[cfg(feature = "ssr")]
 pub fn api_base() -> String {
     std::env::var("IPTV_API_BASE").unwrap_or_else(|_| "http://127.0.0.1:8080".to_string())
 }
@@ -53,6 +61,7 @@ pub fn cookie_value(header: &str, name: &str) -> Option<String> {
 }
 
 /// 请求上下文里的 Cookie 头（server fn 内使用）。
+#[cfg(feature = "ssr")]
 fn parts_cookie(name: &str) -> Option<String> {
     let parts = use_context::<axum::http::request::Parts>()?;
     let header = parts
@@ -63,7 +72,20 @@ fn parts_cookie(name: &str) -> Option<String> {
     cookie_value(header, name)
 }
 
+/// WASM 侧读 Cookie：`document.cookie`。hydrate 后与 SSR 渲染的 locale /
+/// 主题必须一致，否则页面会闪回默认值。
+#[cfg(not(feature = "ssr"))]
+fn parts_cookie(name: &str) -> Option<String> {
+    // `cookie` 在 HtmlDocument 上（Document 没有这个方法）。
+    use wasm_bindgen::JsCast;
+    let document = web_sys::window()?.document()?;
+    let html = document.dyn_into::<web_sys::HtmlDocument>().ok()?;
+    let cookie = html.cookie().ok()?;
+    cookie_value(&cookie, name)
+}
+
 /// 请求上下文里的 Accept-Language。
+#[cfg(feature = "ssr")]
 fn parts_accept_language() -> Option<String> {
     let parts = use_context::<axum::http::request::Parts>()?;
     parts
@@ -74,6 +96,36 @@ fn parts_accept_language() -> Option<String> {
         .map(|s| s.to_string())
 }
 
+/// WASM 侧读浏览器语言。
+#[cfg(not(feature = "ssr"))]
+fn parts_accept_language() -> Option<String> {
+    web_sys::window()?.navigator().language()
+}
+
+/// 请求上下文里的原始客户端 IP（网关写好的 X-Forwarded-For 首项，或
+/// X-Real-IP），调 API 时原样转发，API 才能按真实 IP 做限流分桶（M2）；
+/// 直连门户时浏览器一般不带这两个头，返回 None，API 回落到对端 IP。
+#[cfg(feature = "ssr")]
+fn parts_forwarded_for() -> Option<String> {
+    let parts = use_context::<axum::http::request::Parts>()?;
+    parts
+        .headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.split(',').next())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            parts
+                .headers
+                .get("x-real-ip")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
+}
+
+#[cfg(feature = "ssr")]
 fn http_client() -> reqwest::Client {
     reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
@@ -87,6 +139,7 @@ fn http_client() -> reqwest::Client {
 
 /// GET 后端接口，返回 `Envelope<T>` 的 data；401 返回 `Ok(None)`（未登录）。
 /// 返回 `(data, set_cookie)`：登录类接口需把后端 Set-Cookie 转发给浏览器。
+#[cfg(feature = "ssr")]
 async fn api_get<T: DeserializeOwned>(
     path: &str,
     sid: Option<&str>,
@@ -95,6 +148,9 @@ async fn api_get<T: DeserializeOwned>(
     let mut req = http_client().get(&url);
     if let Some(s) = sid {
         req = req.header("Cookie", format!("iptv_portal_sid={s}"));
+    }
+    if let Some(xff) = parts_forwarded_for() {
+        req = req.header("X-Forwarded-For", xff);
     }
     let res = req.send().await.map_err(|e| e.to_string())?;
     let set_cookie = res
@@ -113,6 +169,7 @@ async fn api_get<T: DeserializeOwned>(
 }
 
 /// POST 后端接口（JSON 体），返回 data 与后端 Set-Cookie。
+#[cfg(feature = "ssr")]
 async fn api_post<B: Serialize, T: DeserializeOwned>(
     path: &str,
     body: &B,
@@ -122,6 +179,9 @@ async fn api_post<B: Serialize, T: DeserializeOwned>(
     let mut req = http_client().post(&url).json(body);
     if let Some(s) = sid {
         req = req.header("Cookie", format!("iptv_portal_sid={s}"));
+    }
+    if let Some(xff) = parts_forwarded_for() {
+        req = req.header("X-Forwarded-For", xff);
     }
     let res = req.send().await.map_err(|e| e.to_string())?;
     let set_cookie = res
@@ -140,6 +200,7 @@ async fn api_post<B: Serialize, T: DeserializeOwned>(
 }
 
 /// 把后端 Set-Cookie 转发给浏览器（server fn 内使用）。
+#[cfg(feature = "ssr")]
 fn forward_set_cookie(set_cookie: Option<String>) {
     if let Some(sc) = set_cookie {
         if let Some(res) = use_context::<leptos_axum::ResponseOptions>() {
@@ -151,11 +212,13 @@ fn forward_set_cookie(set_cookie: Option<String>) {
 }
 
 /// 门户会话 Cookie；无则为 None（页面据此显示登录提示）。
+#[cfg(feature = "ssr")]
 fn portal_sid() -> Option<String> {
     parts_cookie("iptv_portal_sid")
 }
 
 /// 设备指纹：复用 `iptv_device_id` Cookie，没有则生成一个并写回浏览器。
+#[cfg(feature = "ssr")]
 fn device_fingerprint() -> String {
     if let Some(d) = parts_cookie("iptv_device_id") {
         return d;
@@ -319,6 +382,7 @@ pub async fn api_ticket_exchange(ticket: String) -> Result<bool, ServerFnError> 
 }
 
 /// URL 查询参数编码（按 UTF-8 字节百分号编码）。
+#[cfg(feature = "ssr")]
 fn urlencoding(s: &str) -> String {
     let mut out = String::new();
     for b in s.as_bytes() {
@@ -894,4 +958,18 @@ fn HelpPage() -> impl IntoView {
             </div>
         </PortalLayout>
     }
+}
+
+// ---------------------------------------------------------------------------
+// WASM hydrate 入口（B4）
+// ---------------------------------------------------------------------------
+
+/// hydrate 入口：cargo-leptos 生成的 `/pkg/iptv-portal.js` 在加载后调用它，
+/// 把 SSR 出来的 HTML 挂上交互（`#[server]` 函数的客户端存根、资源重取）。
+/// 只在 hydrate 构建里编译；服务端构建不包含它。
+#[cfg(feature = "hydrate")]
+#[wasm_bindgen::prelude::wasm_bindgen]
+pub fn hydrate() {
+    console_error_panic_hook::set_once();
+    leptos::mount::hydrate_body(App);
 }

@@ -13,7 +13,7 @@ pub mod tickets;
 pub use state::{AppState, Config, Metrics};
 
 use axum::extract::{FromRequestParts, Request, State};
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, patch, post};
@@ -129,18 +129,117 @@ pub fn negotiate_locale(headers: &HeaderMap, user_locale: Option<&str>) -> Strin
     iptv_i18n::I18n::negotiate(user_locale, cookie_locale.as_deref(), accept)
 }
 
-pub fn client_ip(headers: &HeaderMap) -> Option<String> {
+/// 同 `negotiate_locale`，但最后的“默认”读系统设置 `default_locale`，
+/// 且结果不在系统设置 `available_locales` 里时回退到默认语言（M1）。
+/// 读设置走 60 秒缓存，中间件每请求调一次无额外负担。
+async fn negotiate_locale_with_settings(
+    state: &AppState,
+    headers: &HeaderMap,
+    user_locale: Option<&str>,
+) -> String {
+    let cookie_locale = headers
+        .get(header::COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|c| {
+            c.split(';').find_map(|part| {
+                let (k, v) = part.trim().split_once('=')?;
+                if k.trim() == "iptv_locale" {
+                    Some(v.trim().to_string())
+                } else {
+                    None
+                }
+            })
+        });
+    let accept = headers
+        .get(header::ACCEPT_LANGUAGE)
+        .and_then(|v| v.to_str().ok());
+    let default = state.store.get_setting_string("default_locale").await;
+    let locale = iptv_i18n::I18n::negotiate_with_default(
+        user_locale,
+        cookie_locale.as_deref(),
+        accept,
+        &default,
+    );
+    let allowed = state
+        .store
+        .get_setting_string_list("available_locales")
+        .await;
+    if !allowed.is_empty() && !allowed.iter().any(|a| a == &locale) {
+        return default;
+    }
+    locale
+}
+
+/// 客户端 IP：X-Forwarded-For 首项 → X-Real-IP → 直连对端 IP。
+/// 单端口部署下请求必经网关，网关把 XFF 写成直连对端 IP（客户端自带
+/// 的 XFF 不可信，网关默认覆盖，见 iptv-gateway）；直连 API 时没有 XFF，
+/// 回落到 ConnectInfo 的对端地址，避免全站共用 "unknown" 桶。
+pub fn client_ip(headers: &HeaderMap, peer: Option<std::net::SocketAddr>) -> Option<String> {
     headers
         .get("x-forwarded-for")
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.split(',').next())
         .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
         .or_else(|| {
             headers
                 .get("x-real-ip")
                 .and_then(|v| v.to_str().ok())
-                .map(|s| s.to_string())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
         })
+        .or_else(|| peer.map(|p| p.ip().to_string()))
+}
+
+/// 登录口限流（M2，§13 三维）：先过按 IP 聚合的桶（30 次/分钟），再过
+/// 复合 key 的桶（5 次/分钟），两者都过才放行。`key` 由调用方按登录类型
+/// 拼（`admin-login:{username}:{ip}` / `ticket-exchange:{ip}` /
+/// `token-login:{prefix}:{ip}`），避免三类登录共用一个 "unknown" 桶。
+pub fn check_login_limit(state: &AppState, ip: &str, key: &str) -> bool {
+    state.login_ip_limiter.check(&format!("ip:{ip}")) && state.login_limiter.check(key)
+}
+
+/// m1 CSRF Origin 校验（§13）：浏览器写请求（POST/PUT/PATCH/DELETE）
+/// 若带 Cookie 且带 Origin，要求 Origin 与 Host 同源；无 Origin 的请求
+/// （服务端对服务端、API 客户端、播放器）放行。会话 Cookie 已是
+/// SameSite=Lax，Origin 校验是第二道防线；双提交 Cookie 未做。
+async fn csrf_origin_middleware(req: Request, next: Next) -> Response {
+    let method = req.method().clone();
+    if matches!(
+        method,
+        Method::POST | Method::PUT | Method::PATCH | Method::DELETE
+    ) {
+        let headers = req.headers();
+        if headers.contains_key(header::COOKIE) {
+            if let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
+                let origin_host = origin.split("://").nth(1).unwrap_or("");
+                let host_ok = headers
+                    .get(header::HOST)
+                    .and_then(|v| v.to_str().ok())
+                    .is_some_and(|host| origin_host.trim_end_matches('/') == host);
+                if !host_ok {
+                    return ApiError::new(ErrorCode::Forbidden, "cross-origin write rejected")
+                        .into_response();
+                }
+            }
+        }
+    }
+    next.run(req).await
+}
+
+/// m2 安全响应头（§4.3）：所有响应加 `Referrer-Policy: no-referrer`；
+/// `/api/v1/*` 全部动态接口再加 `Cache-Control: no-store`（此前只有
+/// /p 代理响应有 no-store，/me 等身份响应可被缓存）。
+async fn security_headers_middleware(req: Request, next: Next) -> Response {
+    let is_api = req.uri().path().starts_with("/api/v1/");
+    let mut resp = next.run(req).await;
+    resp.headers_mut()
+        .insert("referrer-policy", HeaderValue::from_static("no-referrer"));
+    if is_api {
+        resp.headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    }
+    resp
 }
 
 /// 全局中间件：计数 + locale 进 extensions。
@@ -161,7 +260,7 @@ async fn localize_errors_middleware(
     req: Request,
     next: Next,
 ) -> Response {
-    let locale = negotiate_locale(req.headers(), None);
+    let locale = negotiate_locale_with_settings(&state, req.headers(), None).await;
     let mut resp = next.run(req).await;
     let status = resp.status();
     if !(status.is_client_error() || status.is_server_error()) {
@@ -254,9 +353,18 @@ impl FromRequestParts<Arc<AppState>> for PortalAuth {
             .await
             .map_err(ApiError::from)?
             .ok_or_else(|| ApiError::new(ErrorCode::TokenDisabledOrExpired, "token not found"))?;
-        // 滑动续期：7 天（§4.3），每次鉴权成功延长。
+        // m3：滑动续期——每次鉴权成功延长 `portal_session_ttl_days`
+        // （默认 7 天），但总有效期不超过首次登录起
+        // `remember_device_ttl_days`（默认 90 天）；此前每次都重置为
+        // now+7 天，“记住设备 90 天”名不副实，会话可无限续期。
         let now = chrono::Utc::now();
-        let new_exp = now + chrono::Duration::days(7);
+        let slide_days = state.store.get_setting_i64("portal_session_ttl_days").await;
+        let cap_days = state
+            .store
+            .get_setting_i64("remember_device_ttl_days")
+            .await;
+        let cap = session.created_at + chrono::Duration::days(cap_days.max(1));
+        let new_exp = (now + chrono::Duration::days(slide_days.max(1))).min(cap);
         let _ = state
             .store
             .touch_portal_session(session.id, now, new_exp)
@@ -348,8 +456,13 @@ pub fn verify_admin_cookie(secret: &str, cookie: &str) -> Option<i64> {
     let msg = format!("{admin_id}|{exp}");
     let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).ok()?;
     mac.update(msg.as_bytes());
-    let expected = hex::encode(mac.finalize().into_bytes());
-    if expected != sig {
+    let expected = mac.finalize().into_bytes();
+    let Ok(given) = hex::decode(sig) else {
+        return None;
+    };
+    // m11：等时比较（与 play_url 的验签一致；普通字符串比较会泄漏时序）。
+    use subtle::ConstantTimeEq;
+    if expected.as_slice().ct_eq(given.as_slice()).unwrap_u8() != 1 {
         return None;
     }
     Some(admin_id)
@@ -477,7 +590,13 @@ impl AppState {
                 "/admin/sources",
                 get(handlers::admin::list_sources).post(handlers::admin::create_source),
             )
-            .route("/admin/sources/upload", post(handlers::admin::upload_m3u))
+            // 上传不限大小（用户 2026-11-25 亲口批准，与 §7.1 的 20 MB 相悖）：
+            // 只对本路由取消 axum 默认 2 MB 体限；handler 内流式落盘+逐行
+            // 解析，不整包进内存。其他接口仍受默认体限保护。
+            .route(
+                "/admin/sources/upload",
+                post(handlers::admin::upload_m3u).layer(axum::extract::DefaultBodyLimit::disable()),
+            )
             .route(
                 "/admin/sources/{id}/sync",
                 post(handlers::admin::trigger_sync),
@@ -511,7 +630,16 @@ impl AppState {
                 "/admin/admins",
                 get(handlers::admin::list_admins).post(handlers::admin::create_admin),
             )
+            .route(
+                "/admin/admins/{id}",
+                patch(handlers::admin::update_admin).delete(handlers::admin::delete_admin),
+            )
+            .route(
+                "/admin/admins/{id}/reset-totp",
+                post(handlers::admin::reset_admin_totp),
+            )
             .route("/admin/audit", get(handlers::admin::list_audit))
+            .route("/admin/audit/export", get(handlers::admin::export_audit))
             .route(
                 "/admin/settings",
                 get(handlers::admin::list_settings).patch(handlers::admin::update_settings),
@@ -536,6 +664,8 @@ impl AppState {
                 state.clone(),
                 localize_errors_middleware,
             ))
+            .layer(axum::middleware::from_fn(csrf_origin_middleware))
+            .layer(axum::middleware::from_fn(security_headers_middleware))
             .layer(
                 tower_http::cors::CorsLayer::new()
                     .allow_origin(tower_http::cors::Any)

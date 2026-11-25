@@ -15,6 +15,7 @@ pub(crate) fn row_to_admin(row: &AnyRow) -> anyhow::Result<AdminUser> {
         },
         totp_enabled: r_bool(row, "totp_enabled")?,
         totp_required: r_bool(row, "totp_required")?,
+        totp_provisioned: r_bool(row, "totp_provisioned")?,
         created_at: r_ts(row, "created_at")?,
     })
 }
@@ -43,7 +44,10 @@ pub(crate) fn row_to_audit(row: &AnyRow) -> anyhow::Result<AuditLog> {
     })
 }
 
-const ADMIN_COLS: &str = "id, username, role, totp_enabled, totp_required, created_at";
+/// 注意：`totp_provisioned` 是计算列（`CASE WHEN ... THEN 0 ELSE 1 END`，
+/// 三方言都返回整数；不用 `IS NOT NULL` 直接当列，PG 会返回 boolean 类型，
+/// `r_bool` 按 i64 读会失败）。
+const ADMIN_COLS: &str = "id, username, role, totp_enabled, totp_required, CASE WHEN totp_secret IS NULL THEN 0 ELSE 1 END AS totp_provisioned, created_at";
 const AUDIT_COLS: &str = "id, actor, actor_role, action, object_type, object_id, before_json, after_json, ip_address, created_at";
 
 impl Store {
@@ -127,6 +131,79 @@ impl Store {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// 配给 TOTP 密钥（待验证态）：只存密钥，不启用。用户首次登录用
+    /// 验证器 App 的码校验通过后，由登录流程调 `set_admin_totp` 启用。
+    /// 密钥一旦配给即不再可读（只返回给调用方一次），丢了只能重新配给。
+    pub async fn stage_admin_totp_secret(&self, id: i64, secret: &str) -> anyhow::Result<()> {
+        sqlx::query(&ph(
+            "UPDATE admin_user SET totp_secret = ?, totp_enabled = 0, updated_at = ? WHERE id = ?",
+            self.dialect,
+        ))
+        .bind(secret)
+        .bind(epoch(Utc::now()))
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn get_admin_by_id(&self, id: i64) -> anyhow::Result<Option<AdminUser>> {
+        let row = sqlx::query(&ph(
+            &format!("SELECT {ADMIN_COLS} FROM admin_user WHERE id = ?"),
+            self.dialect,
+        ))
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        match row {
+            Some(r) => Ok(Some(row_to_admin(&r)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// 更新管理员角色 / 是否强制 TOTP（仅超管调）。`None` 字段保持原值。
+    pub async fn update_admin(
+        &self,
+        id: i64,
+        role: Option<AdminRole>,
+        totp_required: Option<bool>,
+    ) -> anyhow::Result<Option<AdminUser>> {
+        let Some(cur) = self.get_admin_by_id(id).await? else {
+            return Ok(None);
+        };
+        let role = role.unwrap_or(cur.role);
+        let totp_required = totp_required.unwrap_or(cur.totp_required);
+        sqlx::query(&ph(
+            "UPDATE admin_user SET role = ?, totp_required = ?, updated_at = ? WHERE id = ?",
+            self.dialect,
+        ))
+        .bind(admin_role_str(&role))
+        .bind(i64::from(totp_required))
+        .bind(epoch(Utc::now()))
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        self.get_admin_by_id(id).await
+    }
+
+    /// 删除管理员。调用方负责护栏（不删自己、不删最后一个超管）。
+    pub async fn delete_admin(&self, id: i64) -> anyhow::Result<bool> {
+        let n = sqlx::query(&ph("DELETE FROM admin_user WHERE id = ?", self.dialect))
+            .bind(id)
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+        Ok(n > 0)
+    }
+
+    pub async fn count_super_admins(&self) -> anyhow::Result<i64> {
+        let n: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM admin_user WHERE role = 'super_admin'")
+                .fetch_one(&self.pool)
+                .await?;
+        Ok(n)
     }
 
     pub async fn write_audit(&self, log: &NewAuditLog) -> anyhow::Result<i64> {

@@ -212,13 +212,17 @@ cargo run -p xtask -- i18n-check   # 语言包 key 齐全性 + 占位符一致�
 
 ## 发布
 
-打 tag 即发版：`git tag v0.1.0 && git push origin v0.1.0` → Release 工作流打出
+打 tag 即发版：先把仓库根 `Cargo.toml` 的 `version` 改成与 tag 一致的版本号
+（`iptv_core::VERSION` 与 `/healthz` 自报版本都取自它，漏改会发出版号不符的
+包），再 `git tag vX.Y.Z && git push origin vX.Y.Z` → Release 工作流打出
 6 个架构包（linux x86_64/aarch64/armv7、macOS x86_64/arm64、windows x86_64）
-+ SHA256SUMS；Docker 工作流推多架构镜像 `ghcr.io/judy-gotv/muse-iptv:<tag>`（amd64/arm64）。
++ SHA256SUMS；每个包内含 5 个二进制 + 前端 hydrate 产物 `site/`（/pkg/*.js，
+由 cargo-leptos 构建，门户/后台的语言切换与全部 WASM 交互靠它；Docker
+工作流推多架构镜像 `ghcr.io/judy-gotv/muse-iptv:<tag>`（amd64/arm64）。
 
 ## 安全
 
 - 全站 HTTPS + HSTS（生产用 Rustls 终结，见部署文档）；Token 只存 SHA-256；
   管理员密码 Argon2id；会话 Cookie HttpOnly + SameSite=Lax。
-- SSRF：订阅仅 http/https，目标私网 IP 拒绝；上传限 20 MB；按 IP/Token/账号三维限流。
+- SSRF：订阅仅 http/https，目标私网 IP 拒绝；本地 M3U 上传不限大小（流式落盘+逐行解析）；按 IP/Token/账号三维限流。
 - 仅接入有授权的源，提供下架与黑名单机制，日志脱敏（§13）。

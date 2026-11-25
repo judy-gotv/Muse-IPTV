@@ -54,6 +54,12 @@ async fn main() -> anyhow::Result<()> {
         config.bind_addr,
         state.store.dialect()
     );
-    axum::serve(listener, AppState::router(state)).await?;
+    // 必须用 into_make_service_with_connect_info，否则登录 handler 的
+    // ConnectInfo 拿不到对端 IP，client_ip 回落失效（M2）。
+    axum::serve(
+        listener,
+        AppState::router(state).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }

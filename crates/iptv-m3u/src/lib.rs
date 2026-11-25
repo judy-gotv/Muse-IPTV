@@ -27,74 +27,94 @@ pub struct ParseOutcome {
     pub channels: Vec<NormalizedChannel>,
     pub errors: Vec<M3uLineError>,
     pub x_tvg_url: Option<String>,
+    /// 解析过的总行数（含空行与注释行）。
+    pub total_lines: usize,
 }
 
-/// 解析 M3U 文本。`#EXTINF:-1 <attrs>,<标题>` 后下一行非 `#` 即播放地址。
-pub fn parse_m3u(input: &str) -> ParseOutcome {
-    let mut out = ParseOutcome::default();
-    // §7.2：BOM 必须剥离，否则首行 `#EXTM3U` 认不出来（同类教训：BOM 致 0 频道）。
-    let input = input.strip_prefix('\u{feff}').unwrap_or(input);
-    let mut pending: Option<(usize, String, String)> = None; // (行号, 属性串, 标题)
-    let mut seen_urls = std::collections::HashSet::new();
+/// 逐行喂入的状态机：`parse_m3u`（整串）与 `parse_m3u_reader`（流式）
+/// 共用，保证两种入口行为一致。
+pub struct M3uParser {
+    pending: Option<(usize, String, String)>, // (行号, 属性串, 标题)
+    seen_urls: std::collections::HashSet<String>,
+    out: ParseOutcome,
+    /// 超过错误上限后丢弃的错误条数（防超大文件把 errors 撑爆内存）。
+    dropped_errors: usize,
+}
 
-    for (idx, raw_line) in input.lines().enumerate() {
-        let line_no = idx + 1;
+/// 逐条错误最多保留条数，超出后只计数，结束时补一条汇总。
+pub const MAX_ERRORS: usize = 1000;
+
+impl Default for M3uParser {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl M3uParser {
+    pub fn new() -> Self {
+        Self {
+            pending: None,
+            seen_urls: std::collections::HashSet::new(),
+            out: ParseOutcome::default(),
+            dropped_errors: 0,
+        }
+    }
+
+    fn push_error(&mut self, line: usize, message: String) {
+        if self.out.errors.len() < MAX_ERRORS {
+            self.out.errors.push(M3uLineError { line, message });
+        } else {
+            self.dropped_errors += 1;
+        }
+    }
+
+    /// 喂一行（行号从 1 起；调用方负责剥 BOM——只在首行出现）。
+    pub fn feed_line(&mut self, line_no: usize, raw_line: &str) {
+        self.out.total_lines += 1;
         let line = raw_line.trim_end_matches(['\r', '\n']).trim();
         if line.is_empty() {
-            continue;
+            return;
         }
         if line.starts_with("#EXTM3U") {
             if let Some(url) = parse_attr(line, "x-tvg-url").or_else(|| parse_attr(line, "url-tvg"))
             {
-                out.x_tvg_url = Some(url);
+                self.out.x_tvg_url = Some(url);
             }
-            continue;
+            return;
         }
         if let Some(rest) = line.strip_prefix("#EXTINF:") {
             let (attrs, title) = match rest.split_once(',') {
                 Some((a, t)) => (a.to_string(), t.trim().to_string()),
                 None => {
-                    out.errors.push(M3uLineError {
-                        line: line_no,
-                        message: "EXTINF 缺少逗号后的频道标题".into(),
-                    });
-                    continue;
+                    self.push_error(line_no, "EXTINF 缺少逗号后的频道标题".into());
+                    return;
                 }
             };
-            pending = Some((line_no, attrs, title));
-            continue;
+            self.pending = Some((line_no, attrs, title));
+            return;
         }
         if line.starts_with('#') {
-            continue; // 其他扩展行忽略
+            return; // 其他扩展行忽略
         }
         // 播放地址行
-        let Some((ext_line, attrs, title)) = pending.take() else {
-            out.errors.push(M3uLineError {
-                line: line_no,
-                message: "播放地址前缺少 #EXTINF 行".into(),
-            });
-            continue;
+        let Some((ext_line, attrs, title)) = self.pending.take() else {
+            self.push_error(line_no, "播放地址前缺少 #EXTINF 行".into());
+            return;
         };
         let _ = ext_line;
         if !is_playable_url(line) {
-            out.errors.push(M3uLineError {
-                line: line_no,
-                message: format!("非法播放地址: {line}"),
-            });
-            continue;
+            self.push_error(line_no, format!("非法播放地址: {line}"));
+            return;
         }
-        if !seen_urls.insert(line.to_string()) {
-            out.errors.push(M3uLineError {
-                line: line_no,
-                message: format!("重复频道地址，已跳过: {line}"),
-            });
-            continue;
+        if !self.seen_urls.insert(line.to_string()) {
+            self.push_error(line_no, format!("重复频道地址，已跳过: {line}"));
+            return;
         }
         let tvg_id = parse_attr(&attrs, "tvg-id");
         let name = parse_attr(&attrs, "tvg-name")
             .filter(|s| !s.is_empty())
             .unwrap_or(title);
-        out.channels.push(NormalizedChannel {
+        self.out.channels.push(NormalizedChannel {
             tvg_id,
             name,
             logo: parse_attr(&attrs, "tvg-logo"),
@@ -104,13 +124,57 @@ pub fn parse_m3u(input: &str) -> ParseOutcome {
             catchup_source: parse_attr(&attrs, "catchup-source"),
         });
     }
-    if let Some((line_no, _, _)) = pending {
-        out.errors.push(M3uLineError {
-            line: line_no,
-            message: "最后一个 #EXTINF 没有对应的播放地址".into(),
-        });
+
+    /// 收尾：悬空的 #EXTINF 报错；超限丢弃的错误补一条汇总。
+    pub fn finish(mut self) -> ParseOutcome {
+        if let Some((line_no, _, _)) = self.pending.take() {
+            self.push_error(line_no, "最后一个 #EXTINF 没有对应的播放地址".into());
+        }
+        if self.dropped_errors > 0 {
+            self.out.errors.push(M3uLineError {
+                line: 0,
+                message: format!(
+                    "另有 {} 条错误已省略，仅保留前 {MAX_ERRORS} 条",
+                    self.dropped_errors
+                ),
+            });
+        }
+        self.out
     }
-    out
+}
+
+/// 解析 M3U 文本。`#EXTINF:-1 <attrs>,<标题>` 后下一行非 `#` 即播放地址。
+pub fn parse_m3u(input: &str) -> ParseOutcome {
+    // §7.2：BOM 必须剥离，否则首行 `#EXTM3U` 认不出来（同类教训：BOM 致 0 频道）。
+    let input = input.strip_prefix('\u{feff}').unwrap_or(input);
+    let mut p = M3uParser::new();
+    for (idx, raw_line) in input.lines().enumerate() {
+        p.feed_line(idx + 1, raw_line);
+    }
+    p.finish()
+}
+
+/// 流式解析 M3U：逐行读，不把整包攒进内存（上传不限大小后的安全兜底）。
+/// `reader` 须是 `BufRead`（如文件 `BufReader`）；BOM 只剥首行。
+pub fn parse_m3u_reader<R: std::io::BufRead>(mut reader: R) -> std::io::Result<ParseOutcome> {
+    let mut p = M3uParser::new();
+    let mut line_no = 0usize;
+    let mut buf = String::new();
+    loop {
+        buf.clear();
+        let n = reader.read_line(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        line_no += 1;
+        let line = if line_no == 1 {
+            buf.strip_prefix('\u{feff}').unwrap_or(&buf)
+        } else {
+            &buf
+        };
+        p.feed_line(line_no, line);
+    }
+    Ok(p.finish())
 }
 
 fn is_playable_url(u: &str) -> bool {
@@ -169,5 +233,28 @@ mod tests {
     fn empty_and_header_only() {
         assert!(parse_m3u("").channels.is_empty());
         assert!(parse_m3u("#EXTM3U\n").channels.is_empty());
+    }
+
+    #[test]
+    fn reader_matches_whole_string() {
+        let out = parse_m3u(SAMPLE);
+        let via_reader = parse_m3u_reader(std::io::Cursor::new(SAMPLE.as_bytes())).unwrap();
+        assert_eq!(via_reader.channels, out.channels);
+        assert_eq!(via_reader.errors.len(), out.errors.len());
+        assert_eq!(via_reader.x_tvg_url, out.x_tvg_url);
+        assert_eq!(via_reader.total_lines, SAMPLE.lines().count());
+        assert_eq!(out.total_lines, SAMPLE.lines().count());
+    }
+
+    #[test]
+    fn errors_capped_with_summary() {
+        // 2005 条坏行：只保留前 1000 条 + 1 条汇总，不无限增长。
+        let mut text = String::from("#EXTM3U\n");
+        for i in 0..2005 {
+            text.push_str(&format!("#EXTINF:-1,Bad{i}\nnot a url\n"));
+        }
+        let out = parse_m3u(&text);
+        assert_eq!(out.errors.len(), MAX_ERRORS + 1);
+        assert!(out.errors[MAX_ERRORS].message.contains("条错误已省略"));
     }
 }

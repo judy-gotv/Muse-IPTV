@@ -18,16 +18,63 @@ leptos_meta = { workspace = true }
 leptos_router = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-reqwest = { workspace = true }
-uuid = { workspace = true }
 chrono = { workspace = true }
 fluent-bundle = { workspace = true }
-leptos_axum = { workspace = true }
-axum = { workspace = true }
-tokio = { workspace = true }
-tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
-dotenvy = { workspace = true }
+# B4：WASM 侧只用这三个（hydrate 入口 + 读 document.cookie / navigator.language）。
+wasm-bindgen = { workspace = true }
+web-sys = { workspace = true }
+console_error_panic_hook = { workspace = true }
+# B4：服务端专属依赖，只在 ssr 特性下启用。cargo-leptos 构建 WASM lib 时
+# 只开 hydrate（+ --no-default-features），这些依赖不参与 wasm32 编译，
+# 否则 reqwest（rustls）/ axum（hyper）/ tokio full / uuid v4 全都编不过。
+reqwest = { workspace = true, optional = true }
+uuid = { workspace = true, optional = true }
+leptos_axum = { workspace = true, optional = true }
+axum = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
+tracing-subscriber = { workspace = true, optional = true }
+dotenvy = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
+
+# B4：cargo-leptos 要求 lib 是 cdylib（产 WASM）+ rlib（供服务端二进制与测试用）。
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+# B4：特性划分（cargo-leptos 0.3 默认：lib 构建 --no-default-features
+# --features=hydrate；bin 构建 --no-default-features --features=ssr）。
+# default = ["ssr"] 让普通 cargo build/clippy/test（CI）仍按服务端编译。
+[features]
+default = ["ssr"]
+ssr = [
+    "dep:axum",
+    "dep:dotenvy",
+    "dep:leptos_axum",
+    "dep:reqwest",
+    "dep:tokio",
+    "dep:tracing",
+    "dep:tracing-subscriber",
+    "dep:uuid",
+    "leptos/ssr",
+    "leptos_meta/ssr",
+    "leptos_router/ssr",
+]
+hydrate = ["leptos/hydrate"]
+
+# B4：cargo-leptos 配置。`output-name` 决定 shell 引用的 hydrate 产物名
+# （/pkg/<output-name>.js 与 <output-name>_bg.wasm）；此前全仓库没有
+# 这段元数据，`get_configuration(None)` 读不到 output_name，shell 引用
+# 的是 /pkg/.js（空名），且从未有人跑过 cargo-leptos，pkg/ 根本不存在。
+[package.metadata.leptos]
+output-name = "iptv-portal"
+# B4：cargo-leptos 默认两边都不开特性（--no-default-features 且特性列表为空），
+# 必须显式配：lib（WASM）只开 hydrate（开 ssr 会让 #[server] 宏生成服务端体，
+# 调 reqwest/axum 的 helper 编不过）；bin（服务端）只开 ssr。
+bin-features = ["ssr"]
+lib-features = ["hydrate"]
+# B4：两个项目各用各的 site-root。cargo-leptos 每次构建都会清空整个
+# site 根目录（build_proj 的 rm_dir_content），共享 target/site 时后构建
+# 的项目会删掉先构建的 pkg/；打包时再把两边的 pkg/ 合并成一个 site/。
+site-root = "target/site-portal"

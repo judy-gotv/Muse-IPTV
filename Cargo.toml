@@ -25,7 +25,7 @@ members = [
 exclude = ["deploy/tauri-shell"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.2"
 edition = "2021"
 rust-version = "1.85"
 license = "MIT"
@@ -49,12 +49,16 @@ argon2 = "0.5"
 sha2 = "0.10"
 sha1 = "0.10"
 hmac = "0.12"
+subtle = "2"
 base64 = "0.22"
 hex = "0.4"
 rand = "0.8"
+# B4：见 crates/iptv-core/Cargo.toml 注释（WASM 构建要 getrandom/js）。
+getrandom = { version = "0.2", features = ["js"] }
 uuid = { version = "1", features = ["v4"] }
 # --- http client / parsing (§2) ---
 reqwest = { version = "0.12", features = ["rustls-tls", "json", "stream"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 quick-xml = { version = "0.38", features = ["serialize"] }
 # --- i18n (§2, §12) ---
 fluent-bundle = "0.16"
@@ -73,10 +77,19 @@ qrcode = "0.14"
 utoipa = { version = "5", features = ["axum_extras"] }
 utoipa-swagger-ui = { version = "9", features = ["axum"] }
 url = "2"
-leptos = { version = "0.8", features = ["ssr"] }
+# B4：leptos 系依赖不要在这里开 ssr 特性——`#[server]` 宏经
+# server_fn_macro 的 cfg!(feature = "ssr") 分流服务端体/客户端存根，
+# 它看的是 leptos 自身的 ssr 特性；工作区全局开 ssr 会导致 WASM 构建
+# 也生成服务端体（调 reqwest/axum 的 helper 全编不过）。ssr 由
+# iptv-portal / iptv-admin 各自的 ssr 特性开启。
+leptos = { version = "0.8" }
 leptos_axum = { version = "0.8" }
-leptos_meta = { version = "0.8", features = ["ssr"] }
-leptos_router = { version = "0.8", features = ["ssr"] }
+leptos_meta = { version = "0.8" }
+leptos_router = { version = "0.8" }
+# B4：hydrate 入口与 WASM 侧 Cookie/语言读取（portal/admin 的 lib 用）。
+wasm-bindgen = "0.2"
+web-sys = { version = "0.3", features = ["Window", "Document", "HtmlDocument", "Navigator"] }
+console_error_panic_hook = "0.1"
 
 [profile.release]
 lto = true

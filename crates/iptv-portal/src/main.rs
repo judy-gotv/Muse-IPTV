@@ -1,9 +1,13 @@
 //! 用户端门户二进制（开发文档 §4）。
 //!
-//! Leptos SSR：`leptos_routes` + `shell()`；没有 `pkg/`（cargo-leptos 产物）时
-//! 仍可 SSR 渲染与表单提交。变更处理器是纯 Axum POST，无 hydrate 也能工作，
-//! 包括登录（粘贴 Token，§4.2 方式 B）、退出、语言切换（写 Cookie + PATCH
-//! /api/v1/me/settings，§12.4）、设备下线、改设置、切清晰度。
+//! Leptos SSR + hydrate：`leptos_routes` + `shell()`；hydrate 产物由
+//! cargo-leptos 构建（见 Dockerfile / release.yml），打进镜像与 Release
+//! 包的 `site/`，运行时由 `LEPTOS_SITE_ROOT` 指向（默认 `target/site`）。
+//! 输出名 `iptv-portal` 见 `crates/iptv-portal/Cargo.toml` 的
+//! `[package.metadata.leptos]`（此前缺失导致 shell 引用空名的 /pkg/.js）。
+//! 变更处理器是纯 Axum POST，无 hydrate 也能工作，包括登录（粘贴 Token，
+//! §4.2 方式 B）、退出、语言切换（写 Cookie + PATCH /api/v1/me/settings，
+//! §12.4）、设备下线、改设置、切清晰度。
 //!
 //! 监听地址由 Leptos 配置决定（`LEPTOS_SITE_ADDR`，默认 127.0.0.1:3000）；
 //! 后端地址 `IPTV_API_BASE`，默认 http://127.0.0.1:8080。
@@ -50,6 +54,10 @@ async fn main() {
             let leptos_options = leptos_options.clone();
             move || shell(leptos_options.clone())
         })
+        // B4：leptos_routes 只注册 leptos 路由与 server fn，不带静态文件
+        // 服务；/pkg/*.js 与 /pkg/*.wasm 必须由这个 fallback 经 ServeDir
+        // 从 LEPTOS_SITE_ROOT 指出，否则 hydrate 产物永远 404（空体）。
+        .fallback(leptos_axum::file_and_error_handler(shell))
         .with_state(leptos_options);
     tracing::info!("portal listening on {addr}");
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();

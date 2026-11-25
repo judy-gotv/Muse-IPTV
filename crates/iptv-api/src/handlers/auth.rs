@@ -8,7 +8,7 @@
 // 作者: Passwd Word
 
 use crate::{ok, ApiError, ApiResult, AppState, PortalAuth};
-use axum::extract::State;
+use axum::extract::{ConnectInfo, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -43,7 +43,16 @@ async fn create_portal_session(
         .unwrap_or_default()
         .try_into()
         .unwrap_or([0u8; 32]);
-    let days = if remember { 90 } else { 7 };
+    // M1：会话有效期读系统设置（记住设备 `remember_device_ttl_days`，
+    // 否则 `portal_session_ttl_days`；默认 90 / 7 天）。
+    let days = if remember {
+        state
+            .store
+            .get_setting_i64("remember_device_ttl_days")
+            .await
+    } else {
+        state.store.get_setting_i64("portal_session_ttl_days").await
+    };
     let expires_at = Utc::now() + Duration::days(days);
     state
         .store
@@ -64,14 +73,13 @@ fn json_response<T: serde::Serialize>(
 /// POST /api/v1/auth/ticket-exchange（§4.3 流程图）。
 pub async fn ticket_exchange(
     State(state): State<Arc<AppState>>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
     headers: HeaderMap,
     Json(req): Json<TicketExchangeRequest>,
 ) -> Result<Response, ApiError> {
-    let ip = crate::client_ip(&headers);
-    if !state
-        .login_limiter
-        .check(ip.as_deref().unwrap_or("unknown"))
-    {
+    let ip = crate::client_ip(&headers, Some(peer));
+    let ip_key = ip.clone().unwrap_or_else(|| "unknown".to_string());
+    if !crate::check_login_limit(&state, &ip_key, &format!("ticket-exchange:{ip_key}")) {
         return Err(ApiError::new(ErrorCode::RateLimited, "too many requests"));
     }
     let ticket = state
@@ -149,14 +157,16 @@ pub async fn ticket_exchange(
 /// POST /api/v1/auth/token-login（§4.2 方式 B）。
 pub async fn token_login(
     State(state): State<Arc<AppState>>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
     headers: HeaderMap,
     Json(req): Json<TokenLoginRequest>,
 ) -> Result<Response, ApiError> {
-    let ip = crate::client_ip(&headers);
-    if !state
-        .login_limiter
-        .check(ip.as_deref().unwrap_or("unknown"))
-    {
+    let ip = crate::client_ip(&headers, Some(peer));
+    let ip_key = ip.clone().unwrap_or_else(|| "unknown".to_string());
+    // 按 Token 前缀 + IP 计：同一 Token 被多 IP 轮换刷时各 key 独立，
+    // 再叠加按 IP 聚合的桶防单 IP 横扫多 Token。
+    let prefix = iptv_core::token_prefix(req.token.trim());
+    if !crate::check_login_limit(&state, &ip_key, &format!("token-login:{prefix}:{ip_key}")) {
         return Err(ApiError::new(ErrorCode::RateLimited, "too many requests"));
     }
     let hash = hash_token(req.token.trim());
@@ -196,10 +206,15 @@ pub async fn token_login(
         req.remember_device,
     )
     .await?;
+    // M1：Cookie 有效期与会话 DB 有效期同源（系统设置，默认 90 / 7 天）。
     let max_age = if req.remember_device {
-        90 * 86400
+        state
+            .store
+            .get_setting_i64("remember_device_ttl_days")
+            .await
+            * 86400
     } else {
-        7 * 86400
+        state.store.get_setting_i64("portal_session_ttl_days").await * 86400
     };
     let mut h = HeaderMap::new();
     h.insert(

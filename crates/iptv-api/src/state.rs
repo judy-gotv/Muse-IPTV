@@ -70,7 +70,13 @@ pub struct AppState {
     pub config: Arc<Config>,
     pub metrics: Arc<Metrics>,
     pub tickets: Arc<crate::tickets::TicketStore>,
+    /// 登录口限流（§13 三维：IP / Token / 管理员账号）：
+    /// `login_limiter` 按复合 key 计（5 次/分钟），`login_ip_limiter`
+    /// 按 IP 聚合计（30 次/分钟），两者都过才放行。三类登录共用一个
+    /// "unknown" 桶是 M2 的 bug：单端口部署下所有登录都经门户/后台中转，
+    /// 不分桶时全站每分钟只能登录 5 人次。
     pub login_limiter: Arc<iptv_auth::RateLimiter>,
+    pub login_ip_limiter: Arc<iptv_auth::RateLimiter>,
 }
 
 impl AppState {
@@ -84,6 +90,8 @@ impl AppState {
             }
         }
         let limiter = Arc::new(ConcurrencyLimiter::new(config.redis_url.as_deref()));
+        // M1：会话超时读系统设置 `session_timeout_sec`（默认 90s）。
+        limiter.set_ttl_sec(store.get_setting_i64("session_timeout_sec").await);
         Ok(Self {
             store,
             limiter,
@@ -91,8 +99,10 @@ impl AppState {
             config: Arc::new(config),
             metrics: Arc::new(Metrics::default()),
             tickets: Arc::new(crate::tickets::TicketStore::new()),
-            // §13：登录口限流 5 次/分钟/IP
+            // §13：登录口限流 5 次/分钟/复合 key；另按 IP 聚合 30 次/分钟，
+            // 防单 IP 在多账号/多 Token 间轮换刷登录。
             login_limiter: Arc::new(iptv_auth::RateLimiter::new(5, 60)),
+            login_ip_limiter: Arc::new(iptv_auth::RateLimiter::new(30, 60)),
         })
     }
 }

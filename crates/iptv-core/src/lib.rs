@@ -23,6 +23,14 @@ pub use token::{
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// 默认系统设置（§3.2 全部键）。`system_setting` 表缺失时用这些默认值。
+/// 单个键的默认值（供 `get_setting_i64` 等兜底用，避免各处默认值漂移）。
+pub fn default_setting(key: &str) -> Option<serde_json::Value> {
+    default_settings()
+        .into_iter()
+        .find(|(k, _)| k == key)
+        .map(|(_, v)| v)
+}
+
 pub fn default_settings() -> Vec<(String, serde_json::Value)> {
     vec![
         (
@@ -45,6 +53,7 @@ pub fn default_settings() -> Vec<(String, serde_json::Value)> {
         ("remember_device_ttl_days".into(), serde_json::json!(90)),
         ("ticket_ttl_sec".into(), serde_json::json!(60)),
         ("audit_retention_days".into(), serde_json::json!(180)),
-        ("max_upload_mb".into(), serde_json::json!(20)),
+        // `max_upload_mb` 已废弃：本地 M3U 上传不限大小（用户 2026-11-25
+        // 批准，与 §7.1 的 20 MB 相悖），V4 迁移删已有行，这里不再列出。
     ]
 }

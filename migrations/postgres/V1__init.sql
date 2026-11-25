@@ -37,7 +37,7 @@ CREATE TABLE IF NOT EXISTS user_token (
     updated_at BIGINT NOT NULL
 );
 
-CREATE INDEX idx_user_token_user ON user_token(user_id);
+CREATE INDEX IF NOT EXISTS idx_user_token_user ON user_token(user_id);
 
 CREATE TABLE IF NOT EXISTS portal_session (
     id BIGSERIAL PRIMARY KEY,
@@ -52,7 +52,7 @@ CREATE TABLE IF NOT EXISTS portal_session (
     revoked_at BIGINT
 );
 
-CREATE INDEX idx_portal_session_token ON portal_session(token_id);
+CREATE INDEX IF NOT EXISTS idx_portal_session_token ON portal_session(token_id);
 
 CREATE TABLE IF NOT EXISTS device_binding (
     id BIGSERIAL PRIMARY KEY,
@@ -101,8 +101,8 @@ CREATE TABLE IF NOT EXISTS channel (
     updated_at BIGINT NOT NULL
 );
 
-CREATE INDEX idx_channel_source ON channel(source_id);
-CREATE INDEX idx_channel_group ON channel(group_title);
+CREATE INDEX IF NOT EXISTS idx_channel_source ON channel(source_id);
+CREATE INDEX IF NOT EXISTS idx_channel_group ON channel(group_title);
 
 CREATE TABLE IF NOT EXISTS channel_endpoint (
     id BIGSERIAL PRIMARY KEY,
@@ -114,7 +114,7 @@ CREATE TABLE IF NOT EXISTS channel_endpoint (
     priority INTEGER NOT NULL DEFAULT 0
 );
 
-CREATE INDEX idx_endpoint_channel ON channel_endpoint(channel_id);
+CREATE INDEX IF NOT EXISTS idx_endpoint_channel ON channel_endpoint(channel_id);
 
 CREATE TABLE IF NOT EXISTS channel_group (
     id BIGSERIAL PRIMARY KEY,
@@ -161,7 +161,7 @@ CREATE TABLE IF NOT EXISTS epg_program (
     UNIQUE (channel_id, start_at)
 );
 
-CREATE INDEX idx_epg_program_channel ON epg_program(channel_id, start_at);
+CREATE INDEX IF NOT EXISTS idx_epg_program_channel ON epg_program(channel_id, start_at);
 
 CREATE TABLE IF NOT EXISTS playback_session (
     id BIGSERIAL PRIMARY KEY,
@@ -178,7 +178,7 @@ CREATE TABLE IF NOT EXISTS playback_session (
     status VARCHAR(16) NOT NULL DEFAULT 'active'
 );
 
-CREATE INDEX idx_ps_active ON playback_session(token_id) WHERE status = 'active';
+CREATE INDEX IF NOT EXISTS idx_ps_active ON playback_session(token_id) WHERE status = 'active';
 
 CREATE TABLE IF NOT EXISTS playback_event (
     id BIGSERIAL PRIMARY KEY,
@@ -190,8 +190,8 @@ CREATE TABLE IF NOT EXISTS playback_event (
     created_at BIGINT NOT NULL
 );
 
-CREATE INDEX idx_playback_event_token ON playback_event(token_id, created_at);
-CREATE INDEX idx_playback_event_session ON playback_event(session_uid);
+CREATE INDEX IF NOT EXISTS idx_playback_event_token ON playback_event(token_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_playback_event_session ON playback_event(session_uid);
 
 CREATE TABLE IF NOT EXISTS sync_job (
     id BIGSERIAL PRIMARY KEY,
@@ -202,7 +202,7 @@ CREATE TABLE IF NOT EXISTS sync_job (
     created_at BIGINT NOT NULL
 );
 
-CREATE INDEX idx_sync_job_source ON sync_job(source_id, status);
+CREATE INDEX IF NOT EXISTS idx_sync_job_source ON sync_job(source_id, status);
 
 CREATE TABLE IF NOT EXISTS sync_log (
     id BIGSERIAL PRIMARY KEY,
@@ -216,7 +216,7 @@ CREATE TABLE IF NOT EXISTS sync_log (
     error TEXT
 );
 
-CREATE INDEX idx_sync_log_source ON sync_log(source_id, started_at);
+CREATE INDEX IF NOT EXISTS idx_sync_log_source ON sync_log(source_id, started_at);
 
 CREATE TABLE IF NOT EXISTS plan (
     id BIGSERIAL PRIMARY KEY,
@@ -240,7 +240,7 @@ CREATE TABLE IF NOT EXISTS subscription (
     created_at BIGINT NOT NULL
 );
 
-CREATE INDEX idx_subscription_user ON subscription(user_id);
+CREATE INDEX IF NOT EXISTS idx_subscription_user ON subscription(user_id);
 
 CREATE TABLE IF NOT EXISTS admin_user (
     id BIGSERIAL PRIMARY KEY,
@@ -281,8 +281,8 @@ CREATE TABLE IF NOT EXISTS audit_log (
     created_at BIGINT NOT NULL
 );
 
-CREATE INDEX idx_audit_actor ON audit_log(actor, created_at);
-CREATE INDEX idx_audit_action ON audit_log(action, created_at);
+CREATE INDEX IF NOT EXISTS idx_audit_actor ON audit_log(actor, created_at);
+CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_log(action, created_at);
 
 CREATE TABLE IF NOT EXISTS system_setting (
     setting_key VARCHAR(128) NOT NULL PRIMARY KEY,
@@ -299,4 +299,4 @@ CREATE TABLE IF NOT EXISTS i18n_override (
     UNIQUE (locale, key)
 );
 
-CREATE UNIQUE INDEX uq_channel_tvg ON channel(tvg_id) WHERE tvg_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_channel_tvg ON channel(tvg_id) WHERE tvg_id IS NOT NULL;

@@ -5,7 +5,7 @@
 use super::*;
 use iptv_core::{content_hash, normalize_play_url};
 use iptv_m3u::NormalizedChannel;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 pub(crate) fn row_to_channel(row: &AnyRow) -> anyhow::Result<Channel> {
     Ok(Channel {
@@ -263,6 +263,49 @@ impl Store {
         Ok(n > 0)
     }
 
+    /// 健康探测写回（§7.3 第 7 步）：记录探测时间与是否可用。
+    /// 后台频道列表与仪表盘据此展示可用性（`last_available IS NULL` 为未探测）。
+    pub async fn record_channel_probe(
+        &self,
+        channel_id: i64,
+        available: bool,
+    ) -> anyhow::Result<()> {
+        sqlx::query(&ph(
+            "UPDATE channel SET last_checked_at = ?, last_available = ?, updated_at = ? WHERE id = ?",
+            self.dialect,
+        ))
+        .bind(epoch(Utc::now()))
+        .bind(i64::from(available))
+        .bind(epoch(Utc::now()))
+        .bind(channel_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// EPG 匹配用键（M7）：一次取回全部频道的 (id, tvg_id, name, sort_weight)，
+    /// 按 sort_weight DESC、id ASC 排（与 `list_channels` 的默认排序一致），
+    /// 调用方在内存里匹配，避免每个节目一次查库的 N+1。
+    pub async fn list_channel_match_keys(
+        &self,
+    ) -> anyhow::Result<Vec<(i64, Option<String>, String, i64)>> {
+        let rows = sqlx::query(
+            "SELECT id, tvg_id, name, sort_weight FROM channel ORDER BY sort_weight DESC, id ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for r in &rows {
+            out.push((
+                r_i64(r, "id")?,
+                r_opt_string(r, "tvg_id")?,
+                r_string(r, "name")?,
+                r_i64(r, "sort_weight")?,
+            ));
+        }
+        Ok(out)
+    }
+
     pub async fn list_endpoints(&self, channel_id: i64) -> anyhow::Result<Vec<ChannelEndpoint>> {
         let rows = sqlx::query(&ph(&format!(
             "SELECT {ENDPOINT_COLS} FROM channel_endpoint WHERE channel_id = ? ORDER BY priority ASC, id ASC"
@@ -411,21 +454,24 @@ impl Store {
         // 全局 tvg_id 匹配：唯一索引 uq_channel_tvg 是全局的（不限 source_id），
         // 手动建的频道（source_id 为 NULL）或别源的同名频道也在此列。只按本源
         // 加载去重会误判新增、走纯 INSERT 撞唯一约束（PG contract.rs:124）。
-        let mut tvg_ids: Vec<&str> = Vec::new();
+        // 大文件导入：tvg_id 去重用 HashSet（Vec::contains 是 O(n^2)，82 万条
+        // 会烧掉 10 分钟以上）；全局匹配的 IN 列表按 500 一批查，单条 SQL 的
+        // 绑定变量数必须低于 SQLite 32766 / PG 65535 的上限（6 万条单批会直接
+        // 报 too many SQL variables）。
+        let mut tvg_ids: HashSet<&str> = HashSet::new();
         for item in &items {
             if let Some(t) = item.tvg_id.as_deref().filter(|s| !s.trim().is_empty()) {
-                if !tvg_ids.contains(&t) {
-                    tvg_ids.push(t);
-                }
+                tvg_ids.insert(t);
             }
         }
+        let tvg_ids: Vec<&str> = tvg_ids.into_iter().collect();
         let mut global_matches: Vec<Channel> = Vec::new();
-        if !tvg_ids.is_empty() {
+        for chunk in tvg_ids.chunks(500) {
             let mut sql = format!("SELECT {CHANNEL_COLS} FROM channel WHERE tvg_id IN (");
-            push_in_list(&mut sql, "", tvg_ids.len());
+            push_in_list(&mut sql, "", chunk.len());
             let sql = ph(&sql, self.dialect);
             let mut q = sqlx::query(&sql);
-            for t in &tvg_ids {
+            for t in chunk {
                 q = q.bind(*t);
             }
             for r in q.fetch_all(&self.pool).await? {
@@ -435,22 +481,32 @@ impl Store {
         // 端点按本源频道 + 全局匹配频道的并集加载（UPDATE 分支要靠它判断
         // URL 是否变更；全局匹配的频道不在本源集合里，不补会误判 URL 变更
         // 并重复插入主地址）。
-        let mut ep_ids: Vec<i64> = existing.iter().map(|c| c.id).collect();
+        // 端点只给真正需要的频道加载：无 tvg_id 的本源频道（URL 键需要主
+        // 地址）+ 全局 tvg 匹配的频道（UPDATE 分支要判断 URL 是否变更）。
+        // tvg 匹配的本源频道一定在 global_matches 里（tvg IN 查询覆盖全
+        // 库），URL 匹配的只能是没有 tvg 的频道；其余本源频道的端点在本次
+        // 导入里用不到。此前是全量加载：源里有 88 万台时光端点 IN 列表就
+        // 要 1760 批查询，一个 4 行的小文件上传也会被拖到 120 秒以上超时。
+        let mut ep_ids: HashSet<i64> = existing
+            .iter()
+            .filter(|c| c.tvg_id.as_deref().is_none_or(|t| t.trim().is_empty()))
+            .map(|c| c.id)
+            .collect();
         for ch in &global_matches {
-            if !ep_ids.contains(&ch.id) {
-                ep_ids.push(ch.id);
-            }
+            ep_ids.insert(ch.id);
         }
+        let ep_ids: Vec<i64> = ep_ids.into_iter().collect();
         let mut endpoints: HashMap<i64, Vec<ChannelEndpoint>> = HashMap::new();
-        if !ep_ids.is_empty() {
+        // 同上：端点 IN 列表按 500 一批（重导入 82 万条时 ep_ids 同样超限）。
+        for chunk in ep_ids.chunks(500) {
             // 不用 sqlx::QueryBuilder（见 lib.rs `ph`）：手拼 IN 列表。
             let mut sql =
                 format!("SELECT {ENDPOINT_COLS} FROM channel_endpoint WHERE channel_id IN (");
-            push_in_list(&mut sql, "", ep_ids.len());
+            push_in_list(&mut sql, "", chunk.len());
             sql.push_str(" ORDER BY priority ASC");
             let sql = ph(&sql, self.dialect);
             let mut q = sqlx::query(&sql);
-            for id in &ep_ids {
+            for id in chunk {
                 q = q.bind(*id);
             }
             for r in q.fetch_all(&self.pool).await? {
@@ -485,7 +541,7 @@ impl Store {
                 .entry(key_of_existing(ch))
                 .or_insert_with(|| ch.clone());
         }
-        let mut seen_keys: Vec<String> = Vec::with_capacity(items.len());
+        let mut seen_keys: HashSet<String> = HashSet::with_capacity(items.len());
 
         for item in &items {
             let tvg = item.tvg_id.clone().filter(|s| !s.trim().is_empty());
@@ -494,7 +550,7 @@ impl Store {
                 Some(t) => format!("tvg:{t}"),
                 None => format!("url:{}", normalize_play_url(&item.url)),
             };
-            seen_keys.push(key.clone());
+            seen_keys.insert(key.clone());
             let hash = content_hash(tvg.as_deref().unwrap_or(""), &item.url, &item.name, &group);
             match by_key.get(&key) {
                 Some(cur) => {
@@ -545,10 +601,19 @@ impl Store {
                                 .await?;
                         }
                     }
-                    let updated = self
-                        .get_channel(cur.id)
-                        .await?
-                        .unwrap_or_else(|| cur.clone());
+                    // 直接由 cur + 本次写入值构造，不回查（刚 UPDATE 的行各字段
+                    // 都已知；逐行 get_channel 是大文件导入里每行多一次查询）。
+                    let mut updated = cur.clone();
+                    updated.name = item.name.clone();
+                    updated.logo_url = item.logo.clone();
+                    updated.group_title = item.group.clone();
+                    updated.content_hash = Some(hash.clone());
+                    updated.status = if status == "active" {
+                        ChannelStatus::Active
+                    } else {
+                        ChannelStatus::Disabled
+                    };
+                    updated.updated_at = now;
                     if url_changed {
                         outcome.url_changed.push(updated);
                     } else {
@@ -584,7 +649,7 @@ impl Store {
                     )?;
                     let proto = protocol_for(&item.url, None);
                     self.insert_endpoint(id, &item.url, &proto, true, 0).await?;
-                    let ch = self.get_channel(id).await?.unwrap_or(Channel {
+                    let ch = Channel {
                         id,
                         tvg_id: tvg,
                         name: item.name.clone(),
@@ -606,41 +671,64 @@ impl Store {
                         last_available: None,
                         created_at: now,
                         updated_at: now,
-                    });
+                    };
                     outcome.added_channels.push(ch);
                     outcome.added += 1;
                 }
             }
         }
 
-        // 订阅里消失的频道。
+        // 订阅里消失的频道：先收齐 id 再分批 bulk 写。逐行 DELETE/UPDATE
+        // 在源里有几十万台时会把小文件上传也拖垮——每行一次写，还要与
+        // worker 轮询抢 SQLite 写锁；实测 88 万台消失时每行约 4 秒、基本
+        // 停滞。分批（500 个 id 一批）后同等规模约数十秒内完成。
+        let mut missing_ids: Vec<i64> = Vec::new();
         for cur in &existing {
             let key = key_of_existing(cur);
             if seen_keys.contains(&key) {
                 continue;
             }
-            // 注意：OnMissing 未派生 Copy，循环里用 == 比较，不移出字段。
-            if source.on_missing == iptv_dto::OnMissing::Delete {
-                sqlx::query(&ph(
-                    "DELETE FROM channel_endpoint WHERE channel_id = ?",
-                    self.dialect,
-                ))
-                .bind(cur.id)
-                .execute(&self.pool)
-                .await?;
-                sqlx::query(&ph("DELETE FROM channel WHERE id = ?", self.dialect))
-                    .bind(cur.id)
-                    .execute(&self.pool)
-                    .await?;
-            } else {
-                sqlx::query(&ph("UPDATE channel SET status = 'disabled', updated_at = ? WHERE id = ? AND status = 'active'", self.dialect))
-                    .bind(epoch(now))
-                    .bind(cur.id)
-                    .execute(&self.pool)
-                    .await?;
-            }
+            missing_ids.push(cur.id);
             outcome.missing.push(cur.clone());
             outcome.removed += 1;
+        }
+        if !missing_ids.is_empty() {
+            // 注意：OnMissing 未派生 Copy，用 == 比较，不移出字段。
+            if source.on_missing == iptv_dto::OnMissing::Delete {
+                for chunk in missing_ids.chunks(500) {
+                    let mut sql =
+                        String::from("DELETE FROM channel_endpoint WHERE channel_id IN (");
+                    push_in_list(&mut sql, "", chunk.len());
+                    let sql = ph(&sql, self.dialect);
+                    let mut q = sqlx::query(&sql);
+                    for id in chunk {
+                        q = q.bind(*id);
+                    }
+                    q.execute(&self.pool).await?;
+                    let mut sql = String::from("DELETE FROM channel WHERE id IN (");
+                    push_in_list(&mut sql, "", chunk.len());
+                    let sql = ph(&sql, self.dialect);
+                    let mut q = sqlx::query(&sql);
+                    for id in chunk {
+                        q = q.bind(*id);
+                    }
+                    q.execute(&self.pool).await?;
+                }
+            } else {
+                for chunk in missing_ids.chunks(500) {
+                    let mut sql = String::from(
+                        "UPDATE channel SET status = 'disabled', updated_at = ? WHERE id IN (",
+                    );
+                    push_in_list(&mut sql, "", chunk.len());
+                    sql.push_str(" AND status = 'active'");
+                    let sql = ph(&sql, self.dialect);
+                    let mut q = sqlx::query(&sql).bind(epoch(now));
+                    for id in chunk {
+                        q = q.bind(*id);
+                    }
+                    q.execute(&self.pool).await?;
+                }
+            }
         }
 
         // 缓存差异供 get_sync_diff 重建（CONTRACTS.md）。
