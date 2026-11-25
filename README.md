@@ -20,8 +20,51 @@ irm https://raw.githubusercontent.com/judy-gotv/Muse-IPTV/main/install.ps1 | iex
 ```
 
 安装脚本会打印**只显示一次**的管理员账号密码，请妥善保存。
-手动安装见 [deploy/docker-compose.yml](deploy/docker-compose.yml)（Docker）
 或从 [Releases](https://github.com/judy-gotv/Muse-IPTV/releases) 下载对应架构包。
+
+## Docker 部署
+
+镜像 `ghcr.io/judy-gotv/muse-iptv:latest`（amd64/arm64），一个容器跑全部四个服务：
+API :8080、门户 :8081、后台 :8082，数据在 `/app/data`（默认 SQLite）。
+
+```sh
+docker pull ghcr.io/judy-gotv/muse-iptv:latest
+
+# 首次启动必须设 IPTV_ADMIN_PASSWORD，否则建不出管理员账号
+docker run -d \
+  --name muse-iptv \
+  --restart unless-stopped \
+  -p 8080:8080 -p 8081:8081 -p 8082:8082 \
+  -v muse-iptv-data:/app/data \
+  -e IPTV_ADMIN_USER=admin \
+  -e IPTV_ADMIN_PASSWORD=改成你的密码 \
+  ghcr.io/judy-gotv/muse-iptv:latest
+```
+
+- 门户：`http://服务器IP:8081`（票据登录 / 粘贴 Token 登录）
+- 后台：`http://服务器IP:8082`（管理员登录）
+- 健康检查：`curl http://127.0.0.1:8080/healthz`
+- 看日志：`docker logs -f muse-iptv`；停掉：`docker stop muse-iptv`
+- 升级：`docker pull ghcr.io/judy-gotv/muse-iptv:latest` 后 `docker rm -f muse-iptv`，再按上面命令重跑（数据在 volume 里，不丢）。
+
+### Docker Compose
+
+```sh
+cp .env.example .env   # 改 IPTV_ADMIN_PASSWORD
+docker compose -f deploy/docker-compose.yml up -d
+```
+
+### 环境变量
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `IPTV_ADMIN_USER` / `IPTV_ADMIN_PASSWORD` | admin / 空 | 首次启动建超管；密码为空建不出账号 |
+| `DATABASE_URL` | `sqlite:///app/data/iptv.db` | 改 PostgreSQL/MySQL 见 `.env.example` |
+| `PLAY_SECRET` / `ADMIN_SECRET` | 为空则随机生成 | 不固定则重启后旧播放链接与会话失效 |
+| `PORTAL_BASE_URL` | `http://127.0.0.1:8081` | 票据链接用的门户地址；远程访问改成服务器 IP/域名 |
+| `IPTV_PORT` / `IPTV_PORTAL_PORT` / `IPTV_ADMIN_PORT` | 8080 / 8081 / 8082 | compose 映射到宿主的端口 |
+
+注意：`:v0.1.0` 镜像的入口脚本没给门户/后台定端口（两个服务会抢 `127.0.0.1:3000`），请用 `:latest`。
 
 ## 快速开始（源码）
 
@@ -29,8 +72,8 @@ irm https://raw.githubusercontent.com/judy-gotv/Muse-IPTV/main/install.ps1 | iex
 cp .env.example .env   # 改 IPTV_ADMIN_PASSWORD
 cargo run -p iptv-api      # 后端 :8080（默认 SQLite ./data/iptv.db）
 cargo run -p iptv-worker   # 同步/探测/清理
-cargo run -p iptv-portal   # 门户 :8081
-cargo run -p iptv-admin    # 后台 :8082
+LEPTOS_SITE_ADDR=0.0.0.0:8081 cargo run -p iptv-portal   # 门户 :8081
+LEPTOS_SITE_ADDR=0.0.0.0:8082 cargo run -p iptv-admin    # 后台 :8082
 ```
 
 - 健康检查：`curl http://127.0.0.1:8080/healthz`

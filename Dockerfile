@@ -13,7 +13,7 @@ RUN cargo build --release --bins
 RUN mkdir -p /out && cp target/release/iptv-api target/release/iptv-worker target/release/iptv-portal target/release/iptv-admin /out/ && ls -la /out
 
 FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates sqlite3 && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates sqlite3 wget && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY --from=builder /out/iptv-api /usr/local/bin/iptv-api
 COPY --from=builder /out/iptv-worker /usr/local/bin/iptv-worker
