@@ -3,12 +3,15 @@
 //! DB 用临时文件 SQLite 库。
 // 作者: Passwd Word
 
-use axum::extract::State;
+use axum::extract::{ConnectInfo, State};
 use axum::http::HeaderMap;
+use axum::Json;
 use chrono::{Duration, Utc};
 use iptv_api::handlers::auth;
 use iptv_api::{AppState, Config, PortalAuth};
+use iptv_core::hash_token;
 use iptv_dto::*;
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -128,4 +131,97 @@ async fn logout_all_revokes_every_session_including_current() {
         .unwrap()
         .is_empty());
     assert_eq!(audit_total(&state, "auth.logout_all").await, 1);
+}
+
+/// M14 回归之二：已绑定设备重登录不计入设备上限。
+/// Token 上限 2 台，A/B 两台绑满后：新设备 C 登录 → 42902；logout-all 后
+/// A/B 同一台设备重登 → 200（绑定是粘性的，吊销会话不解绑，重登不能被挡住）；
+/// C 再登仍是 42902。
+#[tokio::test]
+async fn bound_device_relogin_exempt_from_device_cap() {
+    let fx = setup().await;
+    let state = fx.state.clone();
+    let user = state
+        .store
+        .create_user(&CreateUserRequest {
+            display_name: "bound-relogin".to_string(),
+            email: None,
+            phone: None,
+            plan_id: None,
+            locale: Some("zh-Hans-CN".to_string()),
+            remark: None,
+            expires_at: None,
+        })
+        .await
+        .unwrap();
+    let plain = "test-token-plain-bound-1";
+    let token = state
+        .store
+        .create_token(
+            user.id,
+            "tk_live_",
+            &hash_token(plain),
+            &CreateTokenRequest {
+                user_id: user.id,
+                name: "cap-2".to_string(),
+                device_type: Some("android_tv".to_string()),
+                max_concurrent_sessions: 5,
+                max_bound_devices: 2,
+                expires_at: Some(Utc::now() + Duration::days(365)),
+                locale: Some("zh-Hans-CN".to_string()),
+                allowed_groups: vec![],
+                denied_channels: vec![],
+                features: TokenFeatures::default(),
+            },
+        )
+        .await
+        .unwrap();
+    let peer = ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40001)));
+    let login = |fp: &str| {
+        let state = state.clone();
+        let req = TokenLoginRequest {
+            token: plain.to_string(),
+            device_fingerprint: fp.to_string(),
+            remember_device: false,
+        };
+        async move { auth::token_login(State(state), peer, HeaderMap::new(), Json(req)).await }
+    };
+    // A、B 各登一次占满 2 个名额。
+    assert_eq!(login("fp-a").await.unwrap().status(), 200);
+    assert_eq!(login("fp-b").await.unwrap().status(), 200);
+    assert_eq!(state.store.bound_device_count(token.id).await.unwrap(), 2);
+    // 新设备 C 被上限挡住。
+    assert_eq!(
+        login("fp-c").await.unwrap_err().code,
+        ErrorCode::DeviceLimitReached
+    );
+    // A 发起退出全部设备。
+    let sessions = state.store.list_portal_sessions(token.id).await.unwrap();
+    let current = sessions
+        .iter()
+        .find(|s| s.device_id == "fp-a")
+        .expect("fp-a session");
+    let auth_ctx = PortalAuth {
+        token_id: token.id,
+        user_id: user.id,
+        session_id: current.id,
+        device_id: "fp-a".to_string(),
+        locale: "zh-Hans-CN".to_string(),
+    };
+    auth::logout_all(State(state.clone()), auth_ctx, HeaderMap::new())
+        .await
+        .unwrap();
+    assert!(state
+        .store
+        .list_portal_sessions(token.id)
+        .await
+        .unwrap()
+        .is_empty());
+    // 已绑定设备重登放行，新设备仍被挡。
+    assert_eq!(login("fp-a").await.unwrap().status(), 200);
+    assert_eq!(login("fp-b").await.unwrap().status(), 200);
+    assert_eq!(
+        login("fp-c").await.unwrap_err().code,
+        ErrorCode::DeviceLimitReached
+    );
 }

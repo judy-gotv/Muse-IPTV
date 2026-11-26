@@ -171,4 +171,19 @@ impl Store {
         .fetch_one(&self.pool)
         .await?)
     }
+
+    /// 该设备指纹是否已绑定到此 Token（§6.1：上限只计不同设备数，
+    /// 已绑定设备重登录不占新名额——logout-all 后同一台设备重登不能被
+    /// 42902 挡住，绑定本身是粘性的，吊销会话不解绑）。
+    pub async fn is_device_bound(&self, token_id: i64, device_id: &str) -> anyhow::Result<bool> {
+        let n: i64 = sqlx::query_scalar(&ph(
+            "SELECT COUNT(*) FROM device_binding WHERE token_id = ? AND device_id = ?",
+            self.dialect,
+        ))
+        .bind(token_id)
+        .bind(device_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(n > 0)
+    }
 }

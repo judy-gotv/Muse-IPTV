@@ -113,17 +113,25 @@ pub async fn ticket_exchange(
             "token disabled or expired",
         ));
     }
-    // 绑定设备数校验（§6.1 第二维度）。
-    let bound = state
+    // 绑定设备数校验（§6.1 第二维度）：已绑定设备重登录不计入上限——
+    // 上限只限制不同设备数，logout-all 后同一台设备重登不能被 42902 挡住。
+    if !state
         .store
-        .bound_device_count(token.id)
+        .is_device_bound(token.id, &req.device_fingerprint)
         .await
-        .map_err(ApiError::from)?;
-    if bound >= token.max_bound_devices as i64 {
-        return Err(ApiError::new(
-            ErrorCode::DeviceLimitReached,
-            "device limit reached",
-        ));
+        .map_err(ApiError::from)?
+    {
+        let bound = state
+            .store
+            .bound_device_count(token.id)
+            .await
+            .map_err(ApiError::from)?;
+        if bound >= token.max_bound_devices as i64 {
+            return Err(ApiError::new(
+                ErrorCode::DeviceLimitReached,
+                "device limit reached",
+            ));
+        }
     }
     let ua = headers
         .get(header::USER_AGENT)
@@ -191,16 +199,25 @@ pub async fn token_login(
             "token disabled or expired",
         ));
     }
-    let bound = state
+    // 绑定设备数校验（§6.1 第二维度）：已绑定设备重登录不计入上限——
+    // 上限只限制不同设备数，logout-all 后同一台设备重登不能被 42902 挡住。
+    if !state
         .store
-        .bound_device_count(token.id)
+        .is_device_bound(token.id, &req.device_fingerprint)
         .await
-        .map_err(ApiError::from)?;
-    if bound >= token.max_bound_devices as i64 {
-        return Err(ApiError::new(
-            ErrorCode::DeviceLimitReached,
-            "device limit reached",
-        ));
+        .map_err(ApiError::from)?
+    {
+        let bound = state
+            .store
+            .bound_device_count(token.id)
+            .await
+            .map_err(ApiError::from)?;
+        if bound >= token.max_bound_devices as i64 {
+            return Err(ApiError::new(
+                ErrorCode::DeviceLimitReached,
+                "device limit reached",
+            ));
+        }
     }
     let ua = headers
         .get(header::USER_AGENT)
