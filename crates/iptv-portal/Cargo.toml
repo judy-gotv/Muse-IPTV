@@ -6,13 +6,13 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
 
 [dependencies]
 iptv-dto = { path = "../iptv-dto" }
 iptv-i18n = { path = "../iptv-i18n" }
 iptv-design = { path = "../iptv-design" }
 iptv-ui = { path = "../iptv-ui" }
-iptv-core = { path = "../iptv-core" }
 leptos = { workspace = true }
 leptos_meta = { workspace = true }
 leptos_router = { workspace = true }
@@ -23,7 +23,7 @@ fluent-bundle = { workspace = true }
 # B4：WASM 侧只用这三个（hydrate 入口 + 读 document.cookie / navigator.language）。
 wasm-bindgen = { workspace = true }
 web-sys = { workspace = true }
-console_error_panic_hook = { workspace = true }
+console_error_panic_hook = { workspace = true, optional = true }
 # B4：服务端专属依赖，只在 ssr 特性下启用。cargo-leptos 构建 WASM lib 时
 # 只开 hydrate（+ --no-default-features），这些依赖不参与 wasm32 编译，
 # 否则 reqwest（rustls）/ axum（hyper）/ tokio full / uuid v4 全都编不过。
@@ -61,7 +61,7 @@ ssr = [
     "leptos_meta/ssr",
     "leptos_router/ssr",
 ]
-hydrate = ["leptos/hydrate"]
+hydrate = ["leptos/hydrate", "dep:console_error_panic_hook"]
 
 # B4：cargo-leptos 配置。`output-name` 决定 shell 引用的 hydrate 产物名
 # （/pkg/<output-name>.js 与 <output-name>_bg.wasm）；此前全仓库没有

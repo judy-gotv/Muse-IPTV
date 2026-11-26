@@ -409,7 +409,7 @@ pub fn SearchField(
                 type="search"
                 name=name
                 value=value
-                placeholder=placeholder.unwrap_or_else(|| "搜索".to_string())
+                placeholder=placeholder.unwrap_or_else(|| "Search".to_string())
                 aria-label="search"
             />
         </div>

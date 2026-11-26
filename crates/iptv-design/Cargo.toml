@@ -6,12 +6,11 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
 
 [dependencies]
 
 leptos = { workspace = true }
-leptos_meta = { workspace = true }
-leptos_router = { workspace = true }
 serde = { workspace = true }
 
 [dev-dependencies]

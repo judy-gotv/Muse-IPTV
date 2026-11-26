@@ -53,18 +53,30 @@ async fn main() {
         .route("/admin/logout", post(logout))
         .route("/admin/locale", post(set_locale))
         .route("/admin/users", post(create_user))
+        .route("/admin/users/{id}/update", post(update_user))
+        .route("/admin/users/{id}/delete", post(delete_user))
         .route("/admin/tokens", post(create_token))
         .route("/admin/tokens/{id}/ticket", post(create_login_ticket))
         .route("/admin/tokens/{id}/revoke", post(revoke_token_sessions))
+        .route("/admin/tokens/{id}/update", post(update_token))
+        .route("/admin/tokens/{id}/delete", post(delete_token))
         .route("/admin/channels", post(create_channel))
         .route("/admin/channels/{id}/delete", post(delete_channel))
         .route("/admin/sources", post(create_source))
         .route("/admin/sources/upload", post(upload_m3u))
         .route("/admin/sources/{id}/sync", post(trigger_sync))
+        .route("/admin/sources/{id}/update", post(update_source))
+        .route("/admin/sources/{id}/delete", post(delete_source))
         .route("/admin/groups", post(create_group))
+        .route("/admin/groups/{id}/update", post(update_group))
+        .route("/admin/groups/{id}/delete", post(delete_group))
         .route("/admin/epg/sources", post(create_epg_source))
+        .route("/admin/epg/sources/{id}/update", post(update_epg_source))
+        .route("/admin/epg/sources/{id}/delete", post(delete_epg_source))
         .route("/admin/sessions/{id}/kick", post(kick_session))
         .route("/admin/plans", post(create_plan))
+        .route("/admin/plans/{id}/update", post(update_plan))
+        .route("/admin/plans/{id}/delete", post(delete_plan))
         .route("/admin/admins", post(create_admin))
         .route("/admin/admins/{id}/update", post(update_admin))
         .route("/admin/admins/{id}/delete", post(delete_admin))
@@ -233,6 +245,14 @@ fn split_csv(s: &Option<String>) -> Vec<String> {
         .collect()
 }
 
+/// 从请求头 Cookie 读 `iptv_locale`，非法/缺失时回退 `DEFAULT_LOCALE`（m13）。
+fn locale_from_headers(headers: &HeaderMap) -> String {
+    cookie_header(headers)
+        .and_then(|h| cookie_value(&h, "iptv_locale"))
+        .filter(|l| iptv_i18n::normalize_locale(l).is_some())
+        .unwrap_or_else(|| iptv_i18n::DEFAULT_LOCALE.to_string())
+}
+
 /// 一次性展示页（Token / 票据 / TOTP 密钥只显示一次，§5.2）。
 /// `back` 为返回链接（路径，文案）。
 fn onetime_page(
@@ -240,9 +260,10 @@ fn onetime_page(
     rows: &[(String, String)],
     qr_png: Option<&str>,
     back: (&str, &str),
+    locale: &str,
 ) -> Html<String> {
     let mut body = format!(
-        "<!DOCTYPE html><html lang=\"zh-Hant\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><link rel=\"stylesheet\" href=\"/design.css\"><title>{title}</title></head><body><div class=\"page\"><div class=\"card\"><h1>{title}</h1><p style=\"color:var(--c-destructive)\">This secret is shown only once. Save it now.</p>"
+        "<!DOCTYPE html><html lang=\"{locale}\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><link rel=\"stylesheet\" href=\"/design.css\"><title>{title}</title></head><body><div class=\"page\"><div class=\"card\"><h1>{title}</h1><p style=\"color:var(--c-destructive)\">This secret is shown only once. Save it now.</p>"
     );
     for (k, v) in rows {
         body.push_str(&format!(
@@ -386,6 +407,52 @@ async fn create_user(headers: HeaderMap, Form(f): Form<UserForm>) -> (HeaderMap,
     ok_redirect("/admin/users", &r)
 }
 
+/// M19a：行内编辑表单提交 → PATCH /api/v1/admin/users/{id}。
+/// 空串字段一律按“不改”处理（opt_str → null，后端 None 即保持原值）。
+#[derive(Deserialize)]
+struct UserUpdateForm {
+    display_name: Option<String>,
+    remark: Option<String>,
+    plan_id: Option<String>,
+    status: Option<String>,
+    expires_at: Option<String>,
+}
+
+async fn update_user(
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Form(f): Form<UserUpdateForm>,
+) -> (HeaderMap, Redirect) {
+    let body = serde_json::json!({
+        "display_name": opt_str(&f.display_name),
+        "remark": opt_str(&f.remark),
+        "plan_id": f.plan_id.and_then(|v| v.parse::<i64>().ok()),
+        "status": opt_str(&f.status),
+        "expires_at": opt_str(&f.expires_at),
+    });
+    let r = backend_json(
+        reqwest::Method::PATCH,
+        &format!("/api/v1/admin/users/{id}"),
+        Some(body),
+        admin_sid(&headers).as_deref(),
+        forwarded_for(&headers).as_deref(),
+    )
+    .await;
+    ok_redirect("/admin/users", &r)
+}
+
+async fn delete_user(headers: HeaderMap, Path(id): Path<i64>) -> (HeaderMap, Redirect) {
+    let r = backend_json(
+        reqwest::Method::DELETE,
+        &format!("/api/v1/admin/users/{id}"),
+        None,
+        admin_sid(&headers).as_deref(),
+        forwarded_for(&headers).as_deref(),
+    )
+    .await;
+    ok_redirect("/admin/users", &r)
+}
+
 #[derive(Deserialize)]
 struct TokenForm {
     user_id: i64,
@@ -457,7 +524,55 @@ async fn create_token(headers: HeaderMap, Form(f): Form<TokenForm>) -> Html<Stri
         &rows,
         r.data.get("qr_png").and_then(|v| v.as_str()),
         ("/admin/tokens", "Back to Tokens"),
+        &locale_from_headers(&headers),
     )
+}
+
+/// M19b：行内编辑表单提交 → PATCH /api/v1/admin/tokens/{id}。
+#[derive(Deserialize)]
+struct TokenUpdateForm {
+    name: Option<String>,
+    max_concurrent_sessions: Option<String>,
+    max_bound_devices: Option<String>,
+    status: Option<String>,
+    expires_at: Option<String>,
+    allowed_groups: Option<String>,
+}
+
+async fn update_token(
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Form(f): Form<TokenUpdateForm>,
+) -> (HeaderMap, Redirect) {
+    let body = serde_json::json!({
+        "name": opt_str(&f.name),
+        "max_concurrent_sessions": f.max_concurrent_sessions.and_then(|v| v.parse::<i32>().ok()),
+        "max_bound_devices": f.max_bound_devices.and_then(|v| v.parse::<i32>().ok()),
+        "status": opt_str(&f.status),
+        "expires_at": opt_str(&f.expires_at),
+        "allowed_groups": split_csv(&f.allowed_groups),
+    });
+    let r = backend_json(
+        reqwest::Method::PATCH,
+        &format!("/api/v1/admin/tokens/{id}"),
+        Some(body),
+        admin_sid(&headers).as_deref(),
+        forwarded_for(&headers).as_deref(),
+    )
+    .await;
+    ok_redirect("/admin/tokens", &r)
+}
+
+async fn delete_token(headers: HeaderMap, Path(id): Path<i64>) -> (HeaderMap, Redirect) {
+    let r = backend_json(
+        reqwest::Method::DELETE,
+        &format!("/api/v1/admin/tokens/{id}"),
+        None,
+        admin_sid(&headers).as_deref(),
+        forwarded_for(&headers).as_deref(),
+    )
+    .await;
+    ok_redirect("/admin/tokens", &r)
 }
 
 async fn create_login_ticket(headers: HeaderMap, Path(id): Path<i64>) -> Html<String> {
@@ -498,6 +613,7 @@ async fn create_login_ticket(headers: HeaderMap, Path(id): Path<i64>) -> Html<St
         &rows,
         r.data.get("qr_png").and_then(|v| v.as_str()),
         ("/admin/tokens", "Back to Tokens"),
+        &locale_from_headers(&headers),
     )
 }
 
@@ -553,6 +669,54 @@ async fn create_channel(headers: HeaderMap, Form(f): Form<ChannelForm>) -> (Head
     )
     .await;
     ok_redirect("/admin/channels", &r)
+}
+
+/// M19c：行内编辑表单提交 → PATCH /api/v1/admin/sources/{id}。
+/// enabled 是 checkbox：未勾选即不提交，proxy 按 false 送（表单按当前值预选）。
+#[derive(Deserialize)]
+struct SourceUpdateForm {
+    name: Option<String>,
+    url: Option<String>,
+    sync_interval_sec: Option<String>,
+    epg_url: Option<String>,
+    on_missing: Option<String>,
+    enabled: Option<String>,
+}
+
+async fn update_source(
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Form(f): Form<SourceUpdateForm>,
+) -> (HeaderMap, Redirect) {
+    let body = serde_json::json!({
+        "name": opt_str(&f.name),
+        "url": opt_str(&f.url),
+        "sync_interval_sec": f.sync_interval_sec.and_then(|v| v.parse::<i64>().ok()),
+        "epg_url": opt_str(&f.epg_url),
+        "on_missing": opt_str(&f.on_missing),
+        "enabled": f.enabled.as_deref() == Some("true"),
+    });
+    let r = backend_json(
+        reqwest::Method::PATCH,
+        &format!("/api/v1/admin/sources/{id}"),
+        Some(body),
+        admin_sid(&headers).as_deref(),
+        forwarded_for(&headers).as_deref(),
+    )
+    .await;
+    ok_redirect("/admin/sources", &r)
+}
+
+async fn delete_source(headers: HeaderMap, Path(id): Path<i64>) -> (HeaderMap, Redirect) {
+    let r = backend_json(
+        reqwest::Method::DELETE,
+        &format!("/api/v1/admin/sources/{id}"),
+        None,
+        admin_sid(&headers).as_deref(),
+        forwarded_for(&headers).as_deref(),
+    )
+    .await;
+    ok_redirect("/admin/sources", &r)
 }
 
 async fn delete_channel(headers: HeaderMap, Path(id): Path<i64>) -> (HeaderMap, Redirect) {
@@ -650,6 +814,88 @@ async fn upload_m3u(headers: HeaderMap, mut multipart: Multipart) -> Html<String
     Html(format!(
         "<!DOCTYPE html><html><head><link rel=\"stylesheet\" href=\"/design.css\"></head><body><div class=\"page\"><div class=\"card\"><h1>M3U import report</h1><p>parsed {parsed} · imported {imported} · line errors {errors}</p><p><a class=\"btn btn-filled\" href=\"/admin/sources\">Back to Sources</a></p></div></div></body></html>"
     ))
+}
+
+/// M19e：行内编辑表单提交 → PATCH /api/v1/admin/groups/{id}。
+#[derive(Deserialize)]
+struct GroupUpdateForm {
+    name: Option<String>,
+    sort_weight: Option<String>,
+    icon: Option<String>,
+    is_default: Option<String>,
+}
+
+async fn update_group(
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Form(f): Form<GroupUpdateForm>,
+) -> (HeaderMap, Redirect) {
+    let body = serde_json::json!({
+        "name": opt_str(&f.name),
+        "sort_weight": f.sort_weight.and_then(|v| v.parse::<i32>().ok()),
+        "icon": opt_str(&f.icon),
+        "is_default": f.is_default.as_deref() == Some("true"),
+    });
+    let r = backend_json(
+        reqwest::Method::PATCH,
+        &format!("/api/v1/admin/groups/{id}"),
+        Some(body),
+        admin_sid(&headers).as_deref(),
+        forwarded_for(&headers).as_deref(),
+    )
+    .await;
+    ok_redirect("/admin/groups", &r)
+}
+
+async fn delete_group(headers: HeaderMap, Path(id): Path<i64>) -> (HeaderMap, Redirect) {
+    let r = backend_json(
+        reqwest::Method::DELETE,
+        &format!("/api/v1/admin/groups/{id}"),
+        None,
+        admin_sid(&headers).as_deref(),
+        forwarded_for(&headers).as_deref(),
+    )
+    .await;
+    ok_redirect("/admin/groups", &r)
+}
+
+/// M19f：行内编辑表单提交 → PATCH /api/v1/admin/epg/sources/{id}。
+#[derive(Deserialize)]
+struct EpgSourceUpdateForm {
+    name: Option<String>,
+    url: Option<String>,
+}
+
+async fn update_epg_source(
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Form(f): Form<EpgSourceUpdateForm>,
+) -> (HeaderMap, Redirect) {
+    let body = serde_json::json!({
+        "name": opt_str(&f.name),
+        "url": opt_str(&f.url),
+    });
+    let r = backend_json(
+        reqwest::Method::PATCH,
+        &format!("/api/v1/admin/epg/sources/{id}"),
+        Some(body),
+        admin_sid(&headers).as_deref(),
+        forwarded_for(&headers).as_deref(),
+    )
+    .await;
+    ok_redirect("/admin/epg", &r)
+}
+
+async fn delete_epg_source(headers: HeaderMap, Path(id): Path<i64>) -> (HeaderMap, Redirect) {
+    let r = backend_json(
+        reqwest::Method::DELETE,
+        &format!("/api/v1/admin/epg/sources/{id}"),
+        None,
+        admin_sid(&headers).as_deref(),
+        forwarded_for(&headers).as_deref(),
+    )
+    .await;
+    ok_redirect("/admin/epg", &r)
 }
 
 async fn trigger_sync(headers: HeaderMap, Path(id): Path<i64>) -> (HeaderMap, Redirect) {
@@ -810,6 +1056,7 @@ async fn create_admin(headers: HeaderMap, Form(f): Form<AdminForm>) -> Response 
             &rows,
             r.data.get("qr_png").and_then(|v| v.as_str()),
             ("/admin/admins", "Back to Admins"),
+            &locale_from_headers(&headers),
         )
         .into_response();
     }
@@ -890,7 +1137,57 @@ async fn reset_admin_totp(headers: HeaderMap, Path(id): Path<i64>) -> Html<Strin
         &rows,
         r.data.get("qr_png").and_then(|v| v.as_str()),
         ("/admin/admins", "Back to Admins"),
+        &locale_from_headers(&headers),
     )
+}
+
+/// M19d：行内编辑表单提交 → PATCH /api/v1/admin/plans/{id}。
+#[derive(Deserialize)]
+struct PlanUpdateForm {
+    name: Option<String>,
+    max_concurrent_sessions: Option<String>,
+    max_bound_devices: Option<String>,
+    channel_groups: Option<String>,
+    duration_days: Option<String>,
+    price_cents: Option<String>,
+    currency: Option<String>,
+}
+
+async fn update_plan(
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Form(f): Form<PlanUpdateForm>,
+) -> (HeaderMap, Redirect) {
+    let body = serde_json::json!({
+        "name": opt_str(&f.name),
+        "max_concurrent_sessions": f.max_concurrent_sessions.and_then(|v| v.parse::<i32>().ok()),
+        "max_bound_devices": f.max_bound_devices.and_then(|v| v.parse::<i32>().ok()),
+        "channel_groups": split_csv(&f.channel_groups),
+        "duration_days": f.duration_days.and_then(|v| v.parse::<i32>().ok()),
+        "price_cents": f.price_cents.and_then(|v| v.parse::<i64>().ok()),
+        "currency": opt_str(&f.currency),
+    });
+    let r = backend_json(
+        reqwest::Method::PATCH,
+        &format!("/api/v1/admin/plans/{id}"),
+        Some(body),
+        admin_sid(&headers).as_deref(),
+        forwarded_for(&headers).as_deref(),
+    )
+    .await;
+    ok_redirect("/admin/plans", &r)
+}
+
+async fn delete_plan(headers: HeaderMap, Path(id): Path<i64>) -> (HeaderMap, Redirect) {
+    let r = backend_json(
+        reqwest::Method::DELETE,
+        &format!("/api/v1/admin/plans/{id}"),
+        None,
+        admin_sid(&headers).as_deref(),
+        forwarded_for(&headers).as_deref(),
+    )
+    .await;
+    ok_redirect("/admin/plans", &r)
 }
 
 #[derive(Deserialize)]

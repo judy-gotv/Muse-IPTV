@@ -218,6 +218,12 @@ impl RateLimiter {
         entry.0 += 1;
         true
     }
+
+    /// m25：清掉某 key 的计数（成功登录后调用，成功不占限流桶）。
+    pub fn reset(&self, key: &str) {
+        let mut buckets = self.buckets.lock().unwrap();
+        buckets.remove(key);
+    }
 }
 
 #[cfg(test)]
@@ -258,5 +264,17 @@ mod tests {
         assert!(rl.check("ip-1"));
         assert!(!rl.check("ip-1"));
         assert!(rl.check("ip-2"));
+    }
+
+    #[test]
+    fn rate_limiter_reset_clears_key() {
+        // m25：成功登录后重置该 key，成功不占限流桶；其他 key 不受影响。
+        let rl = RateLimiter::new(2, 60);
+        assert!(rl.check("admin-login:alice:1.2.3.4"));
+        assert!(rl.check("admin-login:alice:1.2.3.4"));
+        assert!(!rl.check("admin-login:alice:1.2.3.4"));
+        rl.reset("admin-login:alice:1.2.3.4");
+        assert!(rl.check("admin-login:alice:1.2.3.4"));
+        assert!(rl.check("admin-login:alice:1.2.3.4"));
     }
 }

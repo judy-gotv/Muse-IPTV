@@ -117,7 +117,7 @@ impl Store {
         })
     }
 
-    /// 按方言依次执行内嵌的 V1–V5 迁移（`migrations/{dialect}/`）。
+    /// 按方言依次执行内嵌的 V1–V6 迁移（`migrations/{dialect}/`）。
     /// 幂等：V1 用 `CREATE TABLE IF NOT EXISTS` + `CREATE INDEX IF NOT EXISTS`
     /// （MySQL 不支持索引的 `IF NOT EXISTS` 语法，见 `exec_script` 的
     /// 重复索引容忍），V2 种子用各方言的忽略冲突写法，V5 是单条 UPDATE，
@@ -130,6 +130,9 @@ impl Store {
                 include_str!("../../../migrations/postgres/V3__i18n_tables.sql"),
                 include_str!("../../../migrations/postgres/V4__drop_max_upload_mb.sql"),
                 include_str!("../../../migrations/postgres/V5__default_locale_zh_hans.sql"),
+                include_str!(
+                    "../../../migrations/postgres/V6__settings_updated_at_and_user_theme.sql"
+                ),
             ],
             Dialect::MySql => &[
                 include_str!("../../../migrations/mysql/V1__init.sql"),
@@ -137,6 +140,9 @@ impl Store {
                 include_str!("../../../migrations/mysql/V3__i18n_tables.sql"),
                 include_str!("../../../migrations/mysql/V4__drop_max_upload_mb.sql"),
                 include_str!("../../../migrations/mysql/V5__default_locale_zh_hans.sql"),
+                include_str!(
+                    "../../../migrations/mysql/V6__settings_updated_at_and_user_theme.sql"
+                ),
             ],
             Dialect::Sqlite => &[
                 include_str!("../../../migrations/sqlite/V1__init.sql"),
@@ -144,6 +150,9 @@ impl Store {
                 include_str!("../../../migrations/sqlite/V3__i18n_tables.sql"),
                 include_str!("../../../migrations/sqlite/V4__drop_max_upload_mb.sql"),
                 include_str!("../../../migrations/sqlite/V5__default_locale_zh_hans.sql"),
+                include_str!(
+                    "../../../migrations/sqlite/V6__settings_updated_at_and_user_theme.sql"
+                ),
             ],
         };
         if self.dialect == Dialect::Sqlite {
@@ -185,6 +194,16 @@ impl Store {
                     || msg.contains("duplicate key name")
                     || msg.contains("duplicate key");
                 if is_create_index && duplicate {
+                    continue;
+                }
+                // V6 起的 ALTER TABLE ADD COLUMN：migrate() 每次启动都全量重跑，
+                // 列已存在时三方言分别报 "duplicate column name"（SQLite/MySQL）
+                // 或 "already exists"（PG），属于重复执行，直接跳过。
+                let is_alter_add_column =
+                    upper.starts_with("ALTER TABLE") && upper.contains("ADD COLUMN");
+                if is_alter_add_column
+                    && (msg.contains("duplicate column") || msg.contains("already exists"))
+                {
                     continue;
                 }
                 return Err(e.into());
@@ -303,6 +322,31 @@ macro_rules! insert_id {
     }};
 }
 pub(crate) use insert_id;
+
+/// M10：识别唯一约束冲突（建管理员/频道/套餐/分组重名时 DB 报错）。
+/// 三方言同义：PG `23505`、MySQL `1062`、SQLite 文案
+/// `UNIQUE constraint failed`。sqlx 错误经 `?` /
+/// `map_err(anyhow::Error::from)` 进 anyhow 时原错误仍留在链里，
+/// 这里沿链找 `sqlx::Error::Database` 再判；API 层据此把 500 映射为
+/// `ErrorCode::Conflict`（40900）。PG/MySQL 未在沙箱实测，靠 code
+/// 匹配（与驱动文档一致）；SQLite 已由回归测试覆盖。
+pub fn is_unique_violation_error(e: &anyhow::Error) -> bool {
+    e.chain().any(|cause| {
+        let Some(db_err) = cause.downcast_ref::<sqlx::Error>() else {
+            return false;
+        };
+        match db_err {
+            sqlx::Error::Database(db) => {
+                let code = db.code().map(|c| c.into_owned()).unwrap_or_default();
+                code == "23505"
+                    || code == "1062"
+                    || db.message().contains("UNIQUE constraint failed")
+                    || db.message().contains("Duplicate entry")
+            }
+            _ => false,
+        }
+    })
+}
 
 // ---------------------------------------------------------------------------
 // 行读取 / 时间 / JSON 辅助

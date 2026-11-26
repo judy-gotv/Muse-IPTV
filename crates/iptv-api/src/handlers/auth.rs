@@ -7,7 +7,7 @@
 //! 会话 Cookie `iptv_portal_sid`：256 bit 随机串，DB 只存哈希（§4.3）。
 // 作者: Passwd Word
 
-use crate::{ok, ApiError, ApiResult, AppState, PortalAuth};
+use crate::{ApiError, AppState, PortalAuth};
 use axum::extract::{ConnectInfo, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -16,6 +16,7 @@ use chrono::{Duration, Utc};
 use iptv_auth::sha256_hex;
 use iptv_core::{generate_session_value, hash_token};
 use iptv_dto::{Envelope, ErrorCode, TicketExchangeRequest, TokenLoginRequest};
+use iptv_store::NewAuditLog;
 use serde_json::json;
 use std::sync::Arc;
 
@@ -77,9 +78,14 @@ pub async fn ticket_exchange(
     headers: HeaderMap,
     Json(req): Json<TicketExchangeRequest>,
 ) -> Result<Response, ApiError> {
-    let ip = crate::client_ip(&headers, Some(peer));
-    let ip_key = ip.clone().unwrap_or_else(|| "unknown".to_string());
-    if !crate::check_login_limit(&state, &ip_key, &format!("ticket-exchange:{ip_key}")) {
+    // m25：拿不到客户端 IP 时无法按 IP 限流，直接拒绝，不落 "unknown" 桶。
+    let Some(ip) = crate::client_ip(&headers, Some(peer)) else {
+        return Err(ApiError::new(
+            ErrorCode::RateLimited,
+            "client ip unavailable",
+        ));
+    };
+    if !crate::check_login_limit(&state, &ip, &format!("ticket-exchange:{ip}")) {
         return Err(ApiError::new(ErrorCode::RateLimited, "too many requests"));
     }
     let ticket = state
@@ -88,11 +94,7 @@ pub async fn ticket_exchange(
         .ok_or_else(|| ApiError::new(ErrorCode::SessionExpired, "ticket invalid or expired"))?;
     // 可绑 IP 段：票据签发时若绑定了 IP 前缀，兑换 IP 必须匹配。
     if let Some(prefix) = &ticket.ip_prefix {
-        let ok = ip
-            .as_deref()
-            .map(|i| i.starts_with(prefix.as_str()))
-            .unwrap_or(false);
-        if !ok {
+        if !ip.starts_with(prefix.as_str()) {
             return Err(ApiError::new(
                 ErrorCode::SessionExpired,
                 "ticket ip mismatch",
@@ -131,7 +133,7 @@ pub async fn ticket_exchange(
         &state,
         token.id,
         &req.device_fingerprint,
-        ip.as_deref(),
+        Some(ip.as_str()),
         ua.as_deref(),
         false,
     )
@@ -140,6 +142,8 @@ pub async fn ticket_exchange(
         .metrics
         .ticket_exchanges
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // m25：兑换成功，重置该复合 key 的计数——成功登录不占限流桶。
+    crate::reset_login_limit(&state, &format!("ticket-exchange:{ip}"));
     let mut h = HeaderMap::new();
     h.insert(
         header::SET_COOKIE,
@@ -161,12 +165,17 @@ pub async fn token_login(
     headers: HeaderMap,
     Json(req): Json<TokenLoginRequest>,
 ) -> Result<Response, ApiError> {
-    let ip = crate::client_ip(&headers, Some(peer));
-    let ip_key = ip.clone().unwrap_or_else(|| "unknown".to_string());
+    // m25：拿不到客户端 IP 时无法按 IP 限流，直接拒绝，不落 "unknown" 桶。
+    let Some(ip) = crate::client_ip(&headers, Some(peer)) else {
+        return Err(ApiError::new(
+            ErrorCode::RateLimited,
+            "client ip unavailable",
+        ));
+    };
     // 按 Token 前缀 + IP 计：同一 Token 被多 IP 轮换刷时各 key 独立，
     // 再叠加按 IP 聚合的桶防单 IP 横扫多 Token。
     let prefix = iptv_core::token_prefix(req.token.trim());
-    if !crate::check_login_limit(&state, &ip_key, &format!("token-login:{prefix}:{ip_key}")) {
+    if !crate::check_login_limit(&state, &ip, &format!("token-login:{prefix}:{ip}")) {
         return Err(ApiError::new(ErrorCode::RateLimited, "too many requests"));
     }
     let hash = hash_token(req.token.trim());
@@ -201,11 +210,13 @@ pub async fn token_login(
         &state,
         token.id,
         &req.device_fingerprint,
-        ip.as_deref(),
+        Some(ip.as_str()),
         ua.as_deref(),
         req.remember_device,
     )
     .await?;
+    // m25：登录成功，重置该复合 key 的计数——成功登录不占限流桶。
+    crate::reset_login_limit(&state, &format!("token-login:{prefix}:{ip}"));
     // M1：Cookie 有效期与会话 DB 有效期同源（系统设置，默认 90 / 7 天）。
     let max_age = if req.remember_device {
         state
@@ -250,12 +261,41 @@ pub async fn logout(
     ))
 }
 
-/// 退出全部设备（门户设置页用；由 me handler 调用）。
-pub async fn logout_all(state: &Arc<AppState>, auth: &PortalAuth) -> ApiResult<serde_json::Value> {
+/// POST /api/v1/auth/logout-all（M14：退出全部设备）。
+/// 传 `None`：吊销该 Token 的全部会话，含当前会话；写审计；并清除会话 Cookie。
+pub async fn logout_all(
+    State(state): State<Arc<AppState>>,
+    auth: PortalAuth,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
     let n = state
         .store
-        .revoke_all_portal_sessions(auth.token_id, Some(auth.session_id))
+        .revoke_all_portal_sessions(auth.token_id, None)
         .await
         .map_err(ApiError::from)?;
-    ok(json!({ "revoked": n }))
+    // 审计失败不影响退出本身（`let _ =` 吞掉）；actor 用 token 标识，
+    // 门户侧无管理员身份。
+    let _ = state
+        .store
+        .write_audit(&NewAuditLog {
+            actor: format!("token:{}", auth.token_id),
+            actor_role: Some("portal".to_string()),
+            action: "auth.logout_all".to_string(),
+            object_type: "portal_session".to_string(),
+            object_id: auth.token_id.to_string(),
+            before_json: None,
+            after_json: Some(json!({ "revoked": n })),
+            ip_address: crate::client_ip(&headers, None),
+        })
+        .await;
+    let mut h = HeaderMap::new();
+    h.insert(
+        header::SET_COOKIE,
+        clear_portal_cookie_header().parse().unwrap(),
+    );
+    Ok(json_response(
+        StatusCode::OK,
+        h,
+        Envelope::ok(json!({ "revoked": n })),
+    ))
 }

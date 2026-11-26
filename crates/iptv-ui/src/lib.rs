@@ -1,9 +1,11 @@
 //! 共享业务组件（开发文档 §1.1 / §4.6 / §11.5）。
 //!
 //! - 全部文案走 [`iptv_i18n::I18n`] 的 key；语言包里没有的 key 用
-//!   [`t_or`] 回退到英文原文字面量（语言包目前只定义了约 30 个 key，
-//!   见 `locales/*/common.ftl|portal.ftl|admin.ftl`；回退不是硬编码
-//!   第三语言文案，而是缺 key 时的英文兜底，见 README 的 i18n 说明）。
+//!   [`t_or`] 回退到英文原文字面量（语言包目前定义了 100 余个 key，
+//!   见 `locales/*/common.ftl|portal.ftl|admin.ftl|errors.ftl`；回退不是硬编码
+//!   第三语言文案，而是缺 key 时的英文兜底，见 README 的 i18n 说明；
+//!   缺 key 时 `t_or` / `t_args_or` 打警告，`cargo xtask i18n-check`
+//!   扫描代码引用，缺 key 即失败）。
 //! - `LocaleCtx`：每请求由门户/后台的 `App` 组件从请求头协商后注入。
 // 作者: Passwd Word
 
@@ -25,19 +27,24 @@ pub fn locale() -> String {
         .unwrap_or_else(|| iptv_i18n::DEFAULT_LOCALE.to_string())
 }
 
-/// 查文案；key 缺失（`I18n::t` 原样返回 key）时用英文兜底。
+/// 查文案；key 缺失（`I18n::t` 原样返回 key）时用英文兜底，并打警告
+/// （M11：此前静默回退，缺 key 无任何信号）。
+/// 注意：`log` crate 不在 workspace 依赖里、且本 crate 是同构 Leptos
+/// 组件（浏览器端无 `log` 接收器），故用 `leptos::logging::warn!`——浏览器走
+/// `console.warn`，服务端走 `eprintln!`，无需新增依赖。
 pub fn t_or(key: &str, fallback: &str) -> String {
     let i18n = I18n::new();
     let loc = locale();
     let v = i18n.t_simple(&loc, key);
     if v == key {
+        leptos::logging::warn!("i18n 缺 key：`{key}`（locale `{loc}`），回退英文兜底");
         fallback.to_string()
     } else {
         v
     }
 }
 
-/// 带参数的文案；缺 key 时用 `format!` 的英文兜底。
+/// 带参数的文案；缺 key 时用 `format!` 的英文兜底，并打警告（同 `t_or`）。
 pub fn t_args_or(key: &str, args: &[(&str, String)], fallback: String) -> String {
     let i18n = I18n::new();
     let loc = locale();
@@ -47,9 +54,33 @@ pub fn t_args_or(key: &str, args: &[(&str, String)], fallback: String) -> String
     }
     let v = i18n.t(&loc, key, Some(&fa));
     if v == key {
+        leptos::logging::warn!("i18n 缺 key：`{key}`（locale `{loc}`），回退英文兜底");
         fallback
     } else {
         v
+    }
+}
+
+/// 状态列本地化：入参是 Rust Debug 文本（如 `Suspended`）或小写状态串
+/// （如会话的 `active`）；未知值原样返回，不吞信息。
+pub fn status_label(debug: &str) -> String {
+    match debug {
+        "Active" | "active" => t_or("common.status-active", "Active"),
+        "Disabled" | "disabled" => t_or("common.status-disabled", "Disabled"),
+        "Suspended" | "suspended" => t_or("common.status-suspended", "Suspended"),
+        "Expired" | "expired" => t_or("common.status-expired", "Expired"),
+        other => other.to_string(),
+    }
+}
+
+/// 角色列本地化：入参是 Rust Debug 文本（如 `SuperAdmin`）。
+pub fn role_label(debug: &str) -> String {
+    match debug {
+        "SuperAdmin" => t_or("common.role-super-admin", "Super admin"),
+        "Operator" => t_or("common.role-operator", "Operator"),
+        "Support" => t_or("common.role-support", "Support"),
+        "Readonly" => t_or("common.role-readonly", "Readonly"),
+        other => other.to_string(),
     }
 }
 
@@ -378,7 +409,7 @@ pub fn Player(
                 })}
             </div>
             <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:8px">
-                <span style="font-size:var(--text-footnote);color:var(--c-label-secondary)">"Quality"</span>
+                <span style="font-size:var(--text-footnote);color:var(--c-label-secondary)">{t_or("common.quality", "Quality")}</span>
                 {qualities.into_iter().map(|q| {
                     let q2 = q.clone();
                     let active = move || quality.get() == q2;

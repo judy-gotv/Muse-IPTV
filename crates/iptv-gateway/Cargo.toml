@@ -6,6 +6,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
 authors.workspace = true
 description = "Muse-IPTV 单端口网关：对外只暴露一个端口，按路径分流到 API / 门户 / 后台"
 

@@ -12,6 +12,7 @@
 // 作者: Passwd Word
 
 use chrono::{Duration, Utc};
+use iptv_core::check_url_allowed;
 use iptv_epg::parse_xmltv;
 use iptv_m3u::parse_m3u;
 use iptv_store::{EpgProgramInput, NewAuditLog, Store};
@@ -22,6 +23,7 @@ pub struct Worker {
     pub store: Arc<Store>,
     pub http: reqwest::Client,
     /// 连续失败次数（源 id → 次数），用于退避进档（§7.3 第 9 步）。
+    /// 只是缓存：worker 重启后按 `sync_log` 恢复（M18，见 `load_failures`）。
     failures: std::sync::Mutex<std::collections::HashMap<i64, u32>>,
 }
 
@@ -30,8 +32,10 @@ impl Worker {
         let http = reqwest::Client::builder()
             .timeout(StdDuration::from_secs(30))
             .user_agent(format!("Muse-IPTV-Worker/{}", iptv_core::VERSION))
-            // M3：重定向最多跟 3 跳（默认跟 10 跳可被 302 拐到内网）。
-            .redirect(reqwest::redirect::Policy::limited(3))
+            // M17①：重定向由 `fetch_checked` 手动跟（Policy::none），每跳
+            // 都重做 DNS 解析 + IP 校验。`Policy::limited(3)` 只限跳数，
+            // 302 跳到内网仍会被跟进（M3 残留），故不能再交给客户端自动跟。
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("http client");
         Self {
@@ -42,9 +46,8 @@ impl Worker {
     }
 
     /// 失败退避档位（§7.3）：1m → 5m → 30m → 2h（按连续失败次数进档）。
-    fn backoff_for(&self, source_id: i64) -> i64 {
-        let failures = self.failures.lock().unwrap();
-        let n = failures.get(&source_id).copied().unwrap_or(0);
+    async fn backoff_for(&self, source_id: i64) -> i64 {
+        let n = self.load_failures(source_id).await;
         match n {
             0 => 60,
             1 => 300,
@@ -53,15 +56,77 @@ impl Worker {
         }
     }
 
-    fn record_failure(&self, source_id: i64) -> u32 {
+    /// 连续失败次数：内存有即用；没有（worker 刚重启）就按 `sync_log`
+    /// 最近连续 failed 行恢复（M18），再写回内存当缓存。
+    /// 封顶 6 次：满 6 次即停同步，重启后不应带着更大的旧数回来。
+    async fn load_failures(&self, source_id: i64) -> u32 {
+        {
+            let failures = self.failures.lock().unwrap();
+            if let Some(n) = failures.get(&source_id) {
+                return *n;
+            }
+        }
+        let n = self
+            .store
+            .consecutive_sync_failures(source_id)
+            .await
+            .unwrap_or(0)
+            .min(6);
+        self.failures.lock().unwrap().insert(source_id, n);
+        n
+    }
+
+    async fn record_failure(&self, source_id: i64) -> u32 {
+        // 先恢复（本次失败尚未写入 sync_log，库里数 +1 即本次累计）。
+        let base = self.load_failures(source_id).await;
         let mut failures = self.failures.lock().unwrap();
-        let n = failures.entry(source_id).or_insert(0);
+        let n = failures.entry(source_id).or_insert(base);
         *n += 1;
         *n
     }
 
     fn record_success(&self, source_id: i64) {
         self.failures.lock().unwrap().remove(&source_id);
+    }
+
+    /// 带逐跳 SSRF 校验的请求（M17①）：每跳先 `check_url_allowed`
+    ///（DNS 解析后逐 IP 校验），再发请求；3xx 带 Location 时解析相对
+    /// 地址后继续，最多跟 3 跳（与旧 `Policy::limited(3)` 同限）。
+    /// 无 Location 的 3xx 直接返回响应（由调用方按状态码处理）。
+    async fn fetch_checked(
+        &self,
+        method: reqwest::Method,
+        url: &str,
+        headers: Option<&serde_json::Map<String, serde_json::Value>>,
+    ) -> anyhow::Result<reqwest::Response> {
+        let mut current = url.to_string();
+        for _ in 0..=3 {
+            check_url_allowed(&current).await?;
+            let mut req = self.http.request(method.clone(), &current);
+            if let Some(headers) = headers {
+                for (k, v) in headers {
+                    if let Some(v) = v.as_str() {
+                        req = req.header(k.as_str(), v);
+                    }
+                }
+            }
+            let resp = req.send().await?;
+            if resp.status().is_redirection() {
+                let Some(loc) = resp
+                    .headers()
+                    .get(reqwest::header::LOCATION)
+                    .and_then(|v| v.to_str().ok())
+                    .map(|s| s.to_string())
+                else {
+                    return Ok(resp);
+                };
+                let base = reqwest::Url::parse(&current)?;
+                current = base.join(&loc).map(|u| u.to_string())?;
+                continue;
+            }
+            return Ok(resp);
+        }
+        anyhow::bail!("too many redirects");
     }
 
     /// 主循环：每 15 秒扫一轮到期任务。
@@ -138,7 +203,7 @@ impl Worker {
             }
             Err(e) => {
                 let msg = e.to_string();
-                let failures = self.record_failure(source.id);
+                let failures = self.record_failure(source.id).await;
                 self.store
                     .finish_sync_log(log_id, "failed", 0, 0, 0, Some(&msg))
                     .await?;
@@ -199,7 +264,7 @@ impl Worker {
                         .await;
                 }
                 // 失败退避：1m → 5m → 30m → 2h（按连续失败次数取档）。
-                let backoff = self.backoff_for(source.id);
+                let backoff = self.backoff_for(source.id).await;
                 self.store
                     .update_source_sync(
                         source.id,
@@ -219,17 +284,11 @@ impl Worker {
         source: &iptv_dto::PlaylistSource,
         url: &str,
     ) -> anyhow::Result<(i64, i64, i64)> {
-        // SSRF 校验（§13）：仅 http/https，解析后目标 IP 不在私网段。
-        check_url_allowed(url).await?;
-        let mut req = self.http.get(url);
-        if let Some(headers) = source.http_headers.as_object() {
-            for (k, v) in headers {
-                if let Some(v) = v.as_str() {
-                    req = req.header(k.as_str(), v);
-                }
-            }
-        }
-        let resp = req.send().await?;
+        // SSRF 校验（§13）+ 逐跳重校验在 `fetch_checked` 内做（M17①）：
+        // 仅 http/https，解析后目标 IP 不在私网段，重定向目标同款重验。
+        let resp = self
+            .fetch_checked(reqwest::Method::GET, url, source.http_headers.as_object())
+            .await?;
         if !resp.status().is_success() {
             anyhow::bail!("subscription fetch failed: {}", resp.status());
         }
@@ -265,7 +324,10 @@ impl Worker {
             if url.scheme() != "http" && url.scheme() != "https" {
                 continue;
             }
-            let available = match self.http.head(&ep.url).send().await {
+            let available = match self
+                .fetch_checked(reqwest::Method::HEAD, &ep.url, None)
+                .await
+            {
                 Ok(resp) if resp.status().is_success() => {
                     // 再取 manifest 前 1 KB：HEAD 成功不代表清单可解析。
                     self.fetch_manifest_head_ok(&ep.url).await
@@ -286,9 +348,10 @@ impl Worker {
     }
 
     /// 取上游前 1 KB：清单地址（.m3u8）须含 `#EXTM3U` 才算可解析；
-    /// 其他地址只要返回非空体即算可达。
+    /// 其他地址只要返回非空体即算可达。同样走 `fetch_checked`，
+    /// 重定向目标逐跳重校验（M17①）。
     async fn fetch_manifest_head_ok(&self, url: &str) -> bool {
-        let Ok(resp) = self.http.get(url).send().await else {
+        let Ok(resp) = self.fetch_checked(reqwest::Method::GET, url, None).await else {
             return false;
         };
         if !resp.status().is_success() {
@@ -336,15 +399,15 @@ impl Worker {
             }
         }
         for source in sources {
-            // M3：EPG 拉取与订阅同款 SSRF 校验（此前完全无校验）。
-            if let Err(e) = check_url_allowed(&source.url).await {
-                tracing::warn!("epg source {} blocked: {e}", source.url);
-                continue;
-            }
-            let resp = match self.http.get(&source.url).send().await {
+            // M3/M17①：EPG 拉取与订阅同款逐跳 SSRF 校验（此前完全无校验，
+            // 之后只验首跳；现每跳重验，失败即跳过该源）。
+            let resp = match self
+                .fetch_checked(reqwest::Method::GET, &source.url, None)
+                .await
+            {
                 Ok(r) => r,
                 Err(e) => {
-                    tracing::warn!("epg fetch {} failed: {e}", source.url);
+                    tracing::warn!("epg fetch {} blocked/failed: {e}", source.url);
                     continue;
                 }
             };
@@ -424,7 +487,8 @@ impl Worker {
 }
 
 /// 失败退避档位表（§7.3 第 9 步）：连续失败 0/1/2/3+ 次 → 60/300/1800/7200 秒。
-/// 实际进档由 `Worker::backoff_for` 按内存中的连续失败计数取档。
+/// 实际进档由 `Worker::backoff_for` 按连续失败计数取档；计数以 `sync_log`
+/// 为准持久化，内存只是缓存（M18）。
 pub const BACKOFF_STEPS_SEC: [i64; 4] = [60, 300, 1800, 7200];
 
 /// 远程拉取的单响应上限（§7.1：订阅与 EPG 均为 20 MB；本地上传不限大小，
@@ -444,81 +508,4 @@ async fn read_capped(resp: reqwest::Response, limit: usize) -> anyhow::Result<Ve
         buf.extend_from_slice(&chunk);
     }
     Ok(buf)
-}
-
-/// 该 IP 是否禁止作为拉取目标（SSRF）：私网、回环、链路本地、未指定、
-/// 组播、广播、文档/基准测试/保留段、CGNAT 共享段；v6 另加唯一本地与
-/// 单播链路本地。
-fn ip_is_blocked(ip: std::net::IpAddr) -> bool {
-    match ip {
-        std::net::IpAddr::V4(v4) => {
-            let o = v4.octets();
-            v4.is_private()
-                || v4.is_loopback()
-                || v4.is_link_local()
-                || v4.is_unspecified()
-                || v4.is_multicast()
-                || v4.is_broadcast()
-                || v4.is_documentation()
-                // 以下三段在 1.89 仍不稳定（`ip` 特性），手写段判断：
-                || (o[0] == 198 && (o[1] == 18 || o[1] == 19)) // 基准测试 198.18.0.0/15
-                || o[0] >= 240 // 保留段 240.0.0.0/4
-                || (o[0] == 100 && (64..=127).contains(&o[1])) // CGNAT 共享段 100.64.0.0/10
-        }
-        std::net::IpAddr::V6(v6) => {
-            v6.is_loopback()
-                || v6.is_unspecified()
-                || v6.is_unique_local()
-                || v6.is_unicast_link_local()
-                || v6.is_multicast()
-        }
-    }
-}
-
-fn is_private_host(host: &str) -> bool {
-    // 域名先放行（解析后校验在 reqwest 层无法拦截，故只拦字面 IP）。
-    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-        return ip_is_blocked(ip);
-    }
-    false
-}
-
-/// SSRF 校验（M3）：仅 http/https；把 host 解析成 IP 后逐一校验，
-/// 任一解析结果落在禁段即拒绝。注意这是请求前的尽力校验，解析与建连
-/// 之间存在 TOCTOU 窗口（DNS 重绑定），不能当作绝对屏障。
-async fn check_url_allowed(url: &str) -> anyhow::Result<()> {
-    let parsed = reqwest::Url::parse(url)?;
-    if parsed.scheme() != "http" && parsed.scheme() != "https" {
-        anyhow::bail!("only http/https urls allowed");
-    }
-    let Some(host) = parsed.host_str() else {
-        anyhow::bail!("url has no host");
-    };
-    if is_private_host(host) {
-        anyhow::bail!("url host is private");
-    }
-    if host.parse::<std::net::IpAddr>().is_err() {
-        let port = parsed.port_or_known_default().unwrap_or(443);
-        let addrs = tokio::net::lookup_host((host, port)).await?;
-        for addr in addrs {
-            if ip_is_blocked(addr.ip()) {
-                anyhow::bail!("url resolves to private address {addr}");
-            }
-        }
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn private_host_detection() {
-        assert!(is_private_host("127.0.0.1"));
-        assert!(is_private_host("10.0.0.5"));
-        assert!(is_private_host("192.168.1.1"));
-        assert!(!is_private_host("8.8.8.8"));
-        assert!(!is_private_host("example.com"));
-    }
 }

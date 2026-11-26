@@ -123,6 +123,41 @@ impl Gate {
     }
 }
 
+/// 上游 base 非法的原因（纯函数，见文末测试）：`None` 表示合法。
+/// 要求：能解析为绝对 URL、scheme 为 http/https、且有 host。
+/// 例：`127.0.0.1:8080`（无 scheme）与 `localhost:8080`（scheme 被
+/// 解析成 `localhost`）都会被拒——误配时网关若照常启动，之后每个
+/// 转发请求都会 502（m28），必须在启动期就拦住。
+fn upstream_base_error(value: &str) -> Option<String> {
+    match reqwest::Url::parse(value) {
+        Ok(url) if url.scheme() == "http" || url.scheme() == "https" => {
+            // host_str() 要求非空：`http://` 这类空 host 必须拦住
+            //（`http:///path` 按 WHATWG 解析 host 是 `path`，不在此拦）。
+            if url.host_str().is_some_and(|h| !h.is_empty()) {
+                None
+            } else {
+                Some("missing host".to_string())
+            }
+        }
+        Ok(url) => Some(format!("scheme {:?} is not http/https", url.scheme())),
+        Err(e) => Some(format!("not a valid absolute URL ({e})")),
+    }
+}
+
+/// 校验一个上游 base；非法时打印明确错误（变量名、当前值、要求）并
+/// 直接退出进程，拒绝启动。
+fn validate_upstream_base(var: &str, value: &str) -> String {
+    if let Some(why) = upstream_base_error(value) {
+        eprintln!(
+            "gateway: refusing to start: invalid {var}={value:?}: {why}; \
+             expected an absolute URL with http:// or https:// scheme and a host, \
+             e.g. http://127.0.0.1:8080"
+        );
+        std::process::exit(1);
+    }
+    value.to_string()
+}
+
 fn is_hop_by_hop(name: &str) -> bool {
     HOP_BY_HOP.contains(&name)
 }
@@ -271,6 +306,18 @@ async fn main() {
         .init();
     let bind_addr =
         std::env::var("GATEWAY_BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8081".to_string());
+    let api = validate_upstream_base(
+        "IPTV_API_BASE",
+        &std::env::var("IPTV_API_BASE").unwrap_or_else(|_| "http://127.0.0.1:8080".to_string()),
+    );
+    let portal = validate_upstream_base(
+        "IPTV_PORTAL_BASE",
+        &std::env::var("IPTV_PORTAL_BASE").unwrap_or_else(|_| "http://127.0.0.1:18081".to_string()),
+    );
+    let admin = validate_upstream_base(
+        "IPTV_ADMIN_BASE",
+        &std::env::var("IPTV_ADMIN_BASE").unwrap_or_else(|_| "http://127.0.0.1:18082".to_string()),
+    );
     let gate = Arc::new(Gate {
         client: reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(5))
@@ -280,11 +327,9 @@ async fn main() {
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .unwrap_or_else(|_| reqwest::Client::new()),
-        api: std::env::var("IPTV_API_BASE").unwrap_or_else(|_| "http://127.0.0.1:8080".to_string()),
-        portal: std::env::var("IPTV_PORTAL_BASE")
-            .unwrap_or_else(|_| "http://127.0.0.1:18081".to_string()),
-        admin: std::env::var("IPTV_ADMIN_BASE")
-            .unwrap_or_else(|_| "http://127.0.0.1:18082".to_string()),
+        api,
+        portal,
+        admin,
         trust_xff: std::env::var("GATEWAY_TRUST_XFF")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false),
@@ -325,6 +370,22 @@ mod tests {
 
     fn no_headers() -> header::HeaderMap {
         header::HeaderMap::new()
+    }
+
+    #[test]
+    fn upstream_base_validation() {
+        // 合法：默认三值与带路径/端口的绝对 URL。
+        assert_eq!(upstream_base_error("http://127.0.0.1:8080"), None);
+        assert_eq!(upstream_base_error("http://127.0.0.1:18081"), None);
+        assert_eq!(upstream_base_error("https://example.com:8443/api"), None);
+        // 非法：无 scheme（m28 原案）、scheme 非 http/https、无 host。
+        assert!(upstream_base_error("127.0.0.1:8080").is_some());
+        assert!(upstream_base_error("localhost:8080").is_some());
+        assert!(upstream_base_error("ftp://127.0.0.1:8080").is_some());
+        assert!(upstream_base_error("http://").is_some());
+        assert!(upstream_base_error("").is_some());
+        // 注意：`http:///path` 按 WHATWG 解析 host 就是 `path`，是合法
+        // 绝对 URL，不在此处拦（转发时 DNS 失败才报错，与误配无关）。
     }
 
     #[test]

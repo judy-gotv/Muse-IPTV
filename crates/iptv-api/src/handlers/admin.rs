@@ -18,7 +18,8 @@ use iptv_dto::{
     CreatePlanRequest, CreateSourceRequest, CreateTokenRequest, CreateTokenResponse,
     CreateUserRequest, EpgSource, ErrorCode, M3uImportReport, PageQuery, Paged, Plan,
     PlaylistSource, StatsOverview, SyncDiff, SyncLog, SystemSetting, UpdateAdminRequest,
-    UpdateChannelRequest, UpdateTokenRequest, UpdateUserRequest, UserToken,
+    UpdateChannelRequest, UpdateEpgSourceRequest, UpdateGroupRequest, UpdatePlanRequest,
+    UpdateSourceRequest, UpdateTokenRequest, UpdateUserRequest, UserToken,
 };
 use iptv_store::NewAuditLog;
 use std::sync::Arc;
@@ -77,15 +78,16 @@ pub async fn login(
     headers: HeaderMap,
     Json(req): Json<AdminLoginRequest>,
 ) -> Result<axum::response::Response, ApiError> {
-    let ip = crate::client_ip(&headers, Some(peer));
+    // m25：拿不到客户端 IP 时无法按 IP 限流，直接拒绝，不落 "unknown" 桶。
+    let Some(ip) = crate::client_ip(&headers, Some(peer)) else {
+        return Err(ApiError::new(
+            ErrorCode::RateLimited,
+            "client ip unavailable",
+        ));
+    };
     // M2：按“账号 + IP”复合 key 计（5/分钟）+ 按 IP 聚合（30/分钟），
     // 不再三类登录共用一个 "unknown" 桶。
-    let ip_key = ip.clone().unwrap_or_else(|| "unknown".to_string());
-    if !crate::check_login_limit(
-        &state,
-        &ip_key,
-        &format!("admin-login:{}:{ip_key}", req.username),
-    ) {
+    if !crate::check_login_limit(&state, &ip, &format!("admin-login:{}:{ip}", req.username)) {
         return Err(ApiError::new(ErrorCode::RateLimited, "too many requests"));
     }
     let found = state
@@ -154,7 +156,7 @@ pub async fn login(
                         after_json: Some(
                             serde_json::json!({"totp_required": admin.totp_required, "totp_provisioned": totp_secret.is_some()}),
                         ),
-                        ip_address: ip.clone(),
+                        ip_address: Some(ip.clone()),
                     })
                     .await;
             }
@@ -162,6 +164,8 @@ pub async fn login(
     }
     let exp = Utc::now() + Duration::hours(12);
     let cookie = crate::sign_admin_cookie(&state.config.admin_secret, admin.id, exp.timestamp());
+    // m25：登录成功，重置该复合 key 的计数——成功登录不占限流桶。
+    crate::reset_login_limit(&state, &format!("admin-login:{}:{ip}", req.username));
     let mut h = HeaderMap::new();
     h.insert(
         header::SET_COOKIE,
@@ -290,6 +294,46 @@ pub async fn update_user(
     ok(user)
 }
 
+/// DELETE /api/v1/admin/users/{id}（M19a）：删用户——先释放其全部 Token
+/// 的播放会话并吊销门户会话、禁用 Token（store 层），再删用户行。
+pub async fn delete_user(
+    State(state): State<Arc<AppState>>,
+    admin: AdminAuth,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> ApiResult<serde_json::Value> {
+    require(
+        &admin,
+        &[AdminRole::SuperAdmin, AdminRole::Operator],
+        "delete users",
+    )?;
+    let before = state.store.get_user(id).await.map_err(ApiError::from)?;
+    let tokens = state
+        .store
+        .list_tokens(Some(id), None, &PageQuery::default())
+        .await
+        .map_err(ApiError::from)?;
+    for t in &tokens.items {
+        let _ = revoke_token_sessions_inner(&state, t.id).await;
+    }
+    let deleted = state.store.delete_user(id).await.map_err(ApiError::from)?;
+    if !deleted {
+        return Err(ApiError::new(ErrorCode::NotFound, "user not found"));
+    }
+    audit(
+        &state,
+        &admin,
+        "user.delete",
+        "user",
+        &id.to_string(),
+        before.map(|u| serde_json::to_value(u).unwrap_or_default()),
+        None,
+        ip_of(&headers).as_deref(),
+    )
+    .await;
+    ok(serde_json::json!({ "deleted": true }))
+}
+
 // ---------------------------------------------------------------------------
 // Token（§5.2）
 // ---------------------------------------------------------------------------
@@ -304,9 +348,9 @@ pub async fn list_tokens(
         .list_tokens(None, None, &page)
         .await
         .map_err(ApiError::from)?;
-    // m4：只读角色看 Token 须脱敏（§5.3“读（脱敏）”）：token_prefix 只留
-    // 前 4 位，其余打码（明文与哈希本就不在列表里）。
-    if admin.role == AdminRole::Readonly {
+    // m4/m26：只读与客服角色看 Token 须脱敏（§5.3“读（脱敏）”）：
+    // token_prefix 只留前 4 位，其余打码（明文与哈希本就不在列表里）。
+    if matches!(admin.role, AdminRole::Readonly | AdminRole::Support) {
         for t in &mut tokens.items {
             let p = &t.token_prefix;
             t.token_prefix = if p.len() > 4 {
@@ -435,10 +479,44 @@ pub async fn update_token(
     ok(token)
 }
 
+/// DELETE /api/v1/admin/tokens/{id}（M19b）：删 Token——先释放其播放会话
+/// 并吊销门户会话，再删 Token 行。
+pub async fn delete_token(
+    State(state): State<Arc<AppState>>,
+    admin: AdminAuth,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> ApiResult<serde_json::Value> {
+    require(
+        &admin,
+        &[AdminRole::SuperAdmin, AdminRole::Operator],
+        "delete tokens",
+    )?;
+    let before = state.store.get_token(id).await.map_err(ApiError::from)?;
+    let _ = revoke_token_sessions_inner(&state, id).await;
+    let deleted = state.store.delete_token(id).await.map_err(ApiError::from)?;
+    if !deleted {
+        return Err(ApiError::new(ErrorCode::NotFound, "token not found"));
+    }
+    audit(
+        &state,
+        &admin,
+        "token.delete",
+        "token",
+        &id.to_string(),
+        before.map(|t| serde_json::to_value(t).unwrap_or_default()),
+        None,
+        ip_of(&headers).as_deref(),
+    )
+    .await;
+    ok(serde_json::json!({ "deleted": true }))
+}
+
 /// POST /api/v1/admin/tokens/{id}/login-ticket：生成一次性登录链接/二维码。
 pub async fn create_login_ticket(
     State(state): State<Arc<AppState>>,
     admin: AdminAuth,
+    headers: HeaderMap,
     Path(id): Path<i64>,
 ) -> ApiResult<serde_json::Value> {
     require(
@@ -462,15 +540,55 @@ pub async fn create_login_ticket(
         "{}/t/{ticket}",
         state.config.portal_base_url.trim_end_matches('/')
     );
+    // M20：签发票据是写操作，写审计（票据本身不入库、不进审计快照）。
+    audit(
+        &state,
+        &admin,
+        "token.login_ticket",
+        "token",
+        &id.to_string(),
+        None,
+        Some(serde_json::json!({"issued": true})),
+        ip_of(&headers).as_deref(),
+    )
+    .await;
     ok(
         serde_json::json!({ "ticket": ticket, "portal_url": portal_url, "qr_png": make_qr_png(&portal_url), "expires_in_sec": ticket_ttl }),
     )
+}
+
+/// 吊销一个 Token 的全部会话并释放播放并发额度（M19a/b 与
+/// `revoke_token_sessions` 共用）：先吊销门户会话，再释放 limiter 额度并
+/// 收尾播放会话。
+async fn revoke_token_sessions_inner(
+    state: &Arc<AppState>,
+    token_id: i64,
+) -> Result<u64, ApiError> {
+    let n = state
+        .store
+        .revoke_all_portal_sessions(token_id, None)
+        .await
+        .map_err(ApiError::from)?;
+    for s in state
+        .store
+        .active_sessions_for_token(token_id)
+        .await
+        .map_err(ApiError::from)?
+    {
+        let _ = state.limiter.release(token_id, &s.session_uid).await;
+        let _ = state
+            .store
+            .end_session(&s.session_uid, Utc::now(), "revoked")
+            .await;
+    }
+    Ok(n)
 }
 
 /// POST /api/v1/admin/tokens/{id}/revoke-sessions：吊销该 Token 全部会话。
 pub async fn revoke_token_sessions(
     State(state): State<Arc<AppState>>,
     admin: AdminAuth,
+    headers: HeaderMap,
     Path(id): Path<i64>,
 ) -> ApiResult<serde_json::Value> {
     if !admin.role.can_kick_session() {
@@ -479,24 +597,19 @@ pub async fn revoke_token_sessions(
             "cannot revoke sessions",
         ));
     }
-    let n = state
-        .store
-        .revoke_all_portal_sessions(id, None)
-        .await
-        .map_err(ApiError::from)?;
-    // 同步释放 Redis 并发额度（会话下线后其播放也应停止）。
-    for s in state
-        .store
-        .active_sessions_for_token(id)
-        .await
-        .map_err(ApiError::from)?
-    {
-        let _ = state.limiter.release(id, &s.session_uid).await;
-        let _ = state
-            .store
-            .end_session(&s.session_uid, Utc::now(), "revoked")
-            .await;
-    }
+    let n = revoke_token_sessions_inner(&state, id).await?;
+    // M20：吊销会话是写操作，写审计。
+    audit(
+        &state,
+        &admin,
+        "token.revoke_sessions",
+        "token",
+        &id.to_string(),
+        None,
+        Some(serde_json::json!({"revoked": n})),
+        ip_of(&headers).as_deref(),
+    )
+    .await;
     ok(serde_json::json!({ "revoked": n }))
 }
 
@@ -533,6 +646,25 @@ pub async fn create_channel(
             ErrorCode::ValidationFailed,
             "name and play_url required",
         ));
+    }
+    // M10：建前预查 tvg_id（store 层唯一约束兜底见 From<anyhow::Error>）。
+    if let Some(tvg) = req.tvg_id.as_deref().filter(|t| !t.trim().is_empty()) {
+        let page = state
+            .store
+            .list_channels(
+                &PageQuery {
+                    page: 1,
+                    page_size: 20,
+                    q: Some(tvg.to_string()),
+                },
+                None,
+                None,
+            )
+            .await
+            .map_err(ApiError::from)?;
+        if page.items.iter().any(|c| c.tvg_id.as_deref() == Some(tvg)) {
+            return Err(ApiError::new(ErrorCode::Conflict, "tvg_id already exists"));
+        }
     }
     let channel = state
         .store
@@ -667,6 +799,76 @@ pub async fn create_source(
     )
     .await;
     ok(source)
+}
+
+/// PATCH /api/v1/admin/sources/{id}（M19c）：改订阅源（仅超管）。
+pub async fn update_source(
+    State(state): State<Arc<AppState>>,
+    admin: AdminAuth,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Json(req): Json<UpdateSourceRequest>,
+) -> ApiResult<PlaylistSource> {
+    require(&admin, &[AdminRole::SuperAdmin], "update sources")?;
+    if let Some(interval) = req.sync_interval_sec {
+        if interval < 300 {
+            return Err(ApiError::new(
+                ErrorCode::ValidationFailed,
+                "sync_interval_sec must be >= 300",
+            ));
+        }
+    }
+    let before = state.store.get_source(id).await.map_err(ApiError::from)?;
+    let source = state
+        .store
+        .update_source(id, &req)
+        .await
+        .map_err(ApiError::from)?
+        .ok_or_else(|| ApiError::new(ErrorCode::NotFound, "source not found"))?;
+    audit(
+        &state,
+        &admin,
+        "source.update",
+        "source",
+        &id.to_string(),
+        before.map(|s| serde_json::to_value(s).unwrap_or_default()),
+        Some(serde_json::to_value(&source).unwrap_or_default()),
+        ip_of(&headers).as_deref(),
+    )
+    .await;
+    ok(source)
+}
+
+/// DELETE /api/v1/admin/sources/{id}（M19c）：删订阅源（仅超管；同步日志
+/// 随源清理，该源同步出的频道保留）。
+pub async fn delete_source(
+    State(state): State<Arc<AppState>>,
+    admin: AdminAuth,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> ApiResult<serde_json::Value> {
+    require(&admin, &[AdminRole::SuperAdmin], "delete sources")?;
+    let before = state.store.get_source(id).await.map_err(ApiError::from)?;
+    let deleted = state
+        .store
+        .delete_source(id)
+        .await
+        .map_err(ApiError::from)?;
+    if !deleted {
+        return Err(ApiError::new(ErrorCode::NotFound, "source not found"));
+    }
+    audit(
+        &state,
+        &admin,
+        "source.delete",
+        "source",
+        &id.to_string(),
+        before.map(|s| serde_json::to_value(s).unwrap_or_default()),
+        None,
+        ip_of(&headers).as_deref(),
+    )
+    .await;
+    ok(serde_json::json!({ "deleted": true }))
 }
 
 /// POST /api/v1/admin/sources/upload：本地 M3U 上传。
@@ -876,6 +1078,14 @@ pub async fn create_group(
         &[AdminRole::SuperAdmin, AdminRole::Operator],
         "create groups",
     )?;
+    // M10：建前预查分组名（store 层唯一约束兜底见 From<anyhow::Error>）。
+    let groups = state.store.list_groups().await.map_err(ApiError::from)?;
+    if groups.iter().any(|g| g.name == req.name) {
+        return Err(ApiError::new(
+            ErrorCode::Conflict,
+            "group name already exists",
+        ));
+    }
     let group = state
         .store
         .create_group(&req)
@@ -893,6 +1103,82 @@ pub async fn create_group(
     )
     .await;
     ok(group)
+}
+
+/// PATCH /api/v1/admin/groups/{id}（M19e）：改分组。
+pub async fn update_group(
+    State(state): State<Arc<AppState>>,
+    admin: AdminAuth,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Json(req): Json<UpdateGroupRequest>,
+) -> ApiResult<ChannelGroup> {
+    require(
+        &admin,
+        &[AdminRole::SuperAdmin, AdminRole::Operator],
+        "update groups",
+    )?;
+    // 改名时与建分组同款预查：重名 → 409（store 层唯一约束兜底）。
+    if let Some(name) = &req.name {
+        let groups = state.store.list_groups().await.map_err(ApiError::from)?;
+        if groups.iter().any(|g| g.name == *name && g.id != id) {
+            return Err(ApiError::new(
+                ErrorCode::Conflict,
+                "group name already exists",
+            ));
+        }
+    }
+    let before = state.store.get_group(id).await.map_err(ApiError::from)?;
+    let group = state
+        .store
+        .update_group(id, &req)
+        .await
+        .map_err(ApiError::from)?
+        .ok_or_else(|| ApiError::new(ErrorCode::NotFound, "group not found"))?;
+    audit(
+        &state,
+        &admin,
+        "group.update",
+        "group",
+        &id.to_string(),
+        before.map(|g| serde_json::to_value(g).unwrap_or_default()),
+        Some(serde_json::to_value(&group).unwrap_or_default()),
+        ip_of(&headers).as_deref(),
+    )
+    .await;
+    ok(group)
+}
+
+/// DELETE /api/v1/admin/groups/{id}（M19e）：删分组——`channel_group_map`
+/// 里的映射随分组清理（频道本身保留）。
+pub async fn delete_group(
+    State(state): State<Arc<AppState>>,
+    admin: AdminAuth,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> ApiResult<serde_json::Value> {
+    require(
+        &admin,
+        &[AdminRole::SuperAdmin, AdminRole::Operator],
+        "delete groups",
+    )?;
+    let before = state.store.get_group(id).await.map_err(ApiError::from)?;
+    let deleted = state.store.delete_group(id).await.map_err(ApiError::from)?;
+    if !deleted {
+        return Err(ApiError::new(ErrorCode::NotFound, "group not found"));
+    }
+    audit(
+        &state,
+        &admin,
+        "group.delete",
+        "group",
+        &id.to_string(),
+        before.map(|g| serde_json::to_value(g).unwrap_or_default()),
+        None,
+        ip_of(&headers).as_deref(),
+    )
+    .await;
+    ok(serde_json::json!({ "deleted": true }))
 }
 
 pub async fn list_epg_sources(
@@ -914,6 +1200,7 @@ pub async fn list_epg_sources(
 pub async fn create_epg_source(
     State(state): State<Arc<AppState>>,
     admin: AdminAuth,
+    headers: HeaderMap,
     Json(req): Json<serde_json::Value>,
 ) -> ApiResult<EpgSource> {
     require(&admin, &[AdminRole::SuperAdmin], "create epg sources")?;
@@ -938,7 +1225,89 @@ pub async fn create_epg_source(
         .create_epg_source(&name, &url)
         .await
         .map_err(ApiError::from)?;
+    // M20：建 EPG 源是写操作，写审计。
+    audit(
+        &state,
+        &admin,
+        "epg_source.create",
+        "epg_source",
+        &source.id.to_string(),
+        None,
+        Some(serde_json::to_value(&source).unwrap_or_default()),
+        ip_of(&headers).as_deref(),
+    )
+    .await;
     ok(source)
+}
+
+/// PATCH /api/v1/admin/epg/sources/{id}（M19f）：改 EPG 源（仅超管）。
+pub async fn update_epg_source(
+    State(state): State<Arc<AppState>>,
+    admin: AdminAuth,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Json(req): Json<UpdateEpgSourceRequest>,
+) -> ApiResult<EpgSource> {
+    require(&admin, &[AdminRole::SuperAdmin], "update epg sources")?;
+    let before = state
+        .store
+        .get_epg_source(id)
+        .await
+        .map_err(ApiError::from)?;
+    let source = state
+        .store
+        .update_epg_source(id, &req)
+        .await
+        .map_err(ApiError::from)?
+        .ok_or_else(|| ApiError::new(ErrorCode::NotFound, "epg source not found"))?;
+    audit(
+        &state,
+        &admin,
+        "epg_source.update",
+        "epg_source",
+        &id.to_string(),
+        before.map(|s| serde_json::to_value(s).unwrap_or_default()),
+        Some(serde_json::to_value(&source).unwrap_or_default()),
+        ip_of(&headers).as_deref(),
+    )
+    .await;
+    ok(source)
+}
+
+/// DELETE /api/v1/admin/epg/sources/{id}（M19f）：删 EPG 源（仅超管；
+/// `epg_channel_map` 里的节目映射随源清理，已生成的节目行保留）。
+pub async fn delete_epg_source(
+    State(state): State<Arc<AppState>>,
+    admin: AdminAuth,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> ApiResult<serde_json::Value> {
+    require(&admin, &[AdminRole::SuperAdmin], "delete epg sources")?;
+    let before = state
+        .store
+        .get_epg_source(id)
+        .await
+        .map_err(ApiError::from)?;
+    let deleted = state
+        .store
+        .delete_epg_source(id)
+        .await
+        .map_err(ApiError::from)?;
+    if !deleted {
+        return Err(ApiError::new(ErrorCode::NotFound, "epg source not found"));
+    }
+    audit(
+        &state,
+        &admin,
+        "epg_source.delete",
+        "epg_source",
+        &id.to_string(),
+        before.map(|s| serde_json::to_value(s).unwrap_or_default()),
+        None,
+        ip_of(&headers).as_deref(),
+    )
+    .await;
+    ok(serde_json::json!({ "deleted": true }))
 }
 
 pub async fn list_sessions(
@@ -960,6 +1329,7 @@ pub async fn list_sessions(
 pub async fn kick_session(
     State(state): State<Arc<AppState>>,
     admin: AdminAuth,
+    headers: HeaderMap,
     Path(id): Path<i64>,
 ) -> ApiResult<serde_json::Value> {
     if !admin.role.can_kick_session() {
@@ -988,6 +1358,8 @@ pub async fn kick_session(
     let Some(session) = found else {
         return Err(ApiError::new(ErrorCode::NotFound, "session not found"));
     };
+    // M20：踢会话是写操作，写审计（before 为踢前的会话快照）。
+    let before = serde_json::to_value(&session).unwrap_or_default();
     let _ = state
         .limiter
         .release(session.token_id, &session.session_uid)
@@ -997,6 +1369,17 @@ pub async fn kick_session(
         .end_session(&session.session_uid, Utc::now(), "kicked")
         .await
         .map_err(ApiError::from)?;
+    audit(
+        &state,
+        &admin,
+        "session.kick",
+        "playback_session",
+        &id.to_string(),
+        Some(before),
+        Some(serde_json::json!({"kicked": true, "ended_reason": "kicked"})),
+        ip_of(&headers).as_deref(),
+    )
+    .await;
     ok(serde_json::json!({ "kicked": true }))
 }
 
@@ -1015,6 +1398,14 @@ pub async fn create_plan(
     Json(req): Json<CreatePlanRequest>,
 ) -> ApiResult<Plan> {
     require(&admin, &[AdminRole::SuperAdmin], "create plans")?;
+    // M10：建前预查套餐名（store 层唯一约束兜底见 From<anyhow::Error>）。
+    let plans = state.store.list_plans().await.map_err(ApiError::from)?;
+    if plans.iter().any(|p| p.name == req.name) {
+        return Err(ApiError::new(
+            ErrorCode::Conflict,
+            "plan name already exists",
+        ));
+    }
     let plan = state
         .store
         .create_plan(&req)
@@ -1032,6 +1423,85 @@ pub async fn create_plan(
     )
     .await;
     ok(plan)
+}
+
+/// PATCH /api/v1/admin/plans/{id}（M19d）：改套餐（仅超管）。
+pub async fn update_plan(
+    State(state): State<Arc<AppState>>,
+    admin: AdminAuth,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Json(req): Json<UpdatePlanRequest>,
+) -> ApiResult<Plan> {
+    require(&admin, &[AdminRole::SuperAdmin], "update plans")?;
+    // 改名时与建套餐同款预查：重名 → 409（store 层唯一约束兜底）。
+    if let Some(name) = &req.name {
+        let plans = state.store.list_plans().await.map_err(ApiError::from)?;
+        if plans.iter().any(|p| p.name == *name && p.id != id) {
+            return Err(ApiError::new(
+                ErrorCode::Conflict,
+                "plan name already exists",
+            ));
+        }
+    }
+    let before = state.store.get_plan(id).await.map_err(ApiError::from)?;
+    let plan = state
+        .store
+        .update_plan(id, &req)
+        .await
+        .map_err(ApiError::from)?
+        .ok_or_else(|| ApiError::new(ErrorCode::NotFound, "plan not found"))?;
+    audit(
+        &state,
+        &admin,
+        "plan.update",
+        "plan",
+        &id.to_string(),
+        before.map(|p| serde_json::to_value(p).unwrap_or_default()),
+        Some(serde_json::to_value(&plan).unwrap_or_default()),
+        ip_of(&headers).as_deref(),
+    )
+    .await;
+    ok(plan)
+}
+
+/// DELETE /api/v1/admin/plans/{id}（M19d）：删套餐（仅超管）；仍有用户
+/// 引用该套餐时拒绝（409）并明示人数。
+pub async fn delete_plan(
+    State(state): State<Arc<AppState>>,
+    admin: AdminAuth,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> ApiResult<serde_json::Value> {
+    require(&admin, &[AdminRole::SuperAdmin], "delete plans")?;
+    let before = state.store.get_plan(id).await.map_err(ApiError::from)?;
+    let n_users = state
+        .store
+        .count_users_with_plan(id)
+        .await
+        .map_err(ApiError::from)?;
+    if n_users > 0 {
+        return Err(ApiError::new(
+            ErrorCode::Conflict,
+            format!("plan is in use by {n_users} user(s); reassign them first"),
+        ));
+    }
+    let deleted = state.store.delete_plan(id).await.map_err(ApiError::from)?;
+    if !deleted {
+        return Err(ApiError::new(ErrorCode::NotFound, "plan not found"));
+    }
+    audit(
+        &state,
+        &admin,
+        "plan.delete",
+        "plan",
+        &id.to_string(),
+        before.map(|p| serde_json::to_value(p).unwrap_or_default()),
+        None,
+        ip_of(&headers).as_deref(),
+    )
+    .await;
+    ok(serde_json::json!({ "deleted": true }))
 }
 
 pub async fn list_admins(
@@ -1054,6 +1524,19 @@ pub async fn create_admin(
         return Err(ApiError::new(
             ErrorCode::ValidationFailed,
             "username required and password must be >= 8 chars",
+        ));
+    }
+    // M10：建前预查用户名（store 层唯一约束兜底见 From<anyhow::Error>）。
+    if state
+        .store
+        .find_admin_by_username(&req.username)
+        .await
+        .map_err(ApiError::from)?
+        .is_some()
+    {
+        return Err(ApiError::new(
+            ErrorCode::Conflict,
+            "username already exists",
         ));
     }
     let hash = hash_password(&req.password)

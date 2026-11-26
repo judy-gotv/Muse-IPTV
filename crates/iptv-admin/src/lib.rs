@@ -1,3 +1,6 @@
+// M19：行内编辑表单把 view! 嵌套推过默认 128 层（编译器建议值），
+// 代码生成阶段会报 queries overflow the depth limit。
+#![recursion_limit = "256"]
 //! 管理后台（开发文档 §5）：Leptos SSR 应用。
 //!
 //! - 路由（§5.1）：`/admin/login`、`/admin`、`/admin/users`、`/admin/tokens`、
@@ -18,12 +21,12 @@ use iptv_design::{
 use iptv_dto::{
     AdminRole, AdminUser, AppUser, AuditLog, Channel, ChannelGroup, EpgProgram, EpgSource, Paged,
     Plan, PlaybackSession, PlaylistSource, StatsOverview, SyncDiff, SyncLog, SystemSetting,
-    UserToken,
+    TokenStatus, UserStatus, UserToken,
 };
 // 只在服务端用（admin_get 解 Envelope）。
 #[cfg(feature = "ssr")]
 use iptv_dto::Envelope;
-use iptv_ui::{fmt_dt, t_or, LanguageSwitcher, LocaleCtx};
+use iptv_ui::{fmt_dt, role_label, status_label, t_args_or, t_or, LanguageSwitcher, LocaleCtx};
 use leptos::prelude::*;
 use leptos_meta::{provide_meta_context, MetaTags, Title};
 use leptos_router::components::{Route, Router, Routes};
@@ -319,7 +322,7 @@ pub fn shell(props: leptos::config::LeptosOptions) -> impl IntoView {
     };
     view! {
         <!DOCTYPE html>
-        <html lang="zh-Hant" data-theme=data_theme>
+        <html lang=negotiated_locale() data-theme=data_theme>
             <head>
                 <meta charset="utf-8"/>
                 <meta name="viewport" content="width=device-width, initial-scale=1"/>
@@ -449,13 +452,15 @@ fn AdminLayout(
         ),
     ];
     let toggle = Callback::new(move |_| collapsed.update(|v| *v = !*v));
-    let role_label = admin_role().map(|r| format!("{:?}", r)).unwrap_or_default();
+    let role_text = admin_role()
+        .map(|r| role_label(&format!("{:?}", r)))
+        .unwrap_or_default();
     view! {
         <div class="app-shell">
             <Sidebar title=t_or("common.app-name", "IPTV Platform") items=items collapsed=collapsed.get() on_toggle=toggle/>
             <div class="app-main">
                 <Toolbar title=title>
-                    {(!role_label.is_empty()).then(|| view! { <Badge text=role_label.clone() tone=BadgeTone::Muted/> })}
+                    {(!role_text.is_empty()).then(|| view! { <Badge text=role_text.clone() tone=BadgeTone::Muted/> })}
                     <LanguageSwitcher action="/admin/locale" redirect_to="/admin"/>
                     <form method="post" action="/admin/logout" style="display:inline">
                         <button class="btn btn-plain" type="submit">{t_or("common.logout", "Sign out")}</button>
@@ -530,13 +535,13 @@ fn Pager(page: u32, total: u64, page_size: u32, base: String) -> impl IntoView {
     view! {
         <div class="pagination">
             {if page > 1 {
-                view! { <a class="btn btn-tinted" href=format!("{base}?page={}", page - 1)>"‹ Prev"</a> }.into_any()
+                view! { <a class="btn btn-tinted" href=format!("{base}?page={}", page - 1)>{t_or("common.prev", "‹ Prev")}</a> }.into_any()
             } else {
                 view! { "" }.into_any()
             }}
-            <span>{format!("{page} / {total_pages} · total {total}")}</span>
+            <span>{t_args_or("common.pager", &[("page", page.to_string()), ("pages", total_pages.to_string()), ("total", total.to_string())], format!("{page} / {total_pages} · total {total}"))}</span>
             {if page < total_pages {
-                view! { <a class="btn btn-tinted" href=format!("{base}?page={}", page + 1)>"Next ›"</a> }.into_any()
+                view! { <a class="btn btn-tinted" href=format!("{base}?page={}", page + 1)>{t_or("common.next", "Next ›")}</a> }.into_any()
             } else {
                 view! { "" }.into_any()
             }}
@@ -590,16 +595,16 @@ fn DashboardPage() -> impl IntoView {
                         };
                         view! {
                             <div class="stat-grid">
-                                <div class="stat-card"><div class="stat-value">{s.online_users}</div><div class="stat-label">"online users"</div></div>
-                                <div class="stat-card"><div class="stat-value">{s.active_sessions}</div><div class="stat-label">"active sessions"</div></div>
-                                <div class="stat-card"><div class="stat-value">{format!("{}/{}", s.available_channels, s.total_channels)}</div><div class="stat-label">"available / total channels"</div></div>
-                                <div class="stat-card"><div class="stat-value">{format!("{}/{}", s.active_tokens, s.total_tokens)}</div><div class="stat-label">"active / total tokens"</div></div>
+                                <div class="stat-card"><div class="stat-value">{s.online_users}</div><div class="stat-label">{t_or("admin.online-users", "online users")}</div></div>
+                                <div class="stat-card"><div class="stat-value">{s.active_sessions}</div><div class="stat-label">{t_or("admin.active-sessions", "active sessions")}</div></div>
+                                <div class="stat-card"><div class="stat-value">{format!("{}/{}", s.available_channels, s.total_channels)}</div><div class="stat-label">{t_or("admin.available-total-channels", "available / total channels")}</div></div>
+                                <div class="stat-card"><div class="stat-value">{format!("{}/{}", s.active_tokens, s.total_tokens)}</div><div class="stat-label">{t_or("admin.active-total-tokens", "active / total tokens")}</div></div>
                             </div>
                             <div class="card">
-                                <h3 style="margin-top:0">"sync"</h3>
+                                <h3 style="margin-top:0">{t_or("admin.sync-title", "Sync")}</h3>
                                 <p>{sync}</p>
                                 {if s.alerts.is_empty() {
-                                    view! { <p style="color:var(--c-label-secondary)">"no alerts"</p> }.into_any()
+                                    view! { <p style="color:var(--c-label-secondary)">{t_or("common.no-alerts", "No alerts")}</p> }.into_any()
                                 } else {
                                     view! {
                                         <ul class="list">
@@ -642,9 +647,9 @@ fn UsersPage() -> impl IntoView {
                     <form method="post" action="/admin/users">
                         <div class="form-grid">
                             <TextField label=t_or("portal.display-name", "Display name") name="display_name" required=true/>
-                            <TextField label="Email" name="email" input_type="email"/>
-                            <TextField label="Phone" name="phone"/>
-                            <TextField label="Plan ID" name="plan_id" input_type="number"/>
+                            <TextField label=t_or("common.email", "Email") name="email" input_type="email"/>
+                            <TextField label=t_or("common.phone", "Phone") name="phone"/>
+                            <TextField label=t_or("common.plan-id", "Plan ID") name="plan_id" input_type="number"/>
                             <div class="field">
                                 <label for="locale-select">{t_or("common.language", "Language")}</label>
                                 <select id="locale-select" name="locale" class="textfield">
@@ -654,7 +659,7 @@ fn UsersPage() -> impl IntoView {
                                     }).collect_view()}
                                 </select>
                             </div>
-                            <TextField label="Remark" name="remark"/>
+                            <TextField label=t_or("common.remark", "Remark") name="remark"/>
                         </div>
                         <button class="btn btn-filled" type="submit">{t_or("common.save", "Save")}</button>
                     </form>
@@ -670,17 +675,47 @@ fn UsersPage() -> impl IntoView {
                             view! {
                                 <div class="table-wrap">
                                     <table class="admin-table">
-                                        <thead><tr><th>ID</th><th>Name</th><th>Email</th><th>Status</th><th>Locale</th><th>Expires</th></tr></thead>
+                                        <thead><tr><th>{t_or("common.id", "ID")}</th><th>{t_or("common.name", "Name")}</th><th>{t_or("common.email", "Email")}</th><th>{t_or("common.status", "Status")}</th><th>{t_or("common.locale", "Locale")}</th><th>{t_or("common.expires", "Expires")}</th><th>{t_or("common.actions", "Actions")}</th></tr></thead>
                                         <tbody>
-                                            {paged.items.into_iter().map(|u| view! {
-                                                <tr>
-                                                    <td>{u.id}</td>
-                                                    <td>{u.display_name}</td>
-                                                    <td>{u.email.unwrap_or_default()}</td>
-                                                    <td>{format!("{:?}", u.status)}</td>
-                                                    <td>{u.locale}</td>
-                                                    <td>{u.expires_at.map(fmt_dt).unwrap_or_default()}</td>
-                                                </tr>
+                                            {paged.items.into_iter().map(|u| {
+                                                let uid = u.id;
+                                                let display_name = u.display_name.clone();
+                                                let remark = u.remark.clone().unwrap_or_default();
+                                                let plan_id = u.plan_id.map(|p| p.to_string()).unwrap_or_default();
+                                                let expires_at = u.expires_at.map(|d| d.to_rfc3339()).unwrap_or_default();
+                                                let status = u.status.clone();
+                                                view! {
+                                                    <tr>
+                                                        <td>{u.id}</td>
+                                                        <td>{u.display_name}</td>
+                                                        <td>{u.email.unwrap_or_default()}</td>
+                                                        <td>{status_label(&format!("{:?}", u.status))}</td>
+                                                        <td>{iptv_i18n::locale_display_name(&u.locale)}</td>
+                                                        <td>{u.expires_at.map(fmt_dt).unwrap_or_default()}</td>
+                                                        <td>
+                                                            {can_write.then(|| view! {
+                                                                <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-start">
+                                                                    <details>
+                                                                        <summary>{t_or("admin.edit-user", "Edit user")}</summary>
+                                                                        <form method="post" action=format!("/admin/users/{uid}/update")>
+                                                                            <div class="form-grid">
+                                                                                <div class="field"><label>{t_or("portal.display-name", "Display name")}</label><input class="textfield" name="display_name" value=display_name/></div>
+                                                                                <div class="field"><label>{t_or("common.remark", "Remark")}</label><input class="textfield" name="remark" value=remark/></div>
+                                                                                <div class="field"><label>{t_or("common.plan-id", "Plan ID")}</label><input class="textfield" name="plan_id" type="number" value=plan_id/></div>
+                                                                                <div class="field"><label>{t_or("common.status", "Status")}</label><select name="status" class="textfield"><option value="active" selected=status == UserStatus::Active>{status_label("Active")}</option><option value="suspended" selected=status == UserStatus::Suspended>{status_label("Suspended")}</option><option value="expired" selected=status == UserStatus::Expired>{status_label("Expired")}</option></select></div>
+                                                                                <div class="field"><label>{t_or("common.expires-at", "Expires at (RFC3339)")}</label><input class="textfield" name="expires_at" value=expires_at/></div>
+                                                                            </div>
+                                                                            <button class="btn" type="submit">{t_or("common.save", "Save")}</button>
+                                                                        </form>
+                                                                    </details>
+                                                                    <form method="post" action=format!("/admin/users/{uid}/delete") style="display:inline">
+                                                                        <button class="btn btn-destructive" type="submit">{t_or("common.delete", "Delete")}</button>
+                                                                    </form>
+                                                                </div>
+                                                            })}
+                                                        </td>
+                                                    </tr>
+                                                }
                                             }).collect_view()}
                                         </tbody>
                                     </table>
@@ -719,15 +754,15 @@ fn TokensPage() -> impl IntoView {
             {can_write.then(|| view! {
                 <div class="card">
                     <h3 style="margin-top:0">{t_or("admin.create-token", "Create Token")}</h3>
-                    <p style="font-size:var(--text-footnote);color:var(--c-label-secondary)">"The plaintext Token is shown only once after creation."</p>
+                    <p style="font-size:var(--text-footnote);color:var(--c-label-secondary)">{t_or("admin.plaintext-token-once", "The plaintext Token is shown only once after creation.")}</p>
                     <form method="post" action="/admin/tokens">
                         <div class="form-grid">
-                            <TextField label="User ID" name="user_id" input_type="number" required=true/>
-                            <TextField label="Name" name="name" required=true/>
-                            <TextField label="Device type" name="device_type" value="android_tv"/>
-                            <TextField label="Max concurrent sessions" name="max_concurrent_sessions" input_type="number" value="2"/>
-                            <TextField label="Max bound devices" name="max_bound_devices" input_type="number" value="3"/>
-                            <TextField label="Expires at (RFC3339)" name="expires_at"/>
+                            <TextField label=t_or("common.user-id", "User ID") name="user_id" input_type="number" required=true/>
+                            <TextField label=t_or("common.name", "Name") name="name" required=true/>
+                            <TextField label=t_or("common.device-type", "Device type") name="device_type" value="android_tv"/>
+                            <TextField label=t_or("common.max-concurrent-sessions", "Max concurrent sessions") name="max_concurrent_sessions" input_type="number" value="2"/>
+                            <TextField label=t_or("common.max-bound-devices", "Max bound devices") name="max_bound_devices" input_type="number" value="3"/>
+                            <TextField label=t_or("common.expires-at", "Expires at (RFC3339)") name="expires_at"/>
                             <div class="field">
                                 <label for="locale-select">{t_or("common.language", "Language")}</label>
                                 <select id="locale-select" name="locale" class="textfield">
@@ -737,12 +772,12 @@ fn TokensPage() -> impl IntoView {
                                     }).collect_view()}
                                 </select>
                             </div>
-                            <TextField label="Allowed groups (comma separated)" name="allowed_groups"/>
-                            <TextField label="Max quality" name="max_quality" value="1080p"/>
+                            <TextField label=t_or("common.allowed-groups", "Allowed groups (comma separated)") name="allowed_groups"/>
+                            <TextField label=t_or("common.max-quality", "Max quality") name="max_quality" value="1080p"/>
                         </div>
                         <div style="margin-bottom:12px">
-                            <Toggle label="Catchup" name="catchup" checked=true/>
-                            <Toggle label="Recording" name="recording"/>
+                            <Toggle label=t_or("common.catchup", "Catchup") name="catchup" checked=true/>
+                            <Toggle label=t_or("common.recording", "Recording") name="recording"/>
                         </div>
                         <button class="btn btn-filled" type="submit">{t_or("common.save", "Save")}</button>
                     </form>
@@ -758,10 +793,14 @@ fn TokensPage() -> impl IntoView {
                             view! {
                                 <div class="table-wrap">
                                     <table class="admin-table">
-                                        <thead><tr><th>ID</th><th>Prefix</th><th>Name</th><th>Device</th><th>Concurrent</th><th>Devices</th><th>Status</th><th>Expires</th><th>Actions</th></tr></thead>
+                                        <thead><tr><th>{t_or("common.id", "ID")}</th><th>{t_or("common.prefix", "Prefix")}</th><th>{t_or("common.name", "Name")}</th><th>{t_or("common.device", "Device")}</th><th>{t_or("common.concurrent", "Concurrent")}</th><th>{t_or("common.devices", "Devices")}</th><th>{t_or("common.status", "Status")}</th><th>{t_or("common.expires", "Expires")}</th><th>{t_or("common.actions", "Actions")}</th></tr></thead>
                                         <tbody>
                                             {paged.items.into_iter().map(|t| {
                                                 let tid = t.id;
+                                                let tok_name = t.name.clone();
+                                                let tok_groups = t.allowed_groups.join(", ");
+                                                let tok_expires = t.expires_at.map(|d| d.to_rfc3339()).unwrap_or_default();
+                                                let tok_status = t.status.clone();
                                                 view! {
                                                     <tr>
                                                         <td>{t.id}</td>
@@ -770,16 +809,37 @@ fn TokensPage() -> impl IntoView {
                                                         <td>{t.device_type.unwrap_or_default()}</td>
                                                         <td>{t.max_concurrent_sessions}</td>
                                                         <td>{t.max_bound_devices}</td>
-                                                        <td>{format!("{:?}", t.status)}</td>
+                                                        <td>{status_label(&format!("{:?}", t.status))}</td>
                                                         <td>{t.expires_at.map(fmt_dt).unwrap_or_default()}</td>
                                                         <td>
                                                             <form method="post" action=format!("/admin/tokens/{tid}/ticket") style="display:inline">
-                                                                <button class="btn btn-tinted" type="submit">"login link"</button>
+                                                                <button class="btn btn-tinted" type="submit">{t_or("admin.login-link", "login link")}</button>
                                                             </form>
                                                             " "
                                                             <form method="post" action=format!("/admin/tokens/{tid}/revoke") style="display:inline">
-                                                                <button class="btn btn-destructive" type="submit">"revoke sessions"</button>
+                                                                <button class="btn btn-destructive" type="submit">{t_or("admin.revoke-sessions", "revoke sessions")}</button>
                                                             </form>
+                                                            {can_write.then(|| view! {
+                                                                <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-start">
+                                                                    <details>
+                                                                        <summary>{t_or("admin.edit-token", "Edit Token")}</summary>
+                                                                        <form method="post" action=format!("/admin/tokens/{tid}/update")>
+                                                                            <div class="form-grid">
+                                                                                <div class="field"><label>{t_or("common.name", "Name")}</label><input class="textfield" name="name" value=tok_name/></div>
+                                                                                <div class="field"><label>{t_or("common.max-concurrent-sessions", "Max concurrent sessions")}</label><input class="textfield" name="max_concurrent_sessions" type="number" value=t.max_concurrent_sessions.to_string()/></div>
+                                                                                <div class="field"><label>{t_or("common.max-bound-devices", "Max bound devices")}</label><input class="textfield" name="max_bound_devices" type="number" value=t.max_bound_devices.to_string()/></div>
+                                                                                <div class="field"><label>{t_or("common.status", "Status")}</label><select name="status" class="textfield"><option value="active" selected=tok_status == TokenStatus::Active>{status_label("Active")}</option><option value="disabled" selected=tok_status == TokenStatus::Disabled>{status_label("Disabled")}</option><option value="expired" selected=tok_status == TokenStatus::Expired>{status_label("Expired")}</option></select></div>
+                                                                                <div class="field"><label>{t_or("common.expires-at", "Expires at (RFC3339)")}</label><input class="textfield" name="expires_at" value=tok_expires/></div>
+                                                                                <div class="field"><label>{t_or("common.allowed-groups", "Allowed groups (comma separated)")}</label><input class="textfield" name="allowed_groups" value=tok_groups/></div>
+                                                                            </div>
+                                                                            <button class="btn" type="submit">{t_or("common.save", "Save")}</button>
+                                                                        </form>
+                                                                    </details>
+                                                                    <form method="post" action=format!("/admin/tokens/{tid}/delete") style="display:inline">
+                                                                        <button class="btn btn-destructive" type="submit">{t_or("common.delete", "Delete")}</button>
+                                                                    </form>
+                                                                </div>
+                                                            })}
                                                         </td>
                                                     </tr>
                                                 }
@@ -821,17 +881,17 @@ fn ChannelsPage() -> impl IntoView {
             </form>
             {can_write.then(|| view! {
                 <div class="card">
-                    <h3 style="margin-top:0">"Add channel"</h3>
+                    <h3 style="margin-top:0">{t_or("admin.add-channel", "Add channel")}</h3>
                     <form method="post" action="/admin/channels">
                         <div class="form-grid">
-                            <TextField label="tvg-id" name="tvg_id"/>
-                            <TextField label="Name" name="name" required=true/>
-                            <TextField label="Group" name="group_title"/>
-                            <TextField label="Logo URL" name="logo_url"/>
-                            <TextField label="Play URL" name="play_url" required=true/>
-                            <TextField label="Backup URL" name="backup_url"/>
-                            <TextField label="Protocol" name="protocol" value="hls"/>
-                            <TextField label="Sort weight" name="sort_weight" input_type="number" value="0"/>
+                            <TextField label=t_or("common.tvg-id", "tvg-id") name="tvg_id"/>
+                            <TextField label=t_or("common.name", "Name") name="name" required=true/>
+                            <TextField label=t_or("common.group", "Group") name="group_title"/>
+                            <TextField label=t_or("common.logo-url", "Logo URL") name="logo_url"/>
+                            <TextField label=t_or("common.play-url", "Play URL") name="play_url" required=true/>
+                            <TextField label=t_or("common.backup-url", "Backup URL") name="backup_url"/>
+                            <TextField label=t_or("common.protocol", "Protocol") name="protocol" value="hls"/>
+                            <TextField label=t_or("common.sort-weight", "Sort weight") name="sort_weight" input_type="number" value="0"/>
                         </div>
                         <button class="btn btn-filled" type="submit">{t_or("common.save", "Save")}</button>
                     </form>
@@ -847,7 +907,7 @@ fn ChannelsPage() -> impl IntoView {
                             view! {
                                 <div class="table-wrap">
                                     <table class="admin-table">
-                                        <thead><tr><th>ID</th><th>tvg-id</th><th>Name</th><th>Group</th><th>Status</th><th>Available</th><th>Actions</th></tr></thead>
+                                        <thead><tr><th>{t_or("common.id", "ID")}</th><th>{t_or("common.tvg-id", "tvg-id")}</th><th>{t_or("common.name", "Name")}</th><th>{t_or("common.group", "Group")}</th><th>{t_or("common.status", "Status")}</th><th>{t_or("common.available", "Available")}</th><th>{t_or("common.actions", "Actions")}</th></tr></thead>
                                         <tbody>
                                             {paged.items.into_iter().map(|c| {
                                                 let cid = c.id;
@@ -857,7 +917,7 @@ fn ChannelsPage() -> impl IntoView {
                                                         <td class="mono">{c.tvg_id.unwrap_or_default()}</td>
                                                         <td>{c.name}</td>
                                                         <td>{c.group_title.unwrap_or_default()}</td>
-                                                        <td>{format!("{:?}", c.status)}</td>
+                                                        <td>{status_label(&format!("{:?}", c.status))}</td>
                                                         <td>{c.last_available.map(|b| if b { "●".to_string() } else { "○".to_string() }).unwrap_or_default()}</td>
                                                         <td>
                                                             {can_write.then(|| view! {
@@ -921,27 +981,27 @@ fn SourcesPage() -> impl IntoView {
             <OpNotice/>
             {can_write.then(|| view! {
                 <div class="card">
-                    <h3 style="margin-top:0">"Add subscription source"</h3>
+                    <h3 style="margin-top:0">{t_or("admin.add-source", "Add subscription source")}</h3>
                     <form method="post" action="/admin/sources">
                         <div class="form-grid">
-                            <TextField label="Name" name="name" required=true/>
-                            <TextField label="URL" name="url" required=true/>
-                            <TextField label="Sync interval (sec, min 300)" name="sync_interval_sec" input_type="number" value="3600"/>
-                            <TextField label="EPG URL" name="epg_url"/>
+                            <TextField label=t_or("common.name", "Name") name="name" required=true/>
+                            <TextField label=t_or("common.url", "URL") name="url" required=true/>
+                            <TextField label=t_or("common.sync-interval", "Sync interval (sec, min 300)") name="sync_interval_sec" input_type="number" value="3600"/>
+                            <TextField label=t_or("common.epg-url", "EPG URL") name="epg_url"/>
                         </div>
                         <button class="btn btn-filled" type="submit">{t_or("common.save", "Save")}</button>
                     </form>
-                    <h3>"Upload local M3U (.m3u / .m3u8 / .txt, no size limit)"</h3>
+                    <h3>{t_or("admin.upload-m3u-title", "Upload local M3U (.m3u / .m3u8 / .txt, no size limit)")}</h3>
                     <form method="post" action="/admin/sources/upload" enctype="multipart/form-data">
                         <div class="field">
-                            <label for="m3u-name">"Source name"</label>
+                            <label for="m3u-name">{t_or("common.source-name", "Source name")}</label>
                             <input class="textfield" id="m3u-name" name="name" required/>
                         </div>
                         <div class="field">
-                            <label for="m3u-file">"M3U file"</label>
+                            <label for="m3u-file">{t_or("common.m3u-file", "M3U file")}</label>
                             <input class="textfield" id="m3u-file" type="file" name="file" accept=".m3u,.m3u8,.txt" required/>
                         </div>
-                        <button class="btn btn-filled" type="submit">"Upload & parse"</button>
+                        <button class="btn btn-filled" type="submit">{t_or("admin.upload-parse", "Upload & parse")}</button>
                     </form>
                 </div>
             })}
@@ -954,10 +1014,15 @@ fn SourcesPage() -> impl IntoView {
                             view! {
                                 <div class="table-wrap">
                                     <table class="admin-table">
-                                        <thead><tr><th>ID</th><th>Name</th><th>URL</th><th>Interval</th><th>Last sync</th><th>Status</th><th>Actions</th></tr></thead>
+                                        <thead><tr><th>{t_or("common.id", "ID")}</th><th>{t_or("common.name", "Name")}</th><th>{t_or("common.url", "URL")}</th><th>{t_or("common.interval", "Interval")}</th><th>{t_or("common.last-sync", "Last sync")}</th><th>{t_or("common.status", "Status")}</th><th>{t_or("common.actions", "Actions")}</th></tr></thead>
                                         <tbody>
                                             {list.into_iter().map(|s| {
                                                 let sid = s.id;
+                                                let src_name = s.name.clone();
+                                                let src_url = s.url.clone().unwrap_or_default();
+                                                let src_epg_url = s.epg_url.clone().unwrap_or_default();
+                                                let src_on_missing = s.on_missing.clone();
+                                                let src_enabled = s.enabled;
                                                 view! {
                                                     <tr>
                                                         <td>{s.id}</td>
@@ -967,12 +1032,33 @@ fn SourcesPage() -> impl IntoView {
                                                         <td>{s.last_sync_at.map(fmt_dt).unwrap_or_default()}</td>
                                                         <td>{s.last_status.unwrap_or_default()}</td>
                                                         <td>
-                                                            <a class="btn btn-tinted" href=format!("/admin/sources?source={sid}")>"diff / logs"</a>
+                                                            <a class="btn btn-tinted" href=format!("/admin/sources?source={sid}")>{t_or("admin.diff-logs", "diff / logs")}</a>
                                                             " "
                                                             {can_write.then(|| view! {
                                                                 <form method="post" action=format!("/admin/sources/{sid}/sync") style="display:inline">
                                                                     <button class="btn btn-filled" type="submit">{t_or("admin.sync-now", "Sync now")}</button>
                                                                 </form>
+                                                            })}
+                                                            {can_write.then(|| view! {
+                                                                <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-start">
+                                                                    <details>
+                                                                        <summary>{t_or("admin.edit-source", "Edit source")}</summary>
+                                                                        <form method="post" action=format!("/admin/sources/{sid}/update")>
+                                                                            <div class="form-grid">
+                                                                                <div class="field"><label>{t_or("common.name", "Name")}</label><input class="textfield" name="name" value=src_name/></div>
+                                                                                <div class="field"><label>{t_or("common.url", "URL")}</label><input class="textfield" name="url" value=src_url/></div>
+                                                                                <div class="field"><label>{t_or("common.sync-interval", "Sync interval (sec, min 300)")}</label><input class="textfield" name="sync_interval_sec" type="number" value=s.sync_interval_sec.to_string()/></div>
+                                                                                <div class="field"><label>{t_or("common.epg-url", "EPG URL")}</label><input class="textfield" name="epg_url" value=src_epg_url/></div>
+                                                                                <div class="field"><label>{t_or("common.on-missing", "On missing")}</label><select name="on_missing" class="textfield"><option value="disable" selected=format!("{:?}", src_on_missing) == "Disable">{t_or("common.disable", "Disable")}</option><option value="delete" selected=format!("{:?}", src_on_missing) == "Delete">{t_or("common.delete", "Delete")}</option></select></div>
+                                                                            </div>
+                                                                            <Toggle label=t_or("common.enabled", "Enabled") name="enabled" checked=src_enabled/>
+                                                                            <button class="btn" type="submit">{t_or("common.save", "Save")}</button>
+                                                                        </form>
+                                                                    </details>
+                                                                    <form method="post" action=format!("/admin/sources/{sid}/delete") style="display:inline">
+                                                                        <button class="btn btn-destructive" type="submit">{t_or("common.delete", "Delete")}</button>
+                                                                    </form>
+                                                                </div>
                                                             })}
                                                         </td>
                                                     </tr>
@@ -992,7 +1078,7 @@ fn SourcesPage() -> impl IntoView {
                 {move || diff.get().map(|res| match res {
                     Ok(Some(d)) => view! {
                         <div class="card">
-                            <h3 style="margin-top:0">"Sync diff"</h3>
+                            <h3 style="margin-top:0">{t_or("admin.sync-diff", "Sync diff")}</h3>
                             <p>{format!("added {} · metadata changed {} · url changed {} · missing {}", d.added.len(), d.metadata_changed.len(), d.url_changed.len(), d.missing.len())}</p>
                             <ul class="list">
                                 {d.added.into_iter().map(|c| view! { <li class="row"><span>{format!("+ {}", c.name)}</span></li> }).collect_view()}
@@ -1008,10 +1094,10 @@ fn SourcesPage() -> impl IntoView {
                 {move || logs.get().map(|res| match res {
                     Ok(Some(paged)) => view! {
                         <div class="card">
-                            <h3 style="margin-top:0">"Sync logs"</h3>
+                            <h3 style="margin-top:0">{t_or("admin.sync-logs", "Sync logs")}</h3>
                             <div class="table-wrap">
                                 <table class="admin-table">
-                                    <thead><tr><th>Started</th><th>Status</th><th>Added</th><th>Updated</th><th>Removed</th><th>Error</th></tr></thead>
+                                    <thead><tr><th>{t_or("common.started", "Started")}</th><th>{t_or("common.status", "Status")}</th><th>{t_or("common.added", "Added")}</th><th>{t_or("common.updated", "Updated")}</th><th>{t_or("common.removed", "Removed")}</th><th>{t_or("common.error", "Error")}</th></tr></thead>
                                     <tbody>
                                         {paged.items.into_iter().map(|l| view! {
                                             <tr>
@@ -1048,12 +1134,12 @@ fn GroupsPage() -> impl IntoView {
             <OpNotice/>
             {can_write.then(|| view! {
                 <div class="card">
-                    <h3 style="margin-top:0">"Add group"</h3>
+                    <h3 style="margin-top:0">{t_or("admin.add-group", "Add group")}</h3>
                     <form method="post" action="/admin/groups">
                         <div class="form-grid">
-                            <TextField label="Name" name="name" required=true/>
-                            <TextField label="Sort weight" name="sort_weight" input_type="number" value="0"/>
-                            <TextField label="Icon" name="icon"/>
+                            <TextField label=t_or("common.name", "Name") name="name" required=true/>
+                            <TextField label=t_or("common.sort-weight", "Sort weight") name="sort_weight" input_type="number" value="0"/>
+                            <TextField label=t_or("common.icon", "Icon") name="icon"/>
                         </div>
                         <button class="btn btn-filled" type="submit">{t_or("common.save", "Save")}</button>
                     </form>
@@ -1068,16 +1154,43 @@ fn GroupsPage() -> impl IntoView {
                             view! {
                                 <div class="table-wrap">
                                     <table class="admin-table">
-                                        <thead><tr><th>ID</th><th>Name</th><th>Sort</th><th>Icon</th><th>Default</th></tr></thead>
+                                        <thead><tr><th>{t_or("common.id", "ID")}</th><th>{t_or("common.name", "Name")}</th><th>{t_or("common.sort", "Sort")}</th><th>{t_or("common.icon", "Icon")}</th><th>{t_or("common.default", "Default")}</th><th>{t_or("common.actions", "Actions")}</th></tr></thead>
                                         <tbody>
-                                            {list.into_iter().map(|g| view! {
-                                                <tr>
-                                                    <td>{g.id}</td>
-                                                    <td>{g.name}</td>
-                                                    <td>{g.sort_weight}</td>
-                                                    <td>{g.icon.unwrap_or_default()}</td>
-                                                    <td>{if g.is_default { "✓" } else { "" }}</td>
-                                                </tr>
+                                            {list.into_iter().map(|g| {
+                                                let gid = g.id;
+                                                let grp_name = g.name.clone();
+                                                let grp_icon = g.icon.clone().unwrap_or_default();
+                                                let grp_default = g.is_default;
+                                                view! {
+                                                    <tr>
+                                                        <td>{g.id}</td>
+                                                        <td>{g.name}</td>
+                                                        <td>{g.sort_weight}</td>
+                                                        <td>{g.icon.unwrap_or_default()}</td>
+                                                        <td>{if g.is_default { "✓" } else { "" }}</td>
+                                                        <td>
+                                                            {can_write.then(|| view! {
+                                                                <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-start">
+                                                                    <details>
+                                                                        <summary>{t_or("admin.edit-group", "Edit group")}</summary>
+                                                                        <form method="post" action=format!("/admin/groups/{gid}/update")>
+                                                                            <div class="form-grid">
+                                                                                <div class="field"><label>{t_or("common.name", "Name")}</label><input class="textfield" name="name" value=grp_name/></div>
+                                                                                <div class="field"><label>{t_or("common.sort-weight", "Sort weight")}</label><input class="textfield" name="sort_weight" type="number" value=g.sort_weight.to_string()/></div>
+                                                                                <div class="field"><label>{t_or("common.icon", "Icon")}</label><input class="textfield" name="icon" value=grp_icon/></div>
+                                                                            </div>
+                                                                            <Toggle label=t_or("common.default", "Default") name="is_default" checked=grp_default/>
+                                                                            <button class="btn" type="submit">{t_or("common.save", "Save")}</button>
+                                                                        </form>
+                                                                    </details>
+                                                                    <form method="post" action=format!("/admin/groups/{gid}/delete") style="display:inline">
+                                                                        <button class="btn btn-destructive" type="submit">{t_or("common.delete", "Delete")}</button>
+                                                                    </form>
+                                                                </div>
+                                                            })}
+                                                        </td>
+                                                    </tr>
+                                                }
                                             }).collect_view()}
                                         </tbody>
                                     </table>
@@ -1116,20 +1229,20 @@ fn EpgPage() -> impl IntoView {
             <OpNotice/>
             {can_write.then(|| view! {
                 <div class="card">
-                    <h3 style="margin-top:0">"Add EPG source"</h3>
+                    <h3 style="margin-top:0">{t_or("admin.add-epg-source", "Add EPG source")}</h3>
                     <form method="post" action="/admin/epg/sources">
                         <div class="form-grid">
-                            <TextField label="Name" name="name" required=true/>
-                            <TextField label="URL" name="url" required=true/>
+                            <TextField label=t_or("common.name", "Name") name="name" required=true/>
+                            <TextField label=t_or("common.url", "URL") name="url" required=true/>
                         </div>
                         <button class="btn btn-filled" type="submit">{t_or("common.save", "Save")}</button>
                     </form>
                 </div>
             })}
             <div class="card">
-                <h3 style="margin-top:0">"Program preview"</h3>
+                <h3 style="margin-top:0">{t_or("admin.program-preview", "Program preview")}</h3>
                 <form method="get" action="/admin/epg" style="display:flex;gap:8px">
-                    <input class="textfield" type="number" name="channel_id" placeholder="channel id" style="flex:1"/>
+                    <input class="textfield" type="number" name="channel_id" placeholder=t_or("common.channel-id", "Channel ID") style="flex:1"/>
                     <button class="btn btn-tinted" type="submit">{t_or("common.search", "Search")}</button>
                 </form>
             </div>
@@ -1161,16 +1274,40 @@ fn EpgPage() -> impl IntoView {
                             view! {
                                 <div class="table-wrap">
                                     <table class="admin-table">
-                                        <thead><tr><th>ID</th><th>Name</th><th>URL</th><th>Last sync</th><th>Status</th></tr></thead>
+                                        <thead><tr><th>{t_or("common.id", "ID")}</th><th>{t_or("common.name", "Name")}</th><th>{t_or("common.url", "URL")}</th><th>{t_or("common.last-sync", "Last sync")}</th><th>{t_or("common.status", "Status")}</th><th>{t_or("common.actions", "Actions")}</th></tr></thead>
                                         <tbody>
-                                            {list.into_iter().map(|s| view! {
-                                                <tr>
-                                                    <td>{s.id}</td>
-                                                    <td>{s.name}</td>
-                                                    <td class="mono">{s.url}</td>
-                                                    <td>{s.last_sync_at.map(fmt_dt).unwrap_or_default()}</td>
-                                                    <td>{s.last_status.unwrap_or_default()}</td>
-                                                </tr>
+                                            {list.into_iter().map(|s| {
+                                                let eid = s.id;
+                                                let epg_name = s.name.clone();
+                                                let epg_url = s.url.clone();
+                                                view! {
+                                                    <tr>
+                                                        <td>{s.id}</td>
+                                                        <td>{s.name}</td>
+                                                        <td class="mono">{s.url}</td>
+                                                        <td>{s.last_sync_at.map(fmt_dt).unwrap_or_default()}</td>
+                                                        <td>{s.last_status.unwrap_or_default()}</td>
+                                                        <td>
+                                                            {can_write.then(|| view! {
+                                                                <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-start">
+                                                                    <details>
+                                                                        <summary>{t_or("admin.edit-epg-source", "Edit EPG source")}</summary>
+                                                                        <form method="post" action=format!("/admin/epg/sources/{eid}/update")>
+                                                                            <div class="form-grid">
+                                                                                <div class="field"><label>{t_or("common.name", "Name")}</label><input class="textfield" name="name" value=epg_name/></div>
+                                                                                <div class="field"><label>{t_or("common.url", "URL")}</label><input class="textfield" name="url" value=epg_url/></div>
+                                                                            </div>
+                                                                            <button class="btn" type="submit">{t_or("common.save", "Save")}</button>
+                                                                        </form>
+                                                                    </details>
+                                                                    <form method="post" action=format!("/admin/epg/sources/{eid}/delete") style="display:inline">
+                                                                        <button class="btn btn-destructive" type="submit">{t_or("common.delete", "Delete")}</button>
+                                                                    </form>
+                                                                </div>
+                                                            })}
+                                                        </td>
+                                                    </tr>
+                                                }
                                             }).collect_view()}
                                         </tbody>
                                     </table>
@@ -1205,7 +1342,7 @@ fn SessionsPage() -> impl IntoView {
                             view! {
                                 <div class="table-wrap">
                                     <table class="admin-table">
-                                        <thead><tr><th>ID</th><th>Session</th><th>Token</th><th>Channel</th><th>Device</th><th>Started</th><th>Last heartbeat</th><th>Status</th><th>Actions</th></tr></thead>
+                                        <thead><tr><th>{t_or("common.id", "ID")}</th><th>{t_or("common.session", "Session")}</th><th>{t_or("common.token", "Token")}</th><th>{t_or("common.channel", "Channel")}</th><th>{t_or("common.device", "Device")}</th><th>{t_or("common.started", "Started")}</th><th>{t_or("common.last-heartbeat", "Last heartbeat")}</th><th>{t_or("common.status", "Status")}</th><th>{t_or("common.actions", "Actions")}</th></tr></thead>
                                         <tbody>
                                             {paged.items.into_iter().map(|s| {
                                                 let sid = s.id;
@@ -1218,11 +1355,11 @@ fn SessionsPage() -> impl IntoView {
                                                         <td>{s.device_id}</td>
                                                         <td>{fmt_dt(s.started_at)}</td>
                                                         <td>{fmt_dt(s.last_heartbeat_at)}</td>
-                                                        <td><StatusDot label=s.status.clone() kind=if s.status == "active" { StatusKind::Online } else { StatusKind::Offline }/></td>
+                                                        <td><StatusDot label=status_label(&s.status) kind=if s.status == "active" { StatusKind::Online } else { StatusKind::Offline }/></td>
                                                         <td>
                                                             {can_kick.then(|| view! {
                                                                 <form method="post" action=format!("/admin/sessions/{sid}/kick") style="display:inline">
-                                                                    <button class="btn btn-destructive" type="submit">"kick"</button>
+                                                                    <button class="btn btn-destructive" type="submit">{t_or("common.kick", "Kick")}</button>
                                                                 </form>
                                                             })}
                                                         </td>
@@ -1256,16 +1393,16 @@ fn PlansPage() -> impl IntoView {
             <OpNotice/>
             {can_write.then(|| view! {
                 <div class="card">
-                    <h3 style="margin-top:0">"Add plan"</h3>
+                    <h3 style="margin-top:0">{t_or("admin.add-plan", "Add plan")}</h3>
                     <form method="post" action="/admin/plans">
                         <div class="form-grid">
-                            <TextField label="Name" name="name" required=true/>
-                            <TextField label="Max concurrent sessions" name="max_concurrent_sessions" input_type="number" value="2"/>
-                            <TextField label="Max bound devices" name="max_bound_devices" input_type="number" value="3"/>
-                            <TextField label="Channel groups (comma separated)" name="channel_groups"/>
-                            <TextField label="Duration (days)" name="duration_days" input_type="number" value="365"/>
-                            <TextField label="Price (cents)" name="price_cents" input_type="number" value="0"/>
-                            <TextField label="Currency" name="currency" value="USD"/>
+                            <TextField label=t_or("common.name", "Name") name="name" required=true/>
+                            <TextField label=t_or("common.max-concurrent-sessions", "Max concurrent sessions") name="max_concurrent_sessions" input_type="number" value="2"/>
+                            <TextField label=t_or("common.max-bound-devices", "Max bound devices") name="max_bound_devices" input_type="number" value="3"/>
+                            <TextField label=t_or("common.channel-groups", "Channel groups (comma separated)") name="channel_groups"/>
+                            <TextField label=t_or("common.duration-days", "Duration (days)") name="duration_days" input_type="number" value="365"/>
+                            <TextField label=t_or("common.price-cents", "Price (cents)") name="price_cents" input_type="number" value="0"/>
+                            <TextField label=t_or("common.currency", "Currency") name="currency" value="USD"/>
                         </div>
                         <button class="btn btn-filled" type="submit">{t_or("common.save", "Save")}</button>
                     </form>
@@ -1280,18 +1417,48 @@ fn PlansPage() -> impl IntoView {
                             view! {
                                 <div class="table-wrap">
                                     <table class="admin-table">
-                                        <thead><tr><th>ID</th><th>Name</th><th>Concurrent</th><th>Devices</th><th>Groups</th><th>Duration</th><th>Price</th></tr></thead>
+                                        <thead><tr><th>{t_or("common.id", "ID")}</th><th>{t_or("common.name", "Name")}</th><th>{t_or("common.concurrent", "Concurrent")}</th><th>{t_or("common.devices", "Devices")}</th><th>{t_or("common.groups", "Groups")}</th><th>{t_or("common.duration", "Duration")}</th><th>{t_or("common.price", "Price")}</th><th>{t_or("common.actions", "Actions")}</th></tr></thead>
                                         <tbody>
-                                            {list.into_iter().map(|p| view! {
-                                                <tr>
-                                                    <td>{p.id}</td>
-                                                    <td>{p.name}</td>
-                                                    <td>{p.max_concurrent_sessions}</td>
-                                                    <td>{p.max_bound_devices}</td>
-                                                    <td>{p.channel_groups.join(", ")}</td>
-                                                    <td>{p.duration_days}</td>
-                                                    <td>{format!("{} {}", p.price_cents, p.currency)}</td>
-                                                </tr>
+                                            {list.into_iter().map(|p| {
+                                                let pid = p.id;
+                                                let plan_name = p.name.clone();
+                                                let plan_groups = p.channel_groups.join(", ");
+                                                let plan_currency = p.currency.clone();
+                                                view! {
+                                                    <tr>
+                                                        <td>{p.id}</td>
+                                                        <td>{p.name}</td>
+                                                        <td>{p.max_concurrent_sessions}</td>
+                                                        <td>{p.max_bound_devices}</td>
+                                                        <td>{p.channel_groups.join(", ")}</td>
+                                                        <td>{p.duration_days}</td>
+                                                        <td>{format!("{} {}", p.price_cents, p.currency)}</td>
+                                                        <td>
+                                                            {can_write.then(|| view! {
+                                                                <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-start">
+                                                                    <details>
+                                                                        <summary>{t_or("admin.edit-plan", "Edit plan")}</summary>
+                                                                        <form method="post" action=format!("/admin/plans/{pid}/update")>
+                                                                            <div class="form-grid">
+                                                                                <div class="field"><label>{t_or("common.name", "Name")}</label><input class="textfield" name="name" value=plan_name/></div>
+                                                                                <div class="field"><label>{t_or("common.max-concurrent-sessions", "Max concurrent sessions")}</label><input class="textfield" name="max_concurrent_sessions" type="number" value=p.max_concurrent_sessions.to_string()/></div>
+                                                                                <div class="field"><label>{t_or("common.max-bound-devices", "Max bound devices")}</label><input class="textfield" name="max_bound_devices" type="number" value=p.max_bound_devices.to_string()/></div>
+                                                                                <div class="field"><label>{t_or("common.channel-groups", "Channel groups (comma separated)")}</label><input class="textfield" name="channel_groups" value=plan_groups/></div>
+                                                                                <div class="field"><label>{t_or("common.duration-days", "Duration (days)")}</label><input class="textfield" name="duration_days" type="number" value=p.duration_days.to_string()/></div>
+                                                                                <div class="field"><label>{t_or("common.price-cents", "Price (cents)")}</label><input class="textfield" name="price_cents" type="number" value=p.price_cents.to_string()/></div>
+                                                                                <div class="field"><label>{t_or("common.currency", "Currency")}</label><input class="textfield" name="currency" value=plan_currency/></div>
+                                                                            </div>
+                                                                            <button class="btn" type="submit">{t_or("common.save", "Save")}</button>
+                                                                        </form>
+                                                                    </details>
+                                                                    <form method="post" action=format!("/admin/plans/{pid}/delete") style="display:inline">
+                                                                        <button class="btn btn-destructive" type="submit">{t_or("common.delete", "Delete")}</button>
+                                                                    </form>
+                                                                </div>
+                                                            })}
+                                                        </td>
+                                                    </tr>
+                                                }
                                             }).collect_view()}
                                         </tbody>
                                     </table>
@@ -1316,31 +1483,31 @@ fn AdminsPage() -> impl IntoView {
         <AdminLayout title=t_or("admin.admins", "Admins") active="admins">
             <OpNotice/>
             <div class="card">
-                <h3 style="margin-top:0">"Permission matrix (§5.3)"</h3>
+                <h3 style="margin-top:0">{t_or("admin.permission-matrix", "Permission matrix (§5.3)")}</h3>
                 <div class="table-wrap">
                     <table class="admin-table">
-                        <thead><tr><th>Role</th><th>Users</th><th>Tokens</th><th>Channels</th><th>Sources</th><th>Settings</th><th>Audit</th></tr></thead>
+                        <thead><tr><th>{t_or("common.role", "Role")}</th><th>{t_or("admin.users", "Users")}</th><th>{t_or("admin.tokens", "Tokens")}</th><th>{t_or("admin.channels", "Channels")}</th><th>{t_or("admin.sources", "Sources")}</th><th>{t_or("admin.settings", "Settings")}</th><th>{t_or("admin.audit", "Audit")}</th></tr></thead>
                         <tbody>
-                            <tr><td>SuperAdmin</td><td>RW</td><td>RW</td><td>RW</td><td>RW</td><td>RW</td><td>R</td></tr>
-                            <tr><td>Operator</td><td>RW</td><td>RW</td><td>RW</td><td>R</td><td>{"—"}</td><td>{"—"}</td></tr>
-                            <tr><td>Support</td><td>R</td><td>R + kick</td><td>R</td><td>{"—"}</td><td>{"—"}</td><td>{"—"}</td></tr>
-                            <tr><td>Readonly</td><td>R</td><td>R (masked)</td><td>R</td><td>R</td><td>{"—"}</td><td>{"—"}</td></tr>
+                            <tr><td>{t_or("common.role-super-admin", "Super admin")}</td><td>RW</td><td>RW</td><td>RW</td><td>RW</td><td>RW</td><td>R</td></tr>
+                            <tr><td>{t_or("common.role-operator", "Operator")}</td><td>RW</td><td>RW</td><td>RW</td><td>R</td><td>{"—"}</td><td>{"—"}</td></tr>
+                            <tr><td>{t_or("common.role-support", "Support")}</td><td>R</td><td>R + kick</td><td>R</td><td>{"—"}</td><td>{"—"}</td><td>{"—"}</td></tr>
+                            <tr><td>{t_or("common.role-readonly", "Readonly")}</td><td>R</td><td>R (masked)</td><td>R</td><td>R</td><td>{"—"}</td><td>{"—"}</td></tr>
                         </tbody>
                     </table>
                 </div>
-                <p style="font-size:var(--text-footnote);color:var(--c-label-secondary)">"Permissions are enforced server-side; the frontend only hides actions."</p>
+                <p style="font-size:var(--text-footnote);color:var(--c-label-secondary)">{t_or("admin.permissions-note", "Permissions are enforced server-side; the frontend only hides actions.")}</p>
             </div>
             {is_super.then(|| view! {
                 <div class="card">
-                    <h3 style="margin-top:0">"Add admin"</h3>
+                    <h3 style="margin-top:0">{t_or("admin.add-admin", "Add admin")}</h3>
                     <form method="post" action="/admin/admins">
                         <div class="form-grid">
                             <TextField label=t_or("admin.username", "Username") name="username" required=true/>
                             <TextField label=t_or("admin.password", "Password") name="password" input_type="password" required=true/>
-                            <TextField label="Role (super_admin / operator / support / readonly)" name="role" value="operator"/>
+                            <TextField label=t_or("admin.role-hint", "Role (super_admin / operator / support / readonly)") name="role" value="operator"/>
                         </div>
                         <div style="margin-bottom:12px">
-                            <Toggle label="Require TOTP" name="totp_required"/>
+                            <Toggle label=t_or("admin.require-totp", "Require TOTP") name="totp_required"/>
                         </div>
                         <button class="btn btn-filled" type="submit">{t_or("common.save", "Save")}</button>
                     </form>
@@ -1355,16 +1522,16 @@ fn AdminsPage() -> impl IntoView {
                             view! {
                                 <div class="table-wrap">
                                     <table class="admin-table">
-                                        <thead><tr><th>ID</th><th>Username</th><th>Role</th><th>TOTP status</th><th>TOTP required</th><th>Actions</th></tr></thead>
+                                        <thead><tr><th>{t_or("common.id", "ID")}</th><th>{t_or("admin.username", "Username")}</th><th>{t_or("common.role", "Role")}</th><th>{t_or("common.totp-status", "TOTP status")}</th><th>{t_or("common.totp-required", "TOTP required")}</th><th>{t_or("common.actions", "Actions")}</th></tr></thead>
                                         <tbody>
                                             {list.into_iter().map(|a| {
                                                 // TOTP 状态：已启用 / 待验证（已配给、首次登录输码后启用）/ 未配给。
                                                 let totp_status = if a.totp_enabled {
-                                                    "已启用"
+                                                    t_or("admin.totp-enabled", "Enabled")
                                                 } else if a.totp_provisioned {
-                                                    "待验证"
+                                                    t_or("admin.totp-pending", "Pending verification")
                                                 } else {
-                                                    "未配给"
+                                                    t_or("admin.totp-unprovisioned", "Not provisioned")
                                                 };
                                                 let is_super_admin = a.role == AdminRole::SuperAdmin;
                                                 let is_operator = a.role == AdminRole::Operator;
@@ -1376,7 +1543,7 @@ fn AdminsPage() -> impl IntoView {
                                                     <tr>
                                                         <td>{id}</td>
                                                         <td>{a.username}</td>
-                                                        <td>{format!("{:?}", a.role)}</td>
+                                                        <td>{role_label(&format!("{:?}", a.role))}</td>
                                                         <td>{totp_status}</td>
                                                         <td>{if required { "✓" } else { "" }}</td>
                                                         <td>
@@ -1384,16 +1551,16 @@ fn AdminsPage() -> impl IntoView {
                                                                 <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
                                                                     <form method="post" action=format!("/admin/admins/{id}/update") style="display:inline-flex;gap:6px;align-items:center">
                                                                         <select name="role">
-                                                                            <option value="super_admin" selected=is_super_admin>"Super admin"</option>
-                                                                            <option value="operator" selected=is_operator>"Operator"</option>
-                                                                            <option value="support" selected=is_support>"Support"</option>
-                                                                            <option value="readonly" selected=is_readonly>"Readonly"</option>
+                                                                            <option value="super_admin" selected=is_super_admin>{t_or("common.role-super-admin", "Super admin")}</option>
+                                                                            <option value="operator" selected=is_operator>{t_or("common.role-operator", "Operator")}</option>
+                                                                            <option value="support" selected=is_support>{t_or("common.role-support", "Support")}</option>
+                                                                            <option value="readonly" selected=is_readonly>{t_or("common.role-readonly", "Readonly")}</option>
                                                                         </select>
-                                                                        <label><input type="checkbox" name="totp_required" value="true" checked=required/>"Require TOTP"</label>
+                                                                        <label><input type="checkbox" name="totp_required" value="true" checked=required/>{t_or("admin.require-totp", "Require TOTP")}</label>
                                                                         <button class="btn" type="submit">{t_or("common.save", "Save")}</button>
                                                                     </form>
                                                                     <form method="post" action=format!("/admin/admins/{id}/reset-totp") style="display:inline">
-                                                                        <button class="btn" type="submit">"配给/重置 TOTP"</button>
+                                                                        <button class="btn" type="submit">{t_or("admin.reset-totp", "Provision / reset TOTP")}</button>
                                                                     </form>
                                                                     <form method="post" action=format!("/admin/admins/{id}/delete") style="display:inline">
                                                                         <button class="btn btn-destructive" type="submit">{t_or("common.delete", "Delete")}</button>
@@ -1407,7 +1574,7 @@ fn AdminsPage() -> impl IntoView {
                                         </tbody>
                                     </table>
                                 </div>
-                                <p style="font-size:var(--text-footnote);color:var(--c-label-secondary)">"TOTP 未配给的账号仍可用密码登录（视为配置未完成，不锁死）；建管理员勾选 Require TOTP 时密钥只显示一次，请立即扫码；配给后首次登录输入一枚码即启用。"</p>
+                                <p style="font-size:var(--text-footnote);color:var(--c-label-secondary)">{t_or("admin.totp-note", "Accounts without TOTP provisioned can still sign in with a password (treated as incomplete setup, not locked out); when creating an admin with Require TOTP, the secret is shown only once — scan it immediately; entering one code on first sign-in after provisioning enables it.")}</p>
                             }.into_any()
                         }
                     }
@@ -1438,14 +1605,14 @@ fn AuditPage() -> impl IntoView {
             {if !can_read {
                 view! {
                     <EmptyState title=t_or("errors.e40300", "Forbidden") icon="⚿">
-                        <p>"Only SuperAdmin can read the audit log."</p>
+                        <p>{t_or("admin.only-superadmin-audit", "Only SuperAdmin can read the audit log.")}</p>
                     </EmptyState>
                 }.into_any()
             } else {
                 view! {
                     <form method="get" action="/admin/audit" style="display:flex;gap:8px;margin-bottom:12px">
-                        <input class="textfield" type="text" name="actor" placeholder="actor" value=actor().unwrap_or_default() style="flex:1"/>
-                        <input class="textfield" type="text" name="action" placeholder="action" value=action().unwrap_or_default() style="flex:1"/>
+                        <input class="textfield" type="text" name="actor" placeholder=t_or("common.actor", "Actor") value=actor().unwrap_or_default() style="flex:1"/>
+                        <input class="textfield" type="text" name="action" placeholder=t_or("common.action", "Action") value=action().unwrap_or_default() style="flex:1"/>
                         <button class="btn btn-tinted" type="submit">{t_or("common.search", "Search")}</button>
                     </form>
                     <Suspense fallback=LoadingSkeleton>
@@ -1457,7 +1624,7 @@ fn AuditPage() -> impl IntoView {
                                     view! {
                                         <div class="table-wrap">
                                             <table class="admin-table">
-                                                <thead><tr><th>Time</th><th>Actor</th><th>Action</th><th>Object</th><th>{"Before → After"}</th><th>IP</th></tr></thead>
+                                                <thead><tr><th>{t_or("common.time", "Time")}</th><th>{t_or("common.actor", "Actor")}</th><th>{t_or("common.action", "Action")}</th><th>{t_or("common.object", "Object")}</th><th>{t_or("common.before-after", "Before → After")}</th><th>{t_or("common.ip", "IP")}</th></tr></thead>
                                                 <tbody>
                                                     {paged.items.into_iter().map(|l| view! {
                                                         <tr>
@@ -1512,16 +1679,16 @@ fn SettingsPage() -> impl IntoView {
             <OpNotice/>
             {can_write.then(|| view! {
                 <div class="card">
-                    <h3 style="margin-top:0">"Update setting"</h3>
+                    <h3 style="margin-top:0">{t_or("admin.update-setting", "Update setting")}</h3>
                     <form method="post" action="/admin/settings">
                         <div class="form-grid">
-                            <TextField label="Key" name="key" required=true/>
-                            <TextField label="Value (JSON, e.g. 2 or \"zh-Hant-TW\")" name="value" required=true/>
+                            <TextField label=t_or("common.key", "Key") name="key" required=true/>
+                            <TextField label=t_or("admin.value-json-hint", "Value (JSON, e.g. 2 or \"zh-Hant-TW\")") name="value" required=true/>
                         </div>
                         <button class="btn btn-filled" type="submit">{t_or("common.save", "Save")}</button>
                     </form>
                     <p style="font-size:var(--text-footnote);color:var(--c-label-secondary)">
-                        "Keys (§3.2): default_max_concurrent_sessions, default_max_bound_devices, heartbeat_interval_sec, session_timeout_sec, single_ip_token_limit, play_url_ttl_sec, cdn_domain, alert_threshold_failed_syncs, default_locale, available_locales, portal_session_ttl_days, remember_device_ttl_days, ticket_ttl_sec, audit_retention_days."
+                        {t_or("admin.settings-keys-hint", "Keys (§3.2): default_max_concurrent_sessions, default_max_bound_devices, heartbeat_interval_sec, session_timeout_sec, single_ip_token_limit, play_url_ttl_sec, cdn_domain, alert_threshold_failed_syncs, default_locale, available_locales, portal_session_ttl_days, remember_device_ttl_days, ticket_ttl_sec, audit_retention_days.")}
                     </p>
                 </div>
             })}
@@ -1534,13 +1701,13 @@ fn SettingsPage() -> impl IntoView {
                             view! {
                                 <div class="table-wrap">
                                     <table class="admin-table">
-                                        <thead><tr><th>Key</th><th>Value</th><th>Updated</th><th>Status</th></tr></thead>
+                                        <thead><tr><th>{t_or("common.key", "Key")}</th><th>{t_or("common.value", "Value")}</th><th>{t_or("common.updated", "Updated")}</th><th>{t_or("common.status", "Status")}</th></tr></thead>
                                         <tbody>
                                             {list.into_iter().map(|s| view! {
                                                 <tr>
                                                     <td class="mono">{s.key.clone()}</td>
                                                     <td class="mono">{s.value.to_string()}</td>
-                                                    <td>{fmt_dt(s.updated_at)}</td>
+                                                    <td>{if s.updated_at.timestamp() == 0 { "—".to_string() } else { fmt_dt(s.updated_at) }}</td>
                                                     <td>{setting_status(&s.key)}</td>
                                                 </tr>
                                             }).collect_view()}

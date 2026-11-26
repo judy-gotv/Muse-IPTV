@@ -195,4 +195,24 @@ impl Store {
         .await?;
         self.get_token(id).await
     }
+
+    /// M19b：删 Token——先吊销其全部门户会话（播放并发额度的释放与播放
+    /// 会话收尾在 handler 层做，需 limiter），再删 Token 行。
+    pub async fn delete_token(&self, id: i64) -> anyhow::Result<bool> {
+        let now = Utc::now();
+        sqlx::query(&ph(
+            "UPDATE portal_session SET revoked_at = ? WHERE token_id = ? AND revoked_at IS NULL",
+            self.dialect,
+        ))
+        .bind(epoch(now))
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        let n = sqlx::query(&ph("DELETE FROM user_token WHERE id = ?", self.dialect))
+            .bind(id)
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+        Ok(n > 0)
+    }
 }

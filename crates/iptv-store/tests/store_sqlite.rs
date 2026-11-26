@@ -158,6 +158,7 @@ async fn user_and_token_roundtrip() {
                 plan_id: None,
                 status: None,
                 locale: None,
+                theme: None,
                 remark: None,
                 expires_at: None,
             },
@@ -166,6 +167,46 @@ async fn user_and_token_roundtrip() {
         .unwrap()
         .unwrap();
     assert_eq!(upd_user.display_name, "alice2");
+}
+
+#[tokio::test]
+async fn consecutive_sync_failures_from_log() {
+    // M18：连续失败计数以 sync_log 为准，worker 重启后可恢复。
+    let fx = setup().await;
+    let s = &fx.store;
+    let src = s
+        .create_source(&CreateSourceRequest {
+            name: "失败计数源".to_string(),
+            url: Some("https://example.com/list.m3u".to_string()),
+            sync_interval_sec: None,
+            http_headers: None,
+            epg_url: None,
+            on_missing: None,
+            auto_enable_new: None,
+            enabled: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(s.consecutive_sync_failures(src.id).await.unwrap(), 0);
+    async fn finish_log(s: &Store, source_id: i64, status: &str) {
+        let log_id = s.create_sync_log(source_id).await.unwrap();
+        s.finish_sync_log(log_id, status, 0, 0, 0, None)
+            .await
+            .unwrap();
+    }
+    finish_log(s, src.id, "failed").await;
+    finish_log(s, src.id, "failed").await;
+    assert_eq!(s.consecutive_sync_failures(src.id).await.unwrap(), 2);
+    // 孤儿 running 行（认领失败遗留）不中断计数。
+    s.create_sync_log(src.id).await.unwrap();
+    assert_eq!(s.consecutive_sync_failures(src.id).await.unwrap(), 2);
+    finish_log(s, src.id, "failed").await;
+    assert_eq!(s.consecutive_sync_failures(src.id).await.unwrap(), 3);
+    // 一次成功即清零；此后的失败重新累计。
+    finish_log(s, src.id, "ok").await;
+    assert_eq!(s.consecutive_sync_failures(src.id).await.unwrap(), 0);
+    finish_log(s, src.id, "failed").await;
+    assert_eq!(s.consecutive_sync_failures(src.id).await.unwrap(), 1);
 }
 
 #[tokio::test]
@@ -809,4 +850,41 @@ async fn v5_migration_updates_existing_default_locale() {
         db_value(s, "default_locale").await,
         serde_json::json!("zh-Hans-CN")
     );
+}
+
+#[tokio::test]
+async fn v6_user_theme_persists_and_setting_updated_at_rewritten() {
+    // m17：主题默认 system，PATCH 后持久化；M13：V6 迁移把种子 updated_at=0 改写为迁移时间。
+    let fx = setup().await;
+    let s = &fx.store;
+    let user = s.create_user(&user_req("theme-user")).await.unwrap();
+    assert_eq!(user.theme, "system");
+    let upd = s
+        .update_user(
+            user.id,
+            &UpdateUserRequest {
+                display_name: None,
+                email: None,
+                phone: None,
+                plan_id: None,
+                status: None,
+                locale: None,
+                theme: Some("dark".to_string()),
+                remark: None,
+                expires_at: None,
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(upd.theme, "dark");
+    let again = s.get_user(user.id).await.unwrap().unwrap();
+    assert_eq!(again.theme, "dark");
+    for st in s.list_settings().await.unwrap() {
+        assert_ne!(st.updated_at.timestamp(), 0, "setting {} still 0", st.key);
+    }
+    // V6 幂等：migrate() 每次启动都全量重跑，ALTER ADD COLUMN 第二次必须被容忍。
+    s.migrate().await.unwrap();
+    let again2 = s.get_user(user.id).await.unwrap().unwrap();
+    assert_eq!(again2.theme, "dark");
 }

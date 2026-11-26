@@ -16,6 +16,7 @@ pub(crate) fn row_to_user(row: &AnyRow) -> anyhow::Result<AppUser> {
             _ => UserStatus::Active,
         },
         locale: r_string(row, "locale")?,
+        theme: r_opt_string(row, "theme")?.unwrap_or_else(|| "system".to_string()),
         remark: r_opt_string(row, "remark")?,
         expires_at: r_opt_ts(row, "expires_at")?,
         created_at: r_ts(row, "created_at")?,
@@ -31,20 +32,21 @@ pub(crate) fn status_str(s: &UserStatus) -> &'static str {
     }
 }
 
-const USER_COLS: &str = "id, display_name, email, phone, plan_id, status, locale, remark, expires_at, created_at, updated_at";
+const USER_COLS: &str = "id, display_name, email, phone, plan_id, status, locale, theme, remark, expires_at, created_at, updated_at";
 
 impl Store {
     pub async fn create_user(&self, req: &CreateUserRequest) -> anyhow::Result<AppUser> {
         let now = Utc::now();
         let id = insert_id!(
             self,
-            "INSERT INTO app_user (display_name, email, phone, plan_id, status, locale, remark, expires_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO app_user (display_name, email, phone, plan_id, status, locale, theme, remark, expires_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             &req.display_name,
             req.email.clone(),
             req.phone.clone(),
             req.plan_id,
             "active",
             req.locale.clone().unwrap_or_else(|| "zh-Hans-CN".to_string()),
+            "system",
             req.remark.clone(),
             req.expires_at.map(epoch),
             epoch(now),
@@ -116,6 +118,36 @@ impl Store {
         })
     }
 
+    /// M19a：删用户——先禁用其全部 Token 并吊销其全部门户会话（播放并发
+    /// 额度的释放与播放会话收尾在 handler 层做，需 limiter），再删用户行。
+    /// 返回是否真删到行。
+    pub async fn delete_user(&self, id: i64) -> anyhow::Result<bool> {
+        let now = Utc::now();
+        sqlx::query(&ph(
+            "UPDATE user_token SET status = ?, updated_at = ? WHERE user_id = ?",
+            self.dialect,
+        ))
+        .bind("disabled")
+        .bind(epoch(now))
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(&ph(
+            "UPDATE portal_session SET revoked_at = ? WHERE token_id IN (SELECT id FROM user_token WHERE user_id = ?) AND revoked_at IS NULL",
+            self.dialect,
+        ))
+        .bind(epoch(now))
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        let n = sqlx::query(&ph("DELETE FROM app_user WHERE id = ?", self.dialect))
+            .bind(id)
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+        Ok(n > 0)
+    }
+
     /// 只更新请求里提供的字段（其余字段保持原值，先读后写，避免动态 SET 拼接）。
     pub async fn update_user(
         &self,
@@ -132,10 +164,11 @@ impl Store {
         let plan_id = req.plan_id.or(cur.plan_id);
         let status = req.status.clone().unwrap_or(cur.status);
         let locale = req.locale.clone().unwrap_or(cur.locale);
+        let theme = req.theme.clone().unwrap_or(cur.theme);
         let remark = req.remark.clone().or(cur.remark);
         let expires_at = req.expires_at.or(cur.expires_at);
         sqlx::query(
-            &ph("UPDATE app_user SET display_name = ?, email = ?, phone = ?, plan_id = ?, status = ?, locale = ?, remark = ?, expires_at = ?, updated_at = ? WHERE id = ?", self.dialect),
+            &ph("UPDATE app_user SET display_name = ?, email = ?, phone = ?, plan_id = ?, status = ?, locale = ?, theme = ?, remark = ?, expires_at = ?, updated_at = ? WHERE id = ?", self.dialect),
         )
         .bind(display_name)
         .bind(email)
@@ -143,6 +176,7 @@ impl Store {
         .bind(plan_id)
         .bind(status_str(&status))
         .bind(locale)
+        .bind(theme)
         .bind(remark)
         .bind(expires_at.map(epoch))
         .bind(epoch(now))

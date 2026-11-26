@@ -23,8 +23,8 @@ use iptv_dto::{
 #[cfg(feature = "ssr")]
 use iptv_dto::Envelope;
 use iptv_ui::{
-    fmt_dt, locale, t_or, ChannelCard, DeviceRow, EpgSidebar, LanguageSwitcher, LocaleCtx, Player,
-    QuotaRing,
+    fmt_dt, t_args_or, t_or, ChannelCard, DeviceRow, EpgSidebar, LanguageSwitcher, LocaleCtx,
+    Player, QuotaRing,
 };
 use leptos::prelude::*;
 #[cfg(feature = "ssr")]
@@ -428,7 +428,7 @@ pub fn shell(props: leptos::config::LeptosOptions) -> impl IntoView {
     };
     view! {
         <!DOCTYPE html>
-        <html lang="zh-Hant" data-theme=data_theme data-device=device>
+        <html lang=negotiated_locale() data-theme=data_theme data-device=device>
             <head>
                 <meta charset="utf-8"/>
                 <meta name="viewport" content="width=device-width, initial-scale=1"/>
@@ -674,21 +674,18 @@ fn MePage() -> impl IntoView {
     }
 }
 
+/// 会话到期文案：走 Fluent 复数选择（`portal.session-expires-in`），缺 key
+/// 时由 `t_args_or` 的英文兜底承接，不在代码里另写英文分支。
 fn t_args_or_portal_expires(days: i64) -> String {
-    let i18n = iptv_i18n::I18n::new();
-    let loc = locale();
-    let mut fa = fluent_bundle::FluentArgs::new();
-    fa.set("days", days);
-    let v = i18n.t(&loc, "portal.session-expires-in", Some(&fa));
-    if v == "portal.session-expires-in" {
+    t_args_or(
+        "portal.session-expires-in",
+        &[("days", days.to_string())],
         if days == 0 {
             "Expires today".to_string()
         } else {
             format!("Expires in {days} days")
-        }
-    } else {
-        v
-    }
+        },
+    )
 }
 
 /// `/me/devices` 在线设备与并发占用（§4.1）。
@@ -902,9 +899,9 @@ fn SettingsPage() -> impl IntoView {
                                 <div class="field">
                                     <label for="theme-select">{t_or("portal.theme", "Appearance")}</label>
                                     <select id="theme-select" name="theme" class="textfield">
-                                        <option value="system">system</option>
-                                        <option value="light">light</option>
-                                        <option value="dark">dark</option>
+                                        <option value="system" selected=m.user.theme == "system">system</option>
+                                        <option value="light" selected=m.user.theme == "light">light</option>
+                                        <option value="dark" selected=m.user.theme == "dark">dark</option>
                                     </select>
                                 </div>
                                 <div class="field">
@@ -926,7 +923,7 @@ fn SettingsPage() -> impl IntoView {
                         <div class="card">
                             <h3 style="margin-top:0">{t_or("portal.devices", "Devices")}</h3>
                             <p><a href="/me/devices">{t_or("common.nav-devices", "Devices")}" ›"</a></p>
-                            <form method="post" action="/logout">
+                            <form method="post" action="/logout-all">
                                 <button class="btn btn-destructive" type="submit">{t_or("portal.logout-all", "Sign out of all devices")}</button>
                             </form>
                         </div>

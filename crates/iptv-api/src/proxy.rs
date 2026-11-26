@@ -11,7 +11,10 @@ use crate::{ApiError, AppState};
 use axum::extract::{Path, Query, State};
 use axum::http::{header, StatusCode};
 use axum::response::Response;
-use iptv_core::verify_play_url;
+use iptv_core::{
+    all_ips_public, check_url_allowed, ips_overlap, resolve_host_ips, test_allow_private_upstreams,
+    verify_play_url,
+};
 use serde::Deserialize;
 use std::sync::Arc;
 
@@ -123,16 +126,13 @@ pub async fn proxy_manifest(
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
         .user_agent(format!("Muse-IPTV/{}", iptv_core::VERSION))
-        // M3：重定向最多跟 3 跳。
-        .redirect(reqwest::redirect::Policy::limited(3))
+        // M17①②：重定向不交给客户端自动跟（Policy::limited 只限跳数，
+        // 302 跳到内网仍会被跟进）；`fetch_checked` 手动跟，每跳先
+        // `check_url_allowed`（DB 里的上游 URL 也要验，M17②）。
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(ApiError::from)?;
-    let resp = client.get(&upstream).send().await.map_err(|_| {
-        ApiError::new(
-            iptv_dto::ErrorCode::SourceUnavailable,
-            "upstream fetch failed",
-        )
-    })?;
+    let resp = fetch_checked(&client, &upstream).await?;
     // M4：流式读、边读边累计上限（20 MB），超限立即断流，不先整包进内存。
     let bytes = read_capped(resp, MANIFEST_MAX_BYTES).await?;
     let body = String::from_utf8_lossy(&bytes).into_owned();
@@ -149,6 +149,46 @@ pub async fn proxy_manifest(
 
 /// 上游清单单响应上限（M4）。清单本身很小，20 MB 是安全兜底。
 const MANIFEST_MAX_BYTES: usize = 20 * 1024 * 1024;
+
+/// 带逐跳 SSRF 校验的 GET（M17①②）：每跳先 `check_url_allowed`
+///（仅 http/https、DNS 解析后逐 IP 校验），再发请求；3xx 带 Location
+/// 时解析相对地址后继续，最多跟 3 跳。无 Location 的 3xx 直接返回响应。
+async fn fetch_checked(client: &reqwest::Client, url: &str) -> Result<reqwest::Response, ApiError> {
+    let mut current = url.to_string();
+    for _ in 0..=3 {
+        check_url_allowed(&current).await.map_err(|_| {
+            ApiError::new(iptv_dto::ErrorCode::Forbidden, "upstream url not allowed")
+        })?;
+        let resp = client.get(&current).send().await.map_err(|_| {
+            ApiError::new(
+                iptv_dto::ErrorCode::SourceUnavailable,
+                "upstream fetch failed",
+            )
+        })?;
+        if resp.status().is_redirection() {
+            let Some(loc) = resp
+                .headers()
+                .get(header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string())
+            else {
+                return Ok(resp);
+            };
+            let base = reqwest::Url::parse(&current).map_err(|_| {
+                ApiError::new(iptv_dto::ErrorCode::SourceUnavailable, "bad upstream url")
+            })?;
+            current = base.join(&loc).map(|u| u.to_string()).map_err(|_| {
+                ApiError::new(iptv_dto::ErrorCode::SourceUnavailable, "bad redirect url")
+            })?;
+            continue;
+        }
+        return Ok(resp);
+    }
+    Err(ApiError::new(
+        iptv_dto::ErrorCode::SourceUnavailable,
+        "too many redirects",
+    ))
+}
 
 /// 流式读响应体，累计超 `limit` 立即报错中断，不继续消费上游。
 async fn read_capped(resp: reqwest::Response, limit: usize) -> Result<Vec<u8>, ApiError> {
@@ -253,39 +293,26 @@ pub async fn proxy_segment(
         sig: q.sig.clone(),
     };
     verify(&state, session.channel_id, &pq)?;
-    // SSRF 校验（§13）：目标 host、scheme、端口必须与频道主地址一致
-    //（只比 host 时，http↔https 或非标端口可绕过；重定向另由客户端限 3 跳）。
+    // SSRF 校验（§13/M17③）：目标 host、scheme、端口必须与频道主地址
+    // 一致（只比 host 时，http↔https 或非标端口可绕过）；再把 host 解析
+    // 成 IP 比对（见 `check_segment_target`），只比字符串会被 DNS 重绑定
+    // 绕过（同一主机名在清单拉取时解析到公网、拉分片时解析到内网）。
     let upstream = primary_url(&state, session.channel_id).await?;
     let upstream_url = reqwest::Url::parse(&upstream)
         .map_err(|_| ApiError::new(iptv_dto::ErrorCode::SourceUnavailable, "bad upstream url"))?;
     let target = reqwest::Url::parse(&q.u)
         .map_err(|_| ApiError::new(iptv_dto::ErrorCode::BadRequest, "bad segment url"))?;
-    if target.host_str() != upstream_url.host_str()
-        || target.scheme() != upstream_url.scheme()
-        || target.port_or_known_default() != upstream_url.port_or_known_default()
-    {
-        return Err(ApiError::new(
-            iptv_dto::ErrorCode::Forbidden,
-            "segment host not allowed",
-        ));
-    }
+    check_segment_target(&upstream_url, &target).await?;
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .user_agent(format!("Muse-IPTV/{}", iptv_core::VERSION))
-        // M3：重定向最多跟 3 跳。
-        .redirect(reqwest::redirect::Policy::limited(3))
+        // M17①：重定向不交给客户端自动跟，`fetch_segment_checked` 手动跟，
+        // 每跳都重做 `check_segment_target`。
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(ApiError::from)?;
-    let mut req = client.get(target);
-    if let Some(range) = headers.get(header::RANGE) {
-        req = req.header(header::RANGE, range.clone());
-    }
-    let resp = req.send().await.map_err(|_| {
-        ApiError::new(
-            iptv_dto::ErrorCode::SourceUnavailable,
-            "upstream fetch failed",
-        )
-    })?;
+    let range = headers.get(header::RANGE).cloned();
+    let resp = fetch_segment_checked(&client, &upstream_url, target, range).await?;
     let status = resp.status();
     let content_type = resp.headers().get(header::CONTENT_TYPE).cloned();
     let content_length = resp.headers().get(header::CONTENT_LENGTH).cloned();
@@ -301,4 +328,95 @@ pub async fn proxy_segment(
         builder = builder.header(header::CONTENT_LENGTH, v);
     }
     Ok(builder.body(axum::body::Body::from_stream(stream)).unwrap())
+}
+
+/// 分片目标校验（M17③）：字符串层 host/scheme/端口须与频道主地址一致；
+/// 再把 host 解析成 IP 比对——只比字符串时，同一主机名可在清单拉取与
+/// 分片拉取之间被 DNS 重绑定到内网地址（如 169.254.169.254）。
+/// IP 层两条硬规则：① 目标解析出的任一 IP 落在禁段即拒绝（DNS 解析
+/// 失败也按拒绝处理，不按放行）；② 两侧都只解析出一个 IP 时要求严格
+/// 相等（同一主机名单 IP 场景，改解析即拦）。多 IP 场景（CDN 轮询、
+/// 两次解析返回的子集不同）只执行规则 ①，避免误杀正常轮询。
+async fn check_segment_target(
+    upstream: &reqwest::Url,
+    target: &reqwest::Url,
+) -> Result<(), ApiError> {
+    let forbidden = || ApiError::new(iptv_dto::ErrorCode::Forbidden, "segment host not allowed");
+    if target.host_str() != upstream.host_str()
+        || target.scheme() != upstream.scheme()
+        || target.port_or_known_default() != upstream.port_or_known_default()
+    {
+        return Err(forbidden());
+    }
+    let Some(target_host) = target.host_str() else {
+        return Err(forbidden());
+    };
+    let Some(upstream_host) = upstream.host_str() else {
+        return Err(forbidden());
+    };
+    // 冒烟开关打开时跳过 IP 层两条硬规则（字符串层 host/scheme/端口
+    // 一致性仍保留）：本地 stub 走 127.0.0.1，否则分片永远 403。
+    if test_allow_private_upstreams() {
+        return Ok(());
+    }
+    let target_port = target.port_or_known_default().unwrap_or(443);
+    let upstream_port = upstream.port_or_known_default().unwrap_or(443);
+    let target_ips = resolve_host_ips(target_host, target_port)
+        .await
+        .map_err(|_| forbidden())?;
+    if !all_ips_public(&target_ips) {
+        return Err(forbidden());
+    }
+    let upstream_ips = resolve_host_ips(upstream_host, upstream_port)
+        .await
+        .map_err(|_| forbidden())?;
+    if target_ips.len() == 1 && upstream_ips.len() == 1 && !ips_overlap(&target_ips, &upstream_ips)
+    {
+        return Err(forbidden());
+    }
+    Ok(())
+}
+
+/// 带逐跳分片校验的 GET（M17①）：每跳都重做 `check_segment_target`
+/// 再发请求（Range 头透传）；3xx 带 Location 时解析相对地址后继续，
+/// 最多跟 3 跳。无 Location 的 3xx 直接返回响应。
+async fn fetch_segment_checked(
+    client: &reqwest::Client,
+    upstream: &reqwest::Url,
+    target: reqwest::Url,
+    range: Option<header::HeaderValue>,
+) -> Result<reqwest::Response, ApiError> {
+    let mut current = target;
+    for _ in 0..=3 {
+        check_segment_target(upstream, &current).await?;
+        let mut req = client.get(current.clone());
+        if let Some(range) = &range {
+            req = req.header(header::RANGE, range.clone());
+        }
+        let resp = req.send().await.map_err(|_| {
+            ApiError::new(
+                iptv_dto::ErrorCode::SourceUnavailable,
+                "upstream fetch failed",
+            )
+        })?;
+        if resp.status().is_redirection() {
+            let Some(loc) = resp
+                .headers()
+                .get(header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string())
+            else {
+                return Ok(resp);
+            };
+            current = current.join(&loc).map_err(|_| {
+                ApiError::new(iptv_dto::ErrorCode::SourceUnavailable, "bad redirect url")
+            })?;
+            continue;
+        }
+        return Ok(resp);
+    }
+    Err(ApiError::new(
+        iptv_dto::ErrorCode::SourceUnavailable,
+        "too many redirects",
+    ))
 }

@@ -58,6 +58,8 @@ pub enum ErrorCode {
     /// §6.4：Token 已停用或过期
     TokenDisabledOrExpired = 40302,
     NotFound = 40401,
+    /// M10：唯一约束冲突（重名/已存在），如建管理员/频道/套餐/分组重名。
+    Conflict = 40900,
     /// §6.4：并发已达上限
     ConcurrentLimitReached = 42901,
     /// §6.4：绑定设备数已达上限
@@ -84,6 +86,7 @@ impl ErrorCode {
             | ErrorCode::ChannelForbidden
             | ErrorCode::TokenDisabledOrExpired => 403,
             ErrorCode::NotFound => 404,
+            ErrorCode::Conflict => 409,
             ErrorCode::ConcurrentLimitReached
             | ErrorCode::DeviceLimitReached
             | ErrorCode::RateLimited => 429,
@@ -140,6 +143,7 @@ pub struct AppUser {
     pub plan_id: Option<i64>,
     pub status: UserStatus,
     pub locale: String,
+    pub theme: String,
     pub remark: Option<String>,
     pub expires_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
@@ -165,6 +169,7 @@ pub struct UpdateUserRequest {
     pub plan_id: Option<i64>,
     pub status: Option<UserStatus>,
     pub locale: Option<String>,
+    pub theme: Option<String>,
     pub remark: Option<String>,
     pub expires_at: Option<DateTime<Utc>>,
 }
@@ -191,6 +196,18 @@ pub struct CreatePlanRequest {
     pub channel_groups: Vec<String>,
     pub duration_days: i32,
     pub price_cents: i64,
+    pub currency: Option<String>,
+}
+
+/// M19d：套餐 PATCH——只改提供的字段。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UpdatePlanRequest {
+    pub name: Option<String>,
+    pub max_concurrent_sessions: Option<i32>,
+    pub max_bound_devices: Option<i32>,
+    pub channel_groups: Option<Vec<String>>,
+    pub duration_days: Option<i32>,
+    pub price_cents: Option<i64>,
     pub currency: Option<String>,
 }
 
@@ -381,6 +398,15 @@ pub struct CreateGroupRequest {
     pub is_default: Option<bool>,
 }
 
+/// M19e：分组 PATCH——只改提供的字段。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UpdateGroupRequest {
+    pub name: Option<String>,
+    pub sort_weight: Option<i32>,
+    pub icon: Option<String>,
+    pub is_default: Option<bool>,
+}
+
 /// 订阅源（§7.4 全部配置项）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -410,6 +436,19 @@ pub struct PlaylistSource {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateSourceRequest {
     pub name: String,
+    pub url: Option<String>,
+    pub sync_interval_sec: Option<i64>,
+    pub http_headers: Option<serde_json::Value>,
+    pub epg_url: Option<String>,
+    pub on_missing: Option<OnMissing>,
+    pub auto_enable_new: Option<bool>,
+    pub enabled: Option<bool>,
+}
+
+/// M19c：订阅源 PATCH——只改提供的字段（其余保持原值，先读后写）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UpdateSourceRequest {
+    pub name: Option<String>,
     pub url: Option<String>,
     pub sync_interval_sec: Option<i64>,
     pub http_headers: Option<serde_json::Value>,
@@ -464,6 +503,13 @@ pub struct EpgSource {
     pub last_status: Option<String>,
 }
 
+/// M19f：EPG 源 PATCH——只改提供的字段。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UpdateEpgSourceRequest {
+    pub name: Option<String>,
+    pub url: Option<String>,
+}
+
 // ---------------------------------------------------------------------------
 // §4：门户会话、设备、播放
 // ---------------------------------------------------------------------------
@@ -510,6 +556,7 @@ pub struct MeUser {
     pub id: i64,
     pub display_name: String,
     pub locale: String,
+    pub theme: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

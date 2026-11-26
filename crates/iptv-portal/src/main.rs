@@ -46,6 +46,7 @@ async fn main() {
         .route("/healthz", get(|| async { "ok" }))
         .route("/login", post(login))
         .route("/logout", post(logout))
+        .route("/logout-all", post(logout_all))
         .route("/locale", post(set_locale))
         .route("/me/devices/{session_id}/kick", post(kick_device))
         .route("/me/settings", post(save_settings))
@@ -214,6 +215,21 @@ async fn login(headers: HeaderMap, Form(form): Form<LoginForm>) -> (HeaderMap, R
 async fn logout(headers: HeaderMap) -> (HeaderMap, Redirect) {
     let sid = portal_sid(&headers);
     let _ = backend_post("/api/v1/auth/logout", serde_json::json!({}), sid.as_deref()).await;
+    redirect_with_cookies(
+        "/",
+        &["iptv_portal_sid=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0".to_string()],
+    )
+}
+
+/// POST /logout-all（M14）：调后端吊销该 Token 全部会话（含当前），并清除 Cookie。
+async fn logout_all(headers: HeaderMap) -> (HeaderMap, Redirect) {
+    let sid = portal_sid(&headers);
+    let _ = backend_post(
+        "/api/v1/auth/logout-all",
+        serde_json::json!({}),
+        sid.as_deref(),
+    )
+    .await;
     redirect_with_cookies(
         "/",
         &["iptv_portal_sid=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0".to_string()],

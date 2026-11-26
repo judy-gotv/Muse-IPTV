@@ -6,10 +6,9 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
 
 [dependencies]
-iptv-core = { path = "../iptv-core" }
-iptv-dto = { path = "../iptv-dto" }
 redis = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }

@@ -256,17 +256,50 @@ mod tests {
 
     #[test]
     fn all_locales_have_all_keys() {
+        // M11：全量断言——以 zh-Hant-TW 的 4 个 FTL 文件为 key 全集，要求
+        // 每个 key 在全部 5 种语言 + en-XA 中都存在（此前只抽查 5 个 key，
+        // 49 个缺 key 全部漏网）。解析规则与 xtask i18n-check 一致：
+        // 行首 `key = value` 为新 key，缩进续行归属上一个 key。
+        let files = [
+            include_str!("../../../locales/zh-Hant-TW/common.ftl"),
+            include_str!("../../../locales/zh-Hant-TW/portal.ftl"),
+            include_str!("../../../locales/zh-Hant-TW/admin.ftl"),
+            include_str!("../../../locales/zh-Hant-TW/errors.ftl"),
+        ];
+        let mut keys: Vec<String> = Vec::new();
+        for src in files {
+            for line in src.lines() {
+                if line.starts_with(|c: char| c.is_whitespace())
+                    || line.trim().is_empty()
+                    || line.trim_start().starts_with('#')
+                {
+                    continue;
+                }
+                if let Some((k, _)) = line.split_once('=') {
+                    let k = k.trim();
+                    if !k.is_empty()
+                        && k.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+                        && k.chars()
+                            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+                    {
+                        // FTL key 用横线，代码 key 用点：`admin-dashboard` →
+                        // `admin.dashboard`（与 `I18n::t` 的点转横线规则互逆）。
+                        keys.push(k.replacen('-', ".", 1));
+                    }
+                }
+            }
+        }
+        // M11 补齐时共 104 个 key；只增不减——后续补 key 只会让总数变大。
+        assert!(
+            keys.len() >= 104,
+            "FTL key 总数异常：{}（预期 ≥ 104）",
+            keys.len()
+        );
         let i18n = I18n::new();
-        for loc in SUPPORTED_LOCALES {
-            for key in [
-                "common.app-name",
-                "portal.quota-exhausted",
-                "admin.dashboard",
-                "errors.e42901",
-                "errors.e40101",
-            ] {
+        for loc in SUPPORTED_LOCALES.iter().chain(std::iter::once(&"en-XA")) {
+            for key in &keys {
                 let v = i18n.t_simple(loc, key);
-                assert_ne!(v, key, "missing {key} in {loc}");
+                assert_ne!(v, key.as_str(), "missing {key} in {loc}");
             }
         }
     }

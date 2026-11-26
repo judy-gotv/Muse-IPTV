@@ -8,6 +8,7 @@ errors-e40300 = Forbidden
 errors-e40301 = No permission for this channel
 errors-e40302 = Token disabled or expired
 errors-e40401 = Not found
+errors-e40900 = Resource already exists; the name is already taken
 errors-e42901 = Concurrent stream limit reached. Stop another device and try again.
 errors-e42902 = Bound device limit reached
 errors-e42903 = Too many requests, please try again later

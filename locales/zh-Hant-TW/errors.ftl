@@ -8,6 +8,7 @@ errors-e40300 = 沒有權限
 errors-e40301 = 沒有該頻道的權限
 errors-e40302 = Token 已停用或過期
 errors-e40401 = 找不到該資料
+errors-e40900 = 資源已存在，名稱已被佔用
 errors-e42901 = 並發已達上限，請先下線其他裝置
 errors-e42902 = 綁定裝置數已達上限
 errors-e42903 = 請求過於頻繁，請稍後再試

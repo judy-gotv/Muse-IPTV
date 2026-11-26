@@ -107,4 +107,115 @@ impl Store {
         }
         Ok(out)
     }
+
+    pub async fn get_group(&self, id: i64) -> anyhow::Result<Option<ChannelGroup>> {
+        let row = sqlx::query(&ph(
+            &format!("SELECT {GROUP_COLS} FROM channel_group WHERE id = ?"),
+            self.dialect,
+        ))
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|r| row_to_group(&r)).transpose()
+    }
+
+    /// M19d：只更新请求里提供的字段（先读后写）。
+    pub async fn update_plan(
+        &self,
+        id: i64,
+        req: &UpdatePlanRequest,
+    ) -> anyhow::Result<Option<Plan>> {
+        let Some(cur) = self.get_plan(id).await? else {
+            return Ok(None);
+        };
+        let name = req.name.clone().unwrap_or(cur.name);
+        let max_sessions = req
+            .max_concurrent_sessions
+            .unwrap_or(cur.max_concurrent_sessions);
+        let max_devices = req.max_bound_devices.unwrap_or(cur.max_bound_devices);
+        let groups = req.channel_groups.clone().unwrap_or(cur.channel_groups);
+        let duration = req.duration_days.unwrap_or(cur.duration_days);
+        let price = req.price_cents.unwrap_or(cur.price_cents);
+        let currency = req.currency.clone().unwrap_or(cur.currency);
+        sqlx::query(
+            &ph("UPDATE plan SET name = ?, max_concurrent_sessions = ?, max_bound_devices = ?, channel_groups = ?, duration_days = ?, price_cents = ?, currency = ? WHERE id = ?", self.dialect),
+        )
+        .bind(name)
+        .bind(i64::from(max_sessions))
+        .bind(i64::from(max_devices))
+        .bind(json_text(&serde_json::json!(groups)))
+        .bind(i64::from(duration))
+        .bind(price)
+        .bind(currency)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        self.get_plan(id).await
+    }
+
+    /// M19d：删套餐前由 handler 查引用；此处只删行。
+    pub async fn delete_plan(&self, id: i64) -> anyhow::Result<bool> {
+        let n = sqlx::query(&ph("DELETE FROM plan WHERE id = ?", self.dialect))
+            .bind(id)
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+        Ok(n > 0)
+    }
+
+    /// M19d：有多少用户正用该套餐（删前拒绝的依据）。
+    pub async fn count_users_with_plan(&self, plan_id: i64) -> anyhow::Result<i64> {
+        let n: i64 = sqlx::query_scalar(&ph(
+            "SELECT COUNT(*) FROM app_user WHERE plan_id = ?",
+            self.dialect,
+        ))
+        .bind(plan_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(n)
+    }
+
+    /// M19e：只更新请求里提供的字段（先读后写）。
+    pub async fn update_group(
+        &self,
+        id: i64,
+        req: &UpdateGroupRequest,
+    ) -> anyhow::Result<Option<ChannelGroup>> {
+        let Some(cur) = self.get_group(id).await? else {
+            return Ok(None);
+        };
+        let name = req.name.clone().unwrap_or(cur.name);
+        let sort_weight = req.sort_weight.unwrap_or(cur.sort_weight);
+        let icon = req.icon.clone().or(cur.icon);
+        let is_default = req.is_default.unwrap_or(cur.is_default);
+        sqlx::query(
+            &ph("UPDATE channel_group SET name = ?, sort_weight = ?, icon = ?, is_default = ? WHERE id = ?", self.dialect),
+        )
+        .bind(name)
+        .bind(i64::from(sort_weight))
+        .bind(icon)
+        .bind(i64::from(is_default))
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        self.get_group(id).await
+    }
+
+    /// M19e：删分组——先清 `channel_group_map` 里的映射（频道本身保留，
+    /// 只是不再属于该分组），再删分组行。
+    pub async fn delete_group(&self, id: i64) -> anyhow::Result<bool> {
+        sqlx::query(&ph(
+            "DELETE FROM channel_group_map WHERE group_id = ?",
+            self.dialect,
+        ))
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        let n = sqlx::query(&ph("DELETE FROM channel_group WHERE id = ?", self.dialect))
+            .bind(id)
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+        Ok(n > 0)
+    }
 }

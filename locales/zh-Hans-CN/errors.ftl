@@ -8,6 +8,7 @@ errors-e40300 = 没有权限
 errors-e40301 = 没有该频道的权限
 errors-e40302 = Token 已停用或过期
 errors-e40401 = 找不到该数据
+errors-e40900 = 资源已存在，名称已被占用
 errors-e42901 = 并发已达上限，请先下线其他设备
 errors-e42902 = 绑定设备数已达上限
 errors-e42903 = 请求过于频繁，请稍后再试

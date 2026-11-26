@@ -66,6 +66,58 @@ impl Store {
         Ok(out)
     }
 
+    pub async fn get_epg_source(&self, id: i64) -> anyhow::Result<Option<EpgSource>> {
+        let row = sqlx::query(&ph(
+            &format!("SELECT {EPG_SOURCE_COLS} FROM epg_source WHERE id = ?"),
+            self.dialect,
+        ))
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|r| row_to_epg_source(&r)).transpose()
+    }
+
+    /// M19f：只更新请求里提供的字段（先读后写）。
+    pub async fn update_epg_source(
+        &self,
+        id: i64,
+        req: &UpdateEpgSourceRequest,
+    ) -> anyhow::Result<Option<EpgSource>> {
+        let Some(cur) = self.get_epg_source(id).await? else {
+            return Ok(None);
+        };
+        let name = req.name.clone().unwrap_or(cur.name);
+        let url = req.url.clone().unwrap_or(cur.url);
+        sqlx::query(&ph(
+            "UPDATE epg_source SET name = ?, url = ? WHERE id = ?",
+            self.dialect,
+        ))
+        .bind(name)
+        .bind(url)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        self.get_epg_source(id).await
+    }
+
+    /// M19f：删 EPG 源——先清 `epg_channel_map` 里的节目映射（已生成的
+    /// `epg_program` 节目行保留），再删源行。
+    pub async fn delete_epg_source(&self, id: i64) -> anyhow::Result<bool> {
+        sqlx::query(&ph(
+            "DELETE FROM epg_channel_map WHERE epg_source_id = ?",
+            self.dialect,
+        ))
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        let n = sqlx::query(&ph("DELETE FROM epg_source WHERE id = ?", self.dialect))
+            .bind(id)
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+        Ok(n > 0)
+    }
+
     /// 按 (channel_id, start_at) 去重后写入：先删同键旧节目再插新节目。
     /// 返回实际写入条数。
     pub async fn upsert_epg_programs(&self, items: Vec<EpgProgramInput>) -> anyhow::Result<u64> {

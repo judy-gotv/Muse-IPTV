@@ -87,6 +87,7 @@ pub async fn get_me(State(state): State<Arc<AppState>>, auth: PortalAuth) -> Api
             id: user.id,
             display_name: user.display_name,
             locale: user.locale,
+            theme: user.theme,
         },
         token: MeToken {
             id: token.id,
@@ -248,11 +249,16 @@ pub async fn patch_settings(
     Json(req): Json<MeSettingsPatch>,
 ) -> ApiResult<serde_json::Value> {
     let token = load_token(&state, &auth).await?;
-    if req.display_name.is_some() || req.locale.is_some() {
+    if req.display_name.is_some() || req.locale.is_some() || req.theme.is_some() {
         let locale = req
             .locale
             .clone()
             .filter(|l| iptv_i18n::normalize_locale(l).is_some());
+        // 主题只接受 system/light/dark 三档（m17：非法值忽略，不写库）。
+        let theme = req
+            .theme
+            .clone()
+            .filter(|t| matches!(t.as_str(), "system" | "light" | "dark"));
         state
             .store
             .update_user(
@@ -264,6 +270,7 @@ pub async fn patch_settings(
                     plan_id: None,
                     status: None,
                     locale,
+                    theme,
                     remark: None,
                     expires_at: None,
                 },
@@ -272,6 +279,5 @@ pub async fn patch_settings(
             .map_err(ApiError::from)?;
     }
     let _ = headers;
-    let _ = req.theme;
     ok(serde_json::json!({ "updated": true }))
 }

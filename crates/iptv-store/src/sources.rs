@@ -100,6 +100,70 @@ impl Store {
         Ok(out)
     }
 
+    /// M19c：只更新请求里提供的字段（先读后写）；同步周期与创建时一致，
+    /// 最小 300 秒。
+    pub async fn update_source(
+        &self,
+        id: i64,
+        req: &UpdateSourceRequest,
+    ) -> anyhow::Result<Option<PlaylistSource>> {
+        let Some(cur) = self.get_source(id).await? else {
+            return Ok(None);
+        };
+        let now = Utc::now();
+        let name = req.name.clone().unwrap_or(cur.name);
+        let url = req.url.clone().or(cur.url);
+        let interval = req
+            .sync_interval_sec
+            .unwrap_or(cur.sync_interval_sec)
+            .max(300);
+        let http_headers = req.http_headers.clone().unwrap_or(cur.http_headers);
+        let epg_url = req.epg_url.clone().or(cur.epg_url);
+        let on_missing = req.on_missing.clone().unwrap_or(cur.on_missing);
+        let auto_enable_new = req.auto_enable_new.unwrap_or(cur.auto_enable_new);
+        let enabled = req.enabled.unwrap_or(cur.enabled);
+        sqlx::query(
+            &ph("UPDATE playlist_source SET name = ?, url = ?, sync_interval_sec = ?, http_headers = ?, epg_url = ?, on_missing = ?, auto_enable_new = ?, enabled = ?, updated_at = ? WHERE id = ?", self.dialect),
+        )
+        .bind(name)
+        .bind(url)
+        .bind(interval)
+        .bind(json_text(&http_headers))
+        .bind(epg_url)
+        .bind(match on_missing {
+            OnMissing::Disable => "disable",
+            OnMissing::Delete => "delete",
+        })
+        .bind(i64::from(auto_enable_new))
+        .bind(i64::from(enabled))
+        .bind(epoch(now))
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        self.get_source(id).await
+    }
+
+    /// M19c：删订阅源——先清其同步日志（已删源的日志无处展示），再删源行；
+    /// 该源同步出的频道保留（内容独立存在，删源不等同删台）。
+    pub async fn delete_source(&self, id: i64) -> anyhow::Result<bool> {
+        sqlx::query(&ph(
+            "DELETE FROM sync_log WHERE source_id = ?",
+            self.dialect,
+        ))
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        let n = sqlx::query(&ph(
+            "DELETE FROM playlist_source WHERE id = ?",
+            self.dialect,
+        ))
+        .bind(id)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        Ok(n > 0)
+    }
+
     pub async fn update_source_sync(
         &self,
         id: i64,
@@ -185,6 +249,32 @@ impl Store {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// 最近连续失败次数（M18）：按 `sync_log` 从新到旧数 `failed` 行，
+    /// 遇到 `ok` 即中断；`running` 行跳过不中断——认领失败会留下一条
+    /// 永不完结的 `running` 行（`sync_source` 先建 log 后认领），
+    /// 崩溃中途的 `running` 行也不应把已计失败清零。
+    /// 成功后 `sync_log` 里最新行是 `ok`，故重启后恢复为 0，与
+    /// `record_success` 清内存计数的语义一致。最多回溯 128 行。
+    pub async fn consecutive_sync_failures(&self, source_id: i64) -> anyhow::Result<u32> {
+        let rows = sqlx::query(&ph(
+            "SELECT status FROM sync_log WHERE source_id = ? ORDER BY started_at DESC, id DESC LIMIT ?",
+            self.dialect,
+        ))
+        .bind(source_id)
+        .bind(128i64)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut n = 0u32;
+        for r in &rows {
+            match r_string(r, "status")?.as_str() {
+                "failed" => n += 1,
+                "ok" => break,
+                _ => continue,
+            }
+        }
+        Ok(n)
     }
 
     pub async fn list_sync_logs(

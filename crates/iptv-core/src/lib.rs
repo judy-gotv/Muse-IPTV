@@ -8,6 +8,7 @@ pub mod error;
 pub mod normalize;
 pub mod play_url;
 pub mod policy;
+pub mod ssrf;
 pub mod token;
 
 pub use error::CoreError;
@@ -15,6 +16,10 @@ pub use iptv_dto::*;
 pub use normalize::{content_hash, normalize_play_url, strip_tracking_params};
 pub use play_url::{sign_play_url, verify_play_url};
 pub use policy::{authorize_channel, PlaybackDecision};
+pub use ssrf::{
+    all_ips_public, check_url_allowed, ip_is_blocked, ips_overlap, is_private_host,
+    resolve_host_ips, test_allow_private_upstreams,
+};
 pub use token::{
     generate_session_value, generate_ticket, generate_token, hash_token, token_prefix,
 };

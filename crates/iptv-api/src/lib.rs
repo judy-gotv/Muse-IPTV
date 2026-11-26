@@ -27,6 +27,7 @@ use std::sync::Arc;
 // 错误类型：业务层只抛错误码 + 参数（§12.5），这里统一序列化。
 // ---------------------------------------------------------------------------
 
+#[derive(Debug)]
 pub struct ApiError {
     pub code: ErrorCode,
     pub message: String,
@@ -73,6 +74,10 @@ impl ApiError {
 
 impl From<anyhow::Error> for ApiError {
     fn from(e: anyhow::Error) -> Self {
+        // M10：store 层唯一约束冲突（重名）不再是 500，映射为 40900。
+        if iptv_store::is_unique_violation_error(&e) {
+            return Self::new(ErrorCode::Conflict, "resource already exists");
+        }
         Self::new(ErrorCode::Internal, e.to_string())
     }
 }
@@ -197,6 +202,13 @@ pub fn client_ip(headers: &HeaderMap, peer: Option<std::net::SocketAddr>) -> Opt
 /// `token-login:{prefix}:{ip}`），避免三类登录共用一个 "unknown" 桶。
 pub fn check_login_limit(state: &AppState, ip: &str, key: &str) -> bool {
     state.login_ip_limiter.check(&format!("ip:{ip}")) && state.login_limiter.check(key)
+}
+
+/// m25：成功登录后重置该复合 key 的计数——成功登录不占限流桶。
+/// 只重置复合 key（`login_limiter`），按 IP 聚合的桶（`login_ip_limiter`）
+/// 不动：同一 IP 多账号轮换刷登录仍受 30 次/分钟聚合桶约束。
+pub fn reset_login_limit(state: &AppState, key: &str) {
+    state.login_limiter.reset(key);
 }
 
 /// m1 CSRF Origin 校验（§13）：浏览器写请求（POST/PUT/PATCH/DELETE）
@@ -539,6 +551,7 @@ impl AppState {
             )
             .route("/auth/token-login", post(handlers::auth::token_login))
             .route("/auth/logout", post(handlers::auth::logout))
+            .route("/auth/logout-all", post(handlers::auth::logout_all))
             // §4.5 我的资料
             .route("/me", get(handlers::me::get_me))
             .route("/me/usage", get(handlers::me::get_usage))
@@ -574,13 +587,18 @@ impl AppState {
             )
             .route(
                 "/admin/users/{id}",
-                get(handlers::admin::get_user).patch(handlers::admin::update_user),
+                get(handlers::admin::get_user)
+                    .patch(handlers::admin::update_user)
+                    .delete(handlers::admin::delete_user),
             )
             .route(
                 "/admin/tokens",
                 get(handlers::admin::list_tokens).post(handlers::admin::create_token),
             )
-            .route("/admin/tokens/{id}", patch(handlers::admin::update_token))
+            .route(
+                "/admin/tokens/{id}",
+                patch(handlers::admin::update_token).delete(handlers::admin::delete_token),
+            )
             .route(
                 "/admin/tokens/{id}/login-ticket",
                 post(handlers::admin::create_login_ticket),
@@ -600,6 +618,10 @@ impl AppState {
             .route(
                 "/admin/sources",
                 get(handlers::admin::list_sources).post(handlers::admin::create_source),
+            )
+            .route(
+                "/admin/sources/{id}",
+                patch(handlers::admin::update_source).delete(handlers::admin::delete_source),
             )
             // 上传不限大小（用户 2026-11-25 亲口批准，与 §7.1 的 20 MB 相悖）：
             // 只对本路由取消 axum 默认 2 MB 体限；handler 内流式落盘+逐行
@@ -625,8 +647,17 @@ impl AppState {
                 get(handlers::admin::list_groups).post(handlers::admin::create_group),
             )
             .route(
+                "/admin/groups/{id}",
+                patch(handlers::admin::update_group).delete(handlers::admin::delete_group),
+            )
+            .route(
                 "/admin/epg/sources",
                 get(handlers::admin::list_epg_sources).post(handlers::admin::create_epg_source),
+            )
+            .route(
+                "/admin/epg/sources/{id}",
+                patch(handlers::admin::update_epg_source)
+                    .delete(handlers::admin::delete_epg_source),
             )
             .route("/admin/sessions", get(handlers::admin::list_sessions))
             .route(
@@ -636,6 +667,10 @@ impl AppState {
             .route(
                 "/admin/plans",
                 get(handlers::admin::list_plans).post(handlers::admin::create_plan),
+            )
+            .route(
+                "/admin/plans/{id}",
+                patch(handlers::admin::update_plan).delete(handlers::admin::delete_plan),
             )
             .route(
                 "/admin/admins",
