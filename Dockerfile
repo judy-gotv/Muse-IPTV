@@ -26,6 +26,17 @@ COPY migrations ./migrations
 # 的 wasm-bindgen 0.2.130 一致），编出来的二进制链接本机 glibc 2.36，
 # 不再碰预编译包。代价：构建变慢，arm64 在 QEMU 下从源码编译更慢。
 # 不用 --locked：wasm-bindgen-cli 发布包里没有 Cargo.lock，--locked 会报错。
+# B6（2026-11-27，v0.1.4 Docker(main) #28 定位）：cargo-leptos 在 release 构建
+# 后对每个前端包跑 wasm-opt（front.rs:314，`if proj.release`），而 Exe::get
+# 优先用 PATH 上的 wasm-opt（which），找不到才下载 Binaryen 预编译包。
+# amd64 能下到 version_123 的 x86_64 包，arm64（QEMU 下）在下载 version_123
+# 的 aarch64 包（binaryen-version_123-aarch64-linux.tar.gz，96MB，资产本身
+# 存在）时失败，exit 1，构建在 Dockerfile:29 第一个 cargo leptos build 即
+# 红，根本没到推送阶段；与并发推送/manifest 冲突无关。修法同 B5：构建器里
+# apt 装 binaryen（bookworm 自带 wasm-opt，-Oz 等优化参数版本无关），让
+# cargo-leptos 直接用 PATH 上的 wasm-opt，不再下载。
+RUN apt-get update && apt-get install -y --no-install-recommends binaryen \
+    && rm -rf /var/lib/apt/lists/* && wasm-opt --version
 RUN rustup target add wasm32-unknown-unknown \
     && cargo install cargo-leptos --version "=0.3.12" --locked \
     && cargo install wasm-bindgen-cli --version "=0.2.130" \
