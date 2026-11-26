@@ -2,7 +2,9 @@
 //!
 //! - Fluent（`.ftl`）资源编译期嵌入：`include_str!` 载入，运行时不读磁盘。
 //! - 判定顺序（§12.2）：用户设置（DB）→ Cookie → `Accept-Language` →
-//!   系统默认 → `zh-Hant-TW`；回退链 `zh-Hant-TW → zh-Hant → zh → en`。
+//!   系统默认 → `zh-Hans-CN`；回退链 `zh-Hans-CN → zh-Hans → zh → en`。
+//! - 默认语言：`zh-Hans-CN`（简体中文）。用户 2026-11-26 决定，覆盖
+//!   文档 §12 的默认 `zh-Hant-TW`，见 README/ACCEPTANCE 偏差说明。
 //! - 日期/数字格式化：`chrono` 按 locale 模式格式化（ICU 等价实现，
 //!   见 README §12 偏差说明；复数走 Fluent 的 select / plural 规则）。
 // 作者: Passwd Word
@@ -13,8 +15,21 @@ use std::collections::HashMap;
 use std::sync::OnceLock;
 use unic_langid::LanguageIdentifier;
 
-pub const DEFAULT_LOCALE: &str = "zh-Hant-TW";
+pub const DEFAULT_LOCALE: &str = "zh-Hans-CN";
 pub const SUPPORTED_LOCALES: &[&str] = &["zh-Hant-TW", "zh-Hans-CN", "en", "ja", "ko"];
+
+/// 语言代码 → 界面显示名称（专有名词，直接写死，不走 i18n key；
+/// 用户 2026-11-26 决定：语言选项显示名称，不显示代码）。
+pub fn locale_display_name(code: &str) -> &'static str {
+    match code {
+        "zh-Hant-TW" => "繁体中文",
+        "zh-Hans-CN" => "简体中文",
+        "en" => "English",
+        "ja" => "日本語",
+        "ko" => "한국어",
+        _ => "English",
+    }
+}
 
 /// 编译期嵌入的语言包（§12.4：容器镜像只含二进制）。
 /// `include_str!` 要求字面量路径，故按 locale 字面量分支。
@@ -257,13 +272,22 @@ mod tests {
     }
 
     #[test]
+    fn locale_display_names() {
+        assert_eq!(locale_display_name("zh-Hant-TW"), "繁体中文");
+        assert_eq!(locale_display_name("zh-Hans-CN"), "简体中文");
+        assert_eq!(locale_display_name("en"), "English");
+        assert_eq!(locale_display_name("ja"), "日本語");
+        assert_eq!(locale_display_name("ko"), "한국어");
+    }
+
+    #[test]
     fn negotiate_order() {
         assert_eq!(I18n::negotiate(Some("ja"), Some("en"), Some("en-US")), "ja");
         assert_eq!(I18n::negotiate(None, Some("ko"), Some("en-US")), "ko");
         assert_eq!(I18n::negotiate(None, None, Some("en-US,en;q=0.9")), "en");
         assert_eq!(I18n::negotiate(None, None, Some("zh-TW")), "zh-Hant-TW");
-        assert_eq!(I18n::negotiate(None, None, None), "zh-Hant-TW");
-        assert_eq!(I18n::negotiate(None, None, Some("fr-FR")), "zh-Hant-TW");
+        assert_eq!(I18n::negotiate(None, None, None), "zh-Hans-CN");
+        assert_eq!(I18n::negotiate(None, None, Some("fr-FR")), "zh-Hans-CN");
     }
 
     #[test]

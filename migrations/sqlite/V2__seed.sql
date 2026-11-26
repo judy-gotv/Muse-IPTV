@@ -9,7 +9,7 @@ INSERT OR IGNORE INTO system_setting (setting_key, setting_value, updated_at) VA
 INSERT OR IGNORE INTO system_setting (setting_key, setting_value, updated_at) VALUES ('play_url_ttl_sec', '300', 0);
 INSERT OR IGNORE INTO system_setting (setting_key, setting_value, updated_at) VALUES ('cdn_domain', '""', 0);
 INSERT OR IGNORE INTO system_setting (setting_key, setting_value, updated_at) VALUES ('alert_threshold_failed_syncs', '3', 0);
-INSERT OR IGNORE INTO system_setting (setting_key, setting_value, updated_at) VALUES ('default_locale', '"zh-Hant-TW"', 0);
+INSERT OR IGNORE INTO system_setting (setting_key, setting_value, updated_at) VALUES ('default_locale', '"zh-Hans-CN"', 0);
 INSERT OR IGNORE INTO system_setting (setting_key, setting_value, updated_at) VALUES ('available_locales', '["zh-Hant-TW", "zh-Hans-CN", "en", "ja", "ko"]', 0);
 INSERT OR IGNORE INTO system_setting (setting_key, setting_value, updated_at) VALUES ('portal_session_ttl_days', '7', 0);
 INSERT OR IGNORE INTO system_setting (setting_key, setting_value, updated_at) VALUES ('remember_device_ttl_days', '90', 0);

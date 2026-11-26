@@ -44,7 +44,7 @@ pub fn default_settings() -> Vec<(String, serde_json::Value)> {
         ("play_url_ttl_sec".into(), serde_json::json!(300)),
         ("cdn_domain".into(), serde_json::json!("")),
         ("alert_threshold_failed_syncs".into(), serde_json::json!(3)),
-        ("default_locale".into(), serde_json::json!("zh-Hant-TW")),
+        ("default_locale".into(), serde_json::json!("zh-Hans-CN")),
         (
             "available_locales".into(),
             serde_json::json!(["zh-Hant-TW", "zh-Hans-CN", "en", "ja", "ko"]),

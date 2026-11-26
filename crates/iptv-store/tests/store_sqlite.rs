@@ -766,3 +766,47 @@ async fn channels_for_token_authorization() {
     assert!(s.list_endpoints(sports.id).await.unwrap().is_empty());
     assert!(!s.delete_channel(sports.id).await.unwrap());
 }
+
+#[tokio::test]
+async fn v5_migration_updates_existing_default_locale() {
+    // V5：线上旧库的 default_locale 是 V2 种子写死的 zh-Hant-TW；
+    // migrate 重跑必须把它改成 zh-Hans-CN，且反复跑结果相同（幂等）。
+    // 注意：migrate() 直接跑 SQL，不清 settings 缓存，故这里用
+    // list_settings()（直读表）断言，不用带缓存的 get_setting()。
+    async fn db_value(s: &Store, key: &str) -> serde_json::Value {
+        s.list_settings()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.key == key)
+            .unwrap()
+            .value
+    }
+    let f = setup().await;
+    let s = &f.store;
+    assert_eq!(
+        db_value(s, "default_locale").await,
+        serde_json::json!("zh-Hans-CN"),
+        "新库种子应为简体中文"
+    );
+    // 模拟线上旧库：改回旧值，再跑一次 migrate。
+    s.set_setting("default_locale", &serde_json::json!("zh-Hant-TW"))
+        .await
+        .unwrap();
+    assert_eq!(
+        db_value(s, "default_locale").await,
+        serde_json::json!("zh-Hant-TW")
+    );
+    s.migrate().await.expect("re-migrate");
+    assert_eq!(
+        db_value(s, "default_locale").await,
+        serde_json::json!("zh-Hans-CN"),
+        "V5 应把旧值改成简体中文"
+    );
+    // 再跑一次：幂等。
+    s.migrate().await.expect("re-migrate again");
+    assert_eq!(
+        db_value(s, "default_locale").await,
+        serde_json::json!("zh-Hans-CN")
+    );
+}

@@ -41,7 +41,7 @@
 | `en-XA` 伪本地化下按钮与列表不溢出 | ✅ | `locales/en-XA/`（变音 + 加长）；组件不写死宽度 |
 | 日期、数字、金额、时长按 locale 正确格式化 | ✅ | `I18n::format_datetime` / `format_number`（chrono 按 locale 模式） |
 | API 错误提示随 `Accept-Language` 本地化，且 `code` 保持不变 | ✅ | `localize_errors_middleware`（4xx/5xx Envelope 的 message 按请求语言替换，code 不动）；系统设置 `default_locale` / `available_locales` 已接入中间件回退链；SQLite 冒烟实测 40302：zh「Token 已停用或過期」/ en「Token disabled or expired」 |
-| 切换语言后刷新页面仍保持所选语言（DB + Cookie 一致） | ✅ | `PATCH /me/settings` 写用户 locale + Cookie；`negotiate` 读 DB → Cookie → Accept-Language；已知限制：门户/后台页面渲染在渲染期同步协商 locale，无 DB 通道，系统设置 `default_locale` 改动后页面回退仍用硬编码默认值（仅 API 错误文案走系统设置），需公开设置接口+前端重构后才完整 |
+| 切换语言后刷新页面仍保持所选语言（DB + Cookie 一致） | ✅ | `PATCH /me/settings` 写用户 locale + Cookie；`negotiate` 读 DB → Cookie → Accept-Language；默认语言 `zh-Hans-CN`（用户 2026-11-26 决定，覆盖文档 §12 的 `zh-Hant-TW`；V5 迁移更新已部署库）；语言选项显示名称（繁体中文/简体中文/English/日本語/한국어），不显示代码；已知限制：门户/后台页面渲染在渲染期同步协商 locale，无 DB 通道，系统设置 `default_locale` 改动后页面回退仍用硬编码默认值（仅 API 错误文案走系统设置），需公开设置接口+前端重构后才完整 |
 
 ## §0–§15 章节对照
 

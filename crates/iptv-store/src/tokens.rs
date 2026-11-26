@@ -55,7 +55,7 @@ impl Store {
             hash.to_vec(),
             &req.name,
             req.device_type.clone(),
-            req.locale.clone().unwrap_or_else(|| "zh-Hant-TW".to_string()),
+            req.locale.clone().unwrap_or_else(|| "zh-Hans-CN".to_string()),
             i64::from(req.max_concurrent_sessions),
             i64::from(req.max_bound_devices),
             "active",

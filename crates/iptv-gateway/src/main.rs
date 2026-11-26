@@ -3,8 +3,12 @@
 //! 对外只暴露一个端口（默认 `:8081`），按路径把请求分发给三个内部服务：
 //! - `/admin` 与 `/admin/*` → 管理后台（后台路由本身就带 `/admin` 前缀，
 //!   转发时**不剥离**，页面内所有链接与 POST 路径原样可用）
-//! - `/api/*`、`/p/*`、`/healthz`、`/metrics` → API
+//! - `/api/v1/*`、`/p/*`、`/healthz`、`/metrics` → API
+//! - 其余 `/api/*`（Leptos server function，`/api/<名><hash>`，无 `/v1/`）：
+//!   带 `iptv_admin_sid` Cookie → 后台，无 → 门户（后台/门户各提供自己
+//!   的 server fn；全送 API 的话 API 不认这些路径，全部 404）
 //! - 其余（`/`、`/t/{ticket}`、`/me`、`/channels`、`/watch/*`、`/design.css`…）→ 门户
+//! - `/favicon.ico` → 网关直接回内嵌小图标（不转发，避免 404）
 //!
 //! 转发是流式的：请求/响应 body 直接透传不缓冲整包，`/p/*` 视频分片与
 //! M3U multipart 上传都能过；`Range` / `Cookie` / `Set-Cookie` 原样透传；
@@ -13,6 +17,10 @@
 //! （伪造首项可绕过按 IP 限流），网关默认**覆盖**为直连对端 IP；只有在
 //! 网关前面还有一层自己可信的反代（nginx/Caddy 已写好 XFF）时，才设
 //! `GATEWAY_TRUST_XFF=1` 改为追加。
+//! 同理网关把入站 `Host` 原样写进 `X-Forwarded-Host` 转发给上游：
+//! reqwest 按上游 URL 重写 Host（127.0.0.1:8080/18081/18082），API 的
+//! CSRF 中间件拿 X-Forwarded-Host 与浏览器 Origin 比对，否则所有带
+//! 会话 Cookie 的写请求都会因 host 失配被 403（v0.1.2 服务器实测 B6）。
 //!
 //! 环境变量：
 //! - `GATEWAY_BIND_ADDR`（默认 `0.0.0.0:8081`）：对外监听地址
@@ -51,20 +59,46 @@ enum Upstream {
     Admin,
 }
 
+/// 请求是否带管理员会话 Cookie（`iptv_admin_sid` 非空）。
+/// Leptos server function 按此分流：后台与门户各提供自己的 server fn，
+/// 网关只凭这一个 Cookie 区分（门户会话 Cookie 是 `iptv_portal_sid`，
+/// 名字不同，不会串）。
+fn has_admin_cookie(headers: &header::HeaderMap) -> bool {
+    headers
+        .get(header::COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|cookies| {
+            cookies.split(';').any(|part| {
+                let mut kv = part.trim().splitn(2, '=');
+                kv.next().is_some_and(|k| k.trim() == "iptv_admin_sid")
+                    && kv.next().is_some_and(|v| !v.trim().is_empty())
+            })
+        })
+}
+
 /// 按请求路径决定分流目标（纯函数，见文末测试）。
 /// 注意边界：`/adminx`、`/apiary`、`/healthz2` 都不是后台/API 路径，
 /// 必须落到门户；`/p`、`/api` 这类无尾斜杠的裸前缀也归 API。
-fn route_for(path: &str) -> Upstream {
+/// `/api/v1/*` 归 API；其余 `/api/*` 是 Leptos server function
+/// （`/api/<名><hash>`），按管理员 Cookie 分流到后台/门户。
+fn route_for(path: &str, headers: &header::HeaderMap) -> Upstream {
     if path == "/admin" || path.starts_with("/admin/") {
         Upstream::Admin
     } else if path == "/api"
-        || path.starts_with("/api/")
+        || path == "/api/v1"
+        || path.starts_with("/api/v1/")
         || path == "/p"
         || path.starts_with("/p/")
         || path == "/healthz"
         || path == "/metrics"
     {
         Upstream::Api
+    } else if path.starts_with("/api/") {
+        if has_admin_cookie(headers) {
+            Upstream::Admin
+        } else {
+            Upstream::Portal
+        }
     } else {
         Upstream::Portal
     }
@@ -112,6 +146,10 @@ fn upstream_response(res: reqwest::Response) -> Response {
     }
 }
 
+/// 内嵌 favicon：16×16 蓝色圆角方块 + 白色 M 字（SVG，无需额外文件；
+/// 浏览器接受 SVG favicon）。网关直接回 200，不再让它落到门户/后台 404。
+const FAVICON_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><rect width="16" height="16" rx="3" fill="#2563eb"/><text x="8" y="12" font-size="10" text-anchor="middle" fill="#fff" font-family="sans-serif">M</text></svg>"##;
+
 async fn proxy(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     State(gate): State<Arc<Gate>>,
@@ -120,7 +158,15 @@ async fn proxy(
     let method = req.method().clone();
     let uri = req.uri().clone();
     let path = uri.path();
-    let target = route_for(path);
+    if path == "/favicon.ico" {
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "image/svg+xml")
+            .header(header::CACHE_CONTROL, "public, max-age=86400")
+            .body(Body::from(FAVICON_SVG))
+            .unwrap_or_else(|_| (StatusCode::OK, FAVICON_SVG).into_response());
+    }
+    let target = route_for(path, req.headers());
     let mut url = format!("{}{}", gate.base(target), path);
     if let Some(q) = uri.query() {
         url.push('?');
@@ -137,6 +183,13 @@ async fn proxy(
 
     // 透传请求头：去掉 Host（reqwest 按上游 URL 自己写）与逐跳头；
     // Content-Length 去掉，流式 body 由 reqwest 用 chunked 发送。
+    // x-forwarded-for 与 x-forwarded-host 由网关覆盖写入（客户端自带
+    // 的不可信，见下），这里先跳过。
+    let incoming_host = parts
+        .headers
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
     let incoming_xff = parts
         .headers
         .get("x-forwarded-for")
@@ -144,7 +197,12 @@ async fn proxy(
         .map(|s| s.to_string());
     for (name, value) in parts.headers.iter() {
         let n = name.as_str();
-        if n == "host" || n == "content-length" || n == "x-forwarded-for" || is_hop_by_hop(n) {
+        if n == "host"
+            || n == "content-length"
+            || n == "x-forwarded-for"
+            || n == "x-forwarded-host"
+            || is_hop_by_hop(n)
+        {
             continue;
         }
         out = out.header(name, value);
@@ -162,6 +220,15 @@ async fn proxy(
     };
     if let Ok(v) = HeaderValue::from_str(&xff) {
         out = out.header("x-forwarded-for", v);
+    }
+    // X-Forwarded-Host：直接写成入站 Host（浏览器看到的网关地址，如
+    // 46.38.157.125:8081；与 XFF 同理，客户端自带的值不可信，覆盖写入）。
+    // API 的 CSRF 中间件拿它与 Origin 比对：reqwest 已把 Host 写成上游
+    // 内网地址，不写这个头，所有带会话 Cookie 的写请求都会 403（B6）。
+    if let Some(host) = incoming_host {
+        if let Ok(v) = HeaderValue::from_str(&host) {
+            out = out.header("x-forwarded-host", v);
+        }
     }
     if parts.headers.get("x-real-ip").is_none() {
         if let Ok(v) = HeaderValue::from_str(&peer.ip().to_string()) {
@@ -247,38 +314,83 @@ async fn main() {
 mod tests {
     use super::*;
 
+    fn headers_with_cookie(cookie: &str) -> header::HeaderMap {
+        let mut h = header::HeaderMap::new();
+        h.insert(
+            header::COOKIE,
+            header::HeaderValue::from_str(cookie).unwrap(),
+        );
+        h
+    }
+
+    fn no_headers() -> header::HeaderMap {
+        header::HeaderMap::new()
+    }
+
     #[test]
     fn routes_admin_by_prefix() {
-        assert_eq!(route_for("/admin"), Upstream::Admin);
-        assert_eq!(route_for("/admin/"), Upstream::Admin);
-        assert_eq!(route_for("/admin/login"), Upstream::Admin);
-        assert_eq!(route_for("/admin/tokens/1/ticket"), Upstream::Admin);
+        let h = no_headers();
+        assert_eq!(route_for("/admin", &h), Upstream::Admin);
+        assert_eq!(route_for("/admin/", &h), Upstream::Admin);
+        assert_eq!(route_for("/admin/login", &h), Upstream::Admin);
+        assert_eq!(route_for("/admin/tokens/1/ticket", &h), Upstream::Admin);
     }
 
     #[test]
     fn routes_api_by_prefix() {
-        assert_eq!(route_for("/api"), Upstream::Api);
-        assert_eq!(route_for("/api/v1/openapi.json"), Upstream::Api);
-        assert_eq!(route_for("/api/v1/admin/users"), Upstream::Api);
-        assert_eq!(route_for("/p"), Upstream::Api);
-        assert_eq!(route_for("/p/seg.ts"), Upstream::Api);
-        assert_eq!(route_for("/healthz"), Upstream::Api);
-        assert_eq!(route_for("/metrics"), Upstream::Api);
+        let h = no_headers();
+        assert_eq!(route_for("/api", &h), Upstream::Api);
+        assert_eq!(route_for("/api/v1/openapi.json", &h), Upstream::Api);
+        assert_eq!(route_for("/api/v1/admin/users", &h), Upstream::Api);
+        assert_eq!(route_for("/p", &h), Upstream::Api);
+        assert_eq!(route_for("/p/seg.ts", &h), Upstream::Api);
+        assert_eq!(route_for("/healthz", &h), Upstream::Api);
+        assert_eq!(route_for("/metrics", &h), Upstream::Api);
+    }
+
+    #[test]
+    fn routes_server_fn_by_admin_cookie() {
+        // Leptos server function（/api/<名><hash>，无 /v1/）：带管理员
+        // 会话 Cookie 去后台，否则去门户；/api/v1/* 不受 Cookie 影响。
+        let admin = headers_with_cookie("iptv_admin_sid=abc123; iptv_locale=zh-Hans-CN");
+        let plain = no_headers();
+        let portal_only = headers_with_cookie("iptv_portal_sid=xyz");
+        assert_eq!(
+            route_for("/api/admin_overview6854015780016577278", &admin),
+            Upstream::Admin
+        );
+        assert_eq!(
+            route_for("/api/admin_users6854015780016577278", &admin),
+            Upstream::Admin
+        );
+        assert_eq!(
+            route_for("/api/admin_overview6854015780016577278", &plain),
+            Upstream::Portal
+        );
+        assert_eq!(
+            route_for("/api/admin_overview6854015780016577278", &portal_only),
+            Upstream::Portal
+        );
+        assert_eq!(route_for("/api/v1/admin/users", &admin), Upstream::Api);
+        // 空值 Cookie 不算管理员会话。
+        let empty = headers_with_cookie("iptv_admin_sid=; iptv_locale=en");
+        assert_eq!(route_for("/api/admin_overview1", &empty), Upstream::Portal);
     }
 
     #[test]
     fn routes_portal_by_default_and_similar_names() {
-        assert_eq!(route_for("/"), Upstream::Portal);
-        assert_eq!(route_for("/t/abc123"), Upstream::Portal);
-        assert_eq!(route_for("/me"), Upstream::Portal);
-        assert_eq!(route_for("/channels"), Upstream::Portal);
-        assert_eq!(route_for("/watch/1"), Upstream::Portal);
-        assert_eq!(route_for("/design.css"), Upstream::Portal);
+        let h = no_headers();
+        assert_eq!(route_for("/", &h), Upstream::Portal);
+        assert_eq!(route_for("/t/abc123", &h), Upstream::Portal);
+        assert_eq!(route_for("/me", &h), Upstream::Portal);
+        assert_eq!(route_for("/channels", &h), Upstream::Portal);
+        assert_eq!(route_for("/watch/1", &h), Upstream::Portal);
+        assert_eq!(route_for("/design.css", &h), Upstream::Portal);
         // 形似但不是：前缀必须整段匹配。
-        assert_eq!(route_for("/adminx"), Upstream::Portal);
-        assert_eq!(route_for("/admin2/x"), Upstream::Portal);
-        assert_eq!(route_for("/apiary"), Upstream::Portal);
-        assert_eq!(route_for("/healthz2"), Upstream::Portal);
-        assert_eq!(route_for("/p2/seg.ts"), Upstream::Portal);
+        assert_eq!(route_for("/adminx", &h), Upstream::Portal);
+        assert_eq!(route_for("/admin2/x", &h), Upstream::Portal);
+        assert_eq!(route_for("/apiary", &h), Upstream::Portal);
+        assert_eq!(route_for("/healthz2", &h), Upstream::Portal);
+        assert_eq!(route_for("/p2/seg.ts", &h), Upstream::Portal);
     }
 }

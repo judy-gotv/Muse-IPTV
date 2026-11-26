@@ -248,7 +248,7 @@ pub fn LanguageSwitcher(
             <select id="locale-select" name="locale" style="min-height:44px;border-radius:var(--radius-m);border:1px solid var(--c-separator);background:var(--c-surface)">
                 {locales.into_iter().map(|l| {
                     let selected = l == loc;
-                    view! { <option value=l selected=selected>{l}</option> }
+                    view! { <option value=l selected=selected>{iptv_i18n::locale_display_name(l)}</option> }
                 }).collect_view()}
             </select>
             {redirect_to.map(|r| view! { <input type="hidden" name="redirect_to" value=r/> })}

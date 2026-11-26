@@ -912,7 +912,7 @@ fn SettingsPage() -> impl IntoView {
                                     <select id="locale-select" name="locale" class="textfield">
                                         {iptv_i18n::I18n::supported_locales().into_iter().map(|l| {
                                             let sel = l == m.user.locale;
-                                            view! { <option value=l selected=sel>{l}</option> }
+                                            view! { <option value=l selected=sel>{iptv_i18n::locale_display_name(l)}</option> }
                                         }).collect_view()}
                                     </select>
                                 </div>

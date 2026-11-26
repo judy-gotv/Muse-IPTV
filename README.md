@@ -27,6 +27,7 @@ irm https://raw.githubusercontent.com/judy-gotv/Muse-IPTV/main/install.ps1 | iex
 镜像 `ghcr.io/judy-gotv/muse-iptv:latest`（amd64/arm64），一个容器跑全部五个服务，
 对外只暴露**网关一个端口 :8081**：门户 `/`、后台 `/admin`、API `/api/*` 与 `/healthz`
 全走它；API :8080 与门户/后台 :18081/:18082 只在容器内，宿主看不到。数据在 `/app/data`（默认 SQLite）。
+分流细节：`/api/v1/*` 走 API；其余 `/api/*` 是 Leptos server function（`/api/<名><hash>`），带管理员 Cookie 去后台、否则去门户。
 
 ```sh
 docker pull ghcr.io/judy-gotv/muse-iptv:latest
@@ -125,7 +126,8 @@ cargo run -p iptv-gateway  # 网关，对外 :8081（.env 里 GATEWAY_BIND_ADDR�
 单端口网关 iptv-gateway（对外 :8081，内部按路径分流）
   ├─ 用户端门户 Leptos SSR+WASM  /、/t/{ticket}     → 内部 :18081
   ├─ 后端 API 服务 Axum（鉴权/并发/频道/播放）      → 内部 :8080
-  │     /api/*、/p/*、/healthz、/metrics
+  │     /api/v1/*、/p/*、/healthz、/metrics
+  │     （其余 /api/* 是 Leptos server function，带管理员 Cookie 去后台、否则去门户）
   └─ 管理后台 Leptos SSR+WASM  /admin/*             → 内部 :18082
         │                │
         ▼                ▼
@@ -156,9 +158,10 @@ Workspace 15 个 crate（文档 §1.1）：`iptv-core` / `iptv-dto` / `iptv-stor
   失败退避 1m → 5m → 30m → 2h。
 - **后台**（§5）：Argon2id + TOTP 登录；角色超管/运营/客服/只读，权限矩阵在服务端
   校验；全部写操作写审计（含前后快照，保留 180 天）。
-- **i18n**（§12）：`zh-Hant-TW`（默认）/ `zh-Hans-CN` / `en` / `ja` / `ko`，
+- **i18n**（§12）：`zh-Hans-CN`（默认，简体中文）/ `zh-Hant-TW` / `en` / `ja` / `ko`，
   另有伪本地化 `en-XA`；判定顺序 用户设置 → Cookie → Accept-Language → 默认；
-  错误 `message` 本地化、`code` 永远不变。
+  错误 `message` 本地化、`code` 永远不变。语言选项只显示名称（繁体中文/简体中文/
+  English/日本語/한국어），不显示代码。
 - **数据库**（§10）：SQLx Any，同一套代码跑 PostgreSQL / MySQL / SQLite，
   只改 `DATABASE_URL`；迁移按 `migrations/{postgres,mysql,sqlite}/` 分目录；
   契约测试在 CI 对 PG 与 MySQL 各跑一遍（§16）。
@@ -175,6 +178,7 @@ Workspace 15 个 crate（文档 §1.1）：`iptv-core` / `iptv-dto` / `iptv-stor
 | Tauri 壳 | Tauri 2 跨端壳 | `deploy/tauri-shell/` 只含配置与入口（需 Tauri CLI 构建） | 壳本身是部署形态，不在主 CI 编译；门户/后台同一份 WASM 前端可直接装壳 |
 | Leptos hydrate | SSR + hydration | SSR 已实现并可独立运行；WASM hydrate 需 `cargo leptos build`（wasm target）生成 `pkg/` | 主 CI 只验 SSR；hydrate 在 `ci.yml` 外单独验证，见 `docs/ACCEPTANCE.md` |
 | SF 字体/图标 | SF Pro / SF Symbols | 系统字体栈 + Inter/Noto 回退；Lucide 风格开源图标 | §11.2 授权红线：SF 字体与符号不得跨端打包 |
+| 默认语言 | §12 默认 `zh-Hant-TW`（繁体） | 默认 `zh-Hans-CN`（简体中文）；语言选项显示名称不显示代码 | 用户 2026-11-26 决定；V5 迁移把已部署库的 `default_locale` 改成 `zh-Hans-CN` |
 
 ## SQLite 冒烟（2026-11-25，本地实跑，23/23 通过）
 

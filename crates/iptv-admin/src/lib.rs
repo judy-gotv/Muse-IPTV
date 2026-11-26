@@ -645,7 +645,15 @@ fn UsersPage() -> impl IntoView {
                             <TextField label="Email" name="email" input_type="email"/>
                             <TextField label="Phone" name="phone"/>
                             <TextField label="Plan ID" name="plan_id" input_type="number"/>
-                            <TextField label=t_or("common.language", "Language") name="locale" value="zh-Hant-TW"/>
+                            <div class="field">
+                                <label for="locale-select">{t_or("common.language", "Language")}</label>
+                                <select id="locale-select" name="locale" class="textfield">
+                                    {iptv_i18n::I18n::supported_locales().into_iter().map(|l| {
+                                        let sel = l == iptv_i18n::DEFAULT_LOCALE;
+                                        view! { <option value=l selected=sel>{iptv_i18n::locale_display_name(l)}</option> }
+                                    }).collect_view()}
+                                </select>
+                            </div>
                             <TextField label="Remark" name="remark"/>
                         </div>
                         <button class="btn btn-filled" type="submit">{t_or("common.save", "Save")}</button>
@@ -720,7 +728,15 @@ fn TokensPage() -> impl IntoView {
                             <TextField label="Max concurrent sessions" name="max_concurrent_sessions" input_type="number" value="2"/>
                             <TextField label="Max bound devices" name="max_bound_devices" input_type="number" value="3"/>
                             <TextField label="Expires at (RFC3339)" name="expires_at"/>
-                            <TextField label=t_or("common.language", "Language") name="locale" value="zh-Hant-TW"/>
+                            <div class="field">
+                                <label for="locale-select">{t_or("common.language", "Language")}</label>
+                                <select id="locale-select" name="locale" class="textfield">
+                                    {iptv_i18n::I18n::supported_locales().into_iter().map(|l| {
+                                        let sel = l == iptv_i18n::DEFAULT_LOCALE;
+                                        view! { <option value=l selected=sel>{iptv_i18n::locale_display_name(l)}</option> }
+                                    }).collect_view()}
+                                </select>
+                            </div>
                             <TextField label="Allowed groups (comma separated)" name="allowed_groups"/>
                             <TextField label="Max quality" name="max_quality" value="1080p"/>
                         </div>

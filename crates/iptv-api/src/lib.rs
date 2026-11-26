@@ -213,10 +213,21 @@ async fn csrf_origin_middleware(req: Request, next: Next) -> Response {
         if headers.contains_key(header::COOKIE) {
             if let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
                 let origin_host = origin.split("://").nth(1).unwrap_or("");
+                // 经网关来的请求：reqwest 按上游 URL 把 Host 重写成内网
+                // 地址（127.0.0.1:8080），与浏览器 Origin 里的网关地址
+                // 必然失配；网关会把入站 Host 原样写进 X-Forwarded-Host
+                // （覆盖写入，客户端自带的值不可信），优先用它比对。
+                // 直连 API 时没有 XFH，退回 Host。
+                // 信任前提：API 只绑本机（:8080 不对外），唯一入口是网关。
                 let host_ok = headers
-                    .get(header::HOST)
+                    .get("x-forwarded-host")
                     .and_then(|v| v.to_str().ok())
-                    .is_some_and(|host| origin_host.trim_end_matches('/') == host);
+                    .filter(|s| !s.trim().is_empty())
+                    .map(|s| s.trim())
+                    .or_else(|| headers.get(header::HOST).and_then(|v| v.to_str().ok()))
+                    .is_some_and(|host| {
+                        origin_host.trim_end_matches('/') == host.trim_end_matches('/')
+                    });
                 if !host_ok {
                     return ApiError::new(ErrorCode::Forbidden, "cross-origin write rejected")
                         .into_response();

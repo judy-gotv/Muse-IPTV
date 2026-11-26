@@ -195,6 +195,6 @@ async fn contract_core() {
         .is_empty());
     assert_eq!(
         store.get_setting("default_locale").await.unwrap().unwrap(),
-        serde_json::json!("zh-Hant-TW")
+        serde_json::json!("zh-Hans-CN")
     );
 }

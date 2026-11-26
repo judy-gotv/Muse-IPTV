@@ -44,7 +44,7 @@ impl Store {
             req.phone.clone(),
             req.plan_id,
             "active",
-            req.locale.clone().unwrap_or_else(|| "zh-Hant-TW".to_string()),
+            req.locale.clone().unwrap_or_else(|| "zh-Hans-CN".to_string()),
             req.remark.clone(),
             req.expires_at.map(epoch),
             epoch(now),

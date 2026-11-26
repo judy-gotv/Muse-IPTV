@@ -117,11 +117,11 @@ impl Store {
         })
     }
 
-    /// 按方言依次执行内嵌的 V1–V4 迁移（`migrations/{dialect}/`）。
+    /// 按方言依次执行内嵌的 V1–V5 迁移（`migrations/{dialect}/`）。
     /// 幂等：V1 用 `CREATE TABLE IF NOT EXISTS` + `CREATE INDEX IF NOT EXISTS`
     /// （MySQL 不支持索引的 `IF NOT EXISTS` 语法，见 `exec_script` 的
-    /// 重复索引容忍），V2 种子用各方言的忽略冲突写法，重复执行不会产生
-    /// 重复数据。API 与 Worker 启动都调本函数，先后启动必须都成功。
+    /// 重复索引容忍），V2 种子用各方言的忽略冲突写法，V5 是单条 UPDATE，
+    /// 重复执行不会产生重复数据。API 与 Worker 启动都调本函数，先后启动必须都成功。
     pub async fn migrate(&self) -> anyhow::Result<()> {
         let files: &[&str] = match self.dialect {
             Dialect::Postgres => &[
@@ -129,18 +129,21 @@ impl Store {
                 include_str!("../../../migrations/postgres/V2__seed.sql"),
                 include_str!("../../../migrations/postgres/V3__i18n_tables.sql"),
                 include_str!("../../../migrations/postgres/V4__drop_max_upload_mb.sql"),
+                include_str!("../../../migrations/postgres/V5__default_locale_zh_hans.sql"),
             ],
             Dialect::MySql => &[
                 include_str!("../../../migrations/mysql/V1__init.sql"),
                 include_str!("../../../migrations/mysql/V2__seed.sql"),
                 include_str!("../../../migrations/mysql/V3__i18n_tables.sql"),
                 include_str!("../../../migrations/mysql/V4__drop_max_upload_mb.sql"),
+                include_str!("../../../migrations/mysql/V5__default_locale_zh_hans.sql"),
             ],
             Dialect::Sqlite => &[
                 include_str!("../../../migrations/sqlite/V1__init.sql"),
                 include_str!("../../../migrations/sqlite/V2__seed.sql"),
                 include_str!("../../../migrations/sqlite/V3__i18n_tables.sql"),
                 include_str!("../../../migrations/sqlite/V4__drop_max_upload_mb.sql"),
+                include_str!("../../../migrations/sqlite/V5__default_locale_zh_hans.sql"),
             ],
         };
         if self.dialect == Dialect::Sqlite {
