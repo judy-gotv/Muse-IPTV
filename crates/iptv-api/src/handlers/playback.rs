@@ -23,6 +23,7 @@ fn session_uid() -> String {
 }
 
 /// POST /api/v1/playback/start
+#[utoipa::path(post, path = "/api/v1/playback/start", tag = "playback", request_body = PlaybackStartRequest, responses((status = 200, description = "PlaybackStartResponse（session_uid + play_url）"), (status = 429, description = "并发达上限 42901")))]
 pub async fn start(
     State(state): State<Arc<AppState>>,
     auth: PortalAuth,
@@ -113,6 +114,7 @@ pub async fn start(
 }
 
 /// POST /api/v1/playback/heartbeat（30s 一次，刷新 Redis score 与 DB 心跳）。
+#[utoipa::path(post, path = "/api/v1/playback/heartbeat", tag = "playback", request_body = PlaybackHeartbeatRequest, responses((status = 200, description = "ok")))]
 pub async fn heartbeat(
     State(state): State<Arc<AppState>>,
     auth: PortalAuth,
@@ -147,6 +149,7 @@ pub async fn heartbeat(
 }
 
 /// POST /api/v1/playback/stop（释放并发额度）。
+#[utoipa::path(post, path = "/api/v1/playback/stop", tag = "playback", request_body = PlaybackStopRequest, responses((status = 200, description = "ok")))]
 pub async fn stop(
     State(state): State<Arc<AppState>>,
     auth: PortalAuth,

@@ -15,7 +15,7 @@ use iptv_dto::{
 use serde::Deserialize;
 use std::sync::Arc;
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize, Default, utoipa::IntoParams)]
 pub struct ChannelListQuery {
     #[serde(default = "default_page")]
     pub page: u32,
@@ -51,6 +51,12 @@ async fn load_token(
 }
 
 /// GET /api/v1/me（§4.5 响应示例逐字段对应）。
+#[utoipa::path(
+    get,
+    path = "/api/v1/me",
+    tag = "me",
+    responses((status = 200, description = "我的资料聚合（MeResponse，§4.5 示例）"))
+)]
 pub async fn get_me(State(state): State<Arc<AppState>>, auth: PortalAuth) -> ApiResult<MeResponse> {
     let token = load_token(&state, &auth).await?;
     let user = state
@@ -110,6 +116,7 @@ pub async fn get_me(State(state): State<Arc<AppState>>, auth: PortalAuth) -> Api
 }
 
 /// GET /api/v1/me/usage：并发额度与占用。
+#[utoipa::path(get, path = "/api/v1/me/usage", tag = "me", responses((status = 200, description = "并发额度与占用（MeQuota）")))]
 pub async fn get_usage(State(state): State<Arc<AppState>>, auth: PortalAuth) -> ApiResult<MeQuota> {
     let token = load_token(&state, &auth).await?;
     let active = state
@@ -131,6 +138,7 @@ pub async fn get_usage(State(state): State<Arc<AppState>>, auth: PortalAuth) -> 
 }
 
 /// GET /api/v1/me/devices：在线设备（IP 脱敏，§4.1）。
+#[utoipa::path(get, path = "/api/v1/me/devices", tag = "me", responses((status = 200, description = "在线设备（IP 脱敏），DeviceView[]")))]
 pub async fn list_devices(
     State(state): State<Arc<AppState>>,
     auth: PortalAuth,
@@ -155,6 +163,7 @@ pub async fn list_devices(
 }
 
 /// DELETE /api/v1/me/devices/{session_id}：下线自己的设备（不得下线他人：只查本 token 的会话）。
+#[utoipa::path(delete, path = "/api/v1/me/devices/{session_id}", tag = "me", responses((status = 200, description = "ok")))]
 pub async fn kick_device(
     State(state): State<Arc<AppState>>,
     auth: PortalAuth,
@@ -180,6 +189,7 @@ pub async fn kick_device(
 }
 
 /// GET /api/v1/me/channels：授权频道（分页/分组/关键词，§4.5）。
+#[utoipa::path(get, path = "/api/v1/me/channels", tag = "me", params(ChannelListQuery), responses((status = 200, description = "授权频道（分页/分组/关键词），Paged<Channel>")))]
 pub async fn list_my_channels(
     State(state): State<Arc<AppState>>,
     auth: PortalAuth,
@@ -200,6 +210,7 @@ pub async fn list_my_channels(
 }
 
 /// GET /api/v1/me/history：播放记录。
+#[utoipa::path(get, path = "/api/v1/me/history", tag = "me", params(PageQuery), responses((status = 200, description = "播放记录，Paged<PlaybackEvent>")))]
 pub async fn history(
     State(state): State<Arc<AppState>>,
     auth: PortalAuth,
@@ -214,6 +225,7 @@ pub async fn history(
 }
 
 /// GET /api/v1/me/plan：套餐与到期。
+#[utoipa::path(get, path = "/api/v1/me/plan", tag = "me", responses((status = 200, description = "套餐与到期（MePlan）")))]
 pub async fn plan(
     State(state): State<Arc<AppState>>,
     auth: PortalAuth,
@@ -242,6 +254,7 @@ pub async fn plan(
 
 /// PATCH /api/v1/me/settings：修改显示名、locale、主题（§4.5）。
 /// locale 写回用户记录 + Cookie，刷新后仍保持（§16 i18n 验收）。
+#[utoipa::path(patch, path = "/api/v1/me/settings", tag = "me", request_body = MeSettingsPatch, responses((status = 200, description = "ok")))]
 pub async fn patch_settings(
     State(state): State<Arc<AppState>>,
     auth: PortalAuth,

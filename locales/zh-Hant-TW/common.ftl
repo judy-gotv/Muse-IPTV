@@ -111,3 +111,4 @@ common-edit = 編輯
 common-disabled = 已停用
 common-disable = 停用
 common-on-missing = 缺失時處理
+common-tv-remote-hint = 電視遙控：方向鍵移動焦點，確認鍵選擇，返回鍵返回。

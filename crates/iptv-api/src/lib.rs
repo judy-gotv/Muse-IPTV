@@ -9,6 +9,7 @@ pub mod handlers;
 pub mod proxy;
 pub mod state;
 pub mod tickets;
+pub mod upload_tasks;
 
 pub use state::{AppState, Config, Metrics};
 
@@ -22,6 +23,7 @@ use iptv_auth::{mask_ip, sha256_hex};
 use iptv_dto::{Envelope, ErrorCode, HealthResponse};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use utoipa::OpenApi as _;
 
 // ---------------------------------------------------------------------------
 // 错误类型：业务层只抛错误码 + 参数（§12.5），这里统一序列化。
@@ -32,6 +34,9 @@ pub struct ApiError {
     pub code: ErrorCode,
     pub message: String,
     pub args: Vec<(String, serde_json::Value)>,
+    /// N1：FTL 点分 key（如 `errors.plan-in-use`）；有 key 时序列化层
+    /// 按 locale 渲染该 key（带 `args`），`message` 只作英文兜底。
+    pub message_key: Option<String>,
 }
 
 impl ApiError {
@@ -40,6 +45,42 @@ impl ApiError {
             code,
             message: message.into(),
             args: vec![],
+            message_key: None,
+        }
+    }
+    /// N1：带本地化 key 的错误（§12.5：业务层只抛错误码与文案参数）。
+    /// `message` 为英文兜底（key 缺失或中间件未渲染时用）。
+    pub fn with_key(
+        code: ErrorCode,
+        message_key: impl Into<String>,
+        message: impl Into<String>,
+        args: Vec<(String, serde_json::Value)>,
+    ) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            args,
+            message_key: Some(message_key.into()),
+        }
+    }
+    /// 参数以 JSON Map 形式给出（供序列化层渲染 `message_key` 用）。
+    fn args_map(&self) -> serde_json::Map<String, serde_json::Value> {
+        self.args.iter().cloned().collect()
+    }
+    /// 按 locale 渲染 message：有 `message_key` 时渲染该 key（带 args），
+    /// 无 key 时按 `errors.e<code>` 渲染，文案缺失时回退业务 message。
+    fn render_message(&self, state: &AppState, locale: &str) -> String {
+        if let Some(key) = &self.message_key {
+            let rendered = state.i18n.t_json_args(locale, key, &self.args_map());
+            if rendered != *key {
+                return rendered;
+            }
+        }
+        let message = state.i18n.error_message(locale, self.code as i32);
+        if message == format!("errors.e{}", self.code as i32) {
+            self.message.clone()
+        } else {
+            message
         }
     }
     pub fn from_core(e: iptv_core::CoreError) -> Self {
@@ -52,19 +93,19 @@ impl ApiError {
                 code,
                 message,
                 args,
+                message_key: None,
             },
             iptv_core::CoreError::Internal(m) => Self::new(ErrorCode::Internal, m),
         }
     }
     fn localized(self, state: &AppState, locale: &str) -> (StatusCode, Json<Envelope<()>>) {
-        let message = state.i18n.error_message(locale, self.code as i32);
-        let message = if message == format!("errors.e{}", self.code as i32) {
-            // 无本地化文案时回退业务 message（§12.5：message 仅作兜底）。
-            self.message
-        } else {
-            message
+        let message = self.render_message(state, locale);
+        let args = self.args_map();
+        let message_key = self.message_key;
+        let env = match message_key {
+            Some(key) => Envelope::<()>::err_with_key(self.code, message, key, args),
+            None => Envelope::<()>::err(self.code, message),
         };
-        let env = Envelope::<()>::err(self.code, message);
         (
             StatusCode::from_u16(self.code.http_status()).unwrap_or(StatusCode::BAD_REQUEST),
             Json(env),
@@ -94,11 +135,20 @@ impl From<reqwest::Error> for ApiError {
 
 /// §12.5：前端优先用 `code` 查本地文案，`message` 仅作兜底；
 /// 因此错误响应直接用业务 message，不在这里猜 locale。
+/// N1：带 `message_key` 的错误把 key + args 一并进包，供外层
+/// `localize_errors_middleware` 按请求 locale 渲染（`message` 仍为
+/// 英文兜底，中间件渲染失败时保留）。
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let status =
             StatusCode::from_u16(self.code.http_status()).unwrap_or(StatusCode::BAD_REQUEST);
-        (status, Json(Envelope::<()>::err(self.code, self.message))).into_response()
+        let args = self.args_map();
+        let message_key = self.message_key;
+        let env = match message_key {
+            Some(key) => Envelope::<()>::err_with_key(self.code, self.message, key, args),
+            None => Envelope::<()>::err(self.code, self.message),
+        };
+        (status, Json(env)).into_response()
     }
 }
 
@@ -211,43 +261,135 @@ pub fn reset_login_limit(state: &AppState, key: &str) {
     state.login_limiter.reset(key);
 }
 
-/// m1 CSRF Origin 校验（§13）：浏览器写请求（POST/PUT/PATCH/DELETE）
-/// 若带 Cookie 且带 Origin，要求 Origin 与 Host 同源；无 Origin 的请求
-/// （服务端对服务端、API 客户端、播放器）放行。会话 Cookie 已是
-/// SameSite=Lax，Origin 校验是第二道防线；双提交 Cookie 未做。
-async fn csrf_origin_middleware(req: Request, next: Next) -> Response {
-    let method = req.method().clone();
-    if matches!(
-        method,
+/// m14 CSRF 双提交 Cookie（§13）+ Origin / Sec-Fetch-Site 兜底。
+///
+/// 双提交：会话建立后，SSR 层给浏览器发 `iptv_csrf` Cookie（非 HttpOnly、
+/// 可读，`SameSite=Lax`，见门户/后台 `main.rs` 的签发与续发）；SSR 向 API
+/// 转发写请求时，把该 Cookie 值同时放进 `X-CSRF-Token` 请求头与
+/// `Cookie` 头。中间件比对两者一致才放行——跨站攻击者读不到该 Cookie
+///（同源策略），也就伪造不出与 Cookie 一致的请求头。
+///
+/// 逐类防线（见报告）：
+/// - 带 `X-CSRF-Token` 头的写请求：只走双提交比对（头与 Cookie 等时比较，
+///   不一致/缺 Cookie 即 403），不看 Origin。
+/// - 无头的写请求：走 Origin 兜底（与旧 `csrf_origin_middleware` 同款：
+///   有 Origin 时必须与 `X-Forwarded-Host` 或 `Host` 同源）+ 辅助信号
+///   `Sec-Fetch-Site: cross-site` 时直接拒。两类：
+///   （a）登录/票据兑换（尚未建会话、无 token 可带）；（b）服务端对服务端
+///   与 API 客户端（无 Origin、无 Cookie，浏览器发不出这种请求）。
+/// - 读请求（GET/HEAD/OPTIONS）与无 Cookie 的请求不受影响。
+///
+/// 注意：`Sec-Fetch-Site` 只是辅助信号，从不单独放行——无头请求仍须过
+/// Origin 比对（有 Origin 时）或本身就是无 Origin 的服务端调用。
+pub const CSRF_COOKIE: &str = "iptv_csrf";
+pub const CSRF_HEADER: &str = "x-csrf-token";
+
+/// 从 `Cookie` 头里取指定 Cookie 的值。
+fn cookie_value(header: &str, name: &str) -> Option<String> {
+    header.split(';').find_map(|part| {
+        let (k, v) = part.trim().split_once('=')?;
+        if k.trim() == name {
+            Some(v.trim().to_string())
+        } else {
+            None
+        }
+    })
+}
+
+/// 等时比较（普通 `==` 会泄漏时序；与 play_url / admin Cookie 验签同款）。
+fn tokens_equal(a: &str, b: &str) -> bool {
+    use subtle::ConstantTimeEq;
+    a.as_bytes().ct_eq(b.as_bytes()).unwrap_u8() == 1
+}
+
+/// 写请求是否通过 CSRF 检查（纯函数，供单测；`csrf_middleware` 的决策层）。
+/// 返回 `false` 即 403。
+fn csrf_check(headers: &HeaderMap, method: &Method) -> bool {
+    if !matches!(
+        *method,
         Method::POST | Method::PUT | Method::PATCH | Method::DELETE
     ) {
-        let headers = req.headers();
-        if headers.contains_key(header::COOKIE) {
-            if let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
-                let origin_host = origin.split("://").nth(1).unwrap_or("");
-                // 经网关来的请求：reqwest 按上游 URL 把 Host 重写成内网
-                // 地址（127.0.0.1:8080），与浏览器 Origin 里的网关地址
-                // 必然失配；网关会把入站 Host 原样写进 X-Forwarded-Host
-                // （覆盖写入，客户端自带的值不可信），优先用它比对。
-                // 直连 API 时没有 XFH，退回 Host。
-                // 信任前提：API 只绑本机（:8080 不对外），唯一入口是网关。
-                let host_ok = headers
-                    .get("x-forwarded-host")
-                    .and_then(|v| v.to_str().ok())
-                    .filter(|s| !s.trim().is_empty())
-                    .map(|s| s.trim())
-                    .or_else(|| headers.get(header::HOST).and_then(|v| v.to_str().ok()))
-                    .is_some_and(|host| {
-                        origin_host.trim_end_matches('/') == host.trim_end_matches('/')
-                    });
-                if !host_ok {
-                    return ApiError::new(ErrorCode::Forbidden, "cross-origin write rejected")
-                        .into_response();
-                }
-            }
+        return true;
+    }
+    let cookies = headers
+        .get(header::COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    // 1. 双提交：有头就必须与 Cookie 一致（头在、Cookie 缺失也算不一致）。
+    if let Some(token) = headers.get(CSRF_HEADER).and_then(|v| v.to_str().ok()) {
+        return cookie_value(cookies, CSRF_COOKIE)
+            .is_some_and(|cookie| !token.is_empty() && tokens_equal(token, &cookie));
+    }
+    // 2. 辅助信号：浏览器明确标注 cross-site 的写请求直接拒（即使 Origin 缺失）。
+    if headers
+        .get("sec-fetch-site")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.trim().eq_ignore_ascii_case("cross-site"))
+    {
+        return false;
+    }
+    // 3. Origin 兜底：有 Origin 时必须同源；无 Origin 的放行（服务端调用）。
+    if let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
+        let origin_host = origin.split("://").nth(1).unwrap_or("");
+        // 经网关来的请求：reqwest 按上游 URL 把 Host 重写成内网
+        // 地址（127.0.0.1:8080），与浏览器 Origin 里的网关地址
+        // 必然失配；网关会把入站 Host 原样写进 X-Forwarded-Host
+        // （覆盖写入，客户端自带的值不可信），优先用它比对。
+        // 直连 API 时没有 XFH，退回 Host。
+        // 信任前提：API 只绑本机（:8080 不对外），唯一入口是网关。
+        let host_ok = headers
+            .get("x-forwarded-host")
+            .and_then(|v| v.to_str().ok())
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| s.trim())
+            .or_else(|| headers.get(header::HOST).and_then(|v| v.to_str().ok()))
+            .is_some_and(|host| origin_host.trim_end_matches('/') == host.trim_end_matches('/'));
+        if !host_ok {
+            return false;
         }
     }
+    true
+}
+
+pub async fn csrf_middleware(req: Request, next: Next) -> Response {
+    if !csrf_check(req.headers(), req.method()) {
+        return ApiError::new(ErrorCode::Forbidden, "cross-origin write rejected").into_response();
+    }
     next.run(req).await
+}
+
+/// m14 CORS（§13）：`allow_origin(Any)` 改为可配置允许源列表。
+/// - 空列表（默认）：不放行任何跨域源——预检收不到
+///   `Access-Control-Allow-Origin`，浏览器拦截跨域读；同源请求不受影响
+///   （部署是单端口网关同源，浏览器根本不走 CORS）。
+/// - 配了源：只放行列表里的源；`allow_credentials` 永远不配（会话 Cookie
+///   不走跨域，见 `Config::cors_origins`）。
+/// - `X-CSRF-Token` 必须在 `allow_headers` 里，否则已配源的跨域客户端
+///   在预检阶段就发不出双提交头。
+///
+/// 与 CSRF 中间件不打架：CORS 层在最外层先处理 OPTIONS 预检（预检不是写
+/// 方法，不会进 CSRF 检查）；真正写请求上的 Origin 由 CSRF 中间件再验一次。
+pub fn build_cors_layer(origins: &[String]) -> tower_http::cors::CorsLayer {
+    use tower_http::cors::{AllowHeaders, AllowMethods, AllowOrigin, CorsLayer};
+    let allow_origin = if origins.is_empty() {
+        AllowOrigin::predicate(|_, _| false)
+    } else {
+        AllowOrigin::list(origins.iter().filter_map(|o| o.parse::<HeaderValue>().ok()))
+    };
+    CorsLayer::new()
+        .allow_origin(allow_origin)
+        .allow_methods(AllowMethods::list([
+            Method::GET,
+            Method::POST,
+            Method::PATCH,
+            Method::DELETE,
+        ]))
+        .allow_headers(AllowHeaders::list([
+            header::AUTHORIZATION,
+            header::CONTENT_TYPE,
+            header::ACCEPT_LANGUAGE,
+            header::HeaderName::from_static(CSRF_HEADER),
+        ]))
 }
 
 /// m2 安全响应头（§4.3）：所有响应加 `Referrer-Policy: no-referrer`；
@@ -301,9 +443,34 @@ async fn localize_errors_middleware(
     };
     if let Some(code) = v.get("code").and_then(|c| c.as_i64()) {
         if code != 0 {
-            let localized = state.i18n.error_message(&locale, code as i32);
-            if localized != format!("errors.e{code}") {
-                v["message"] = serde_json::Value::String(localized);
+            // N1：带 message_key 的错误渲染该 key（带 args，如删套餐被
+            // N 人引用）；无 key 时按 errors.e<code> 渲染；文案缺失时
+            // 保留业务 message。
+            let rendered = match v.get("message_key").and_then(|k| k.as_str()) {
+                Some(key) => {
+                    let args = v
+                        .get("args")
+                        .and_then(|a| a.as_object())
+                        .cloned()
+                        .unwrap_or_default();
+                    let rendered = state.i18n.t_json_args(&locale, key, &args);
+                    if rendered == key {
+                        None
+                    } else {
+                        Some(rendered)
+                    }
+                }
+                None => {
+                    let localized = state.i18n.error_message(&locale, code as i32);
+                    if localized != format!("errors.e{code}") {
+                        Some(localized)
+                    } else {
+                        None
+                    }
+                }
+            };
+            if let Some(rendered) = rendered {
+                v["message"] = serde_json::Value::String(rendered);
             }
         }
     }
@@ -495,6 +662,142 @@ pub fn verify_admin_cookie(secret: &str, cookie: &str) -> Option<i64> {
 // 公开端点：健康、指标、OpenAPI
 // ---------------------------------------------------------------------------
 
+/// m21：OpenAPI 文档由 utoipa 从 `#[utoipa::path]` 标注的代码生成
+/// （`#[derive(OpenApi)]`），不再是静态 `openapi.json` 文件。
+/// `version` 取 Cargo 包版本（`env!("CARGO_PKG_VERSION")`），随发版自动
+/// 走，不会再过期（v0.1.4 时静态文件仍写 0.1.0）。
+#[derive(utoipa::OpenApi)]
+#[openapi(
+    info(
+        title = "Muse-IPTV API",
+        description = "IPTV 播放平台后端 API（开发文档 v1.2 §3/§4.5/§5.2）。统一响应包 { code, message, data }，code==0 成功；message 按 Accept-Language 本地化，code 永远不变。门户用 Cookie iptv_portal_sid，后台用 Cookie iptv_admin_sid。",
+        version = env!("CARGO_PKG_VERSION")
+    ),
+    paths(
+        handlers::auth::ticket_exchange,
+        handlers::auth::token_login,
+        handlers::auth::logout,
+        handlers::auth::logout_all,
+        handlers::me::get_me,
+        handlers::me::get_usage,
+        handlers::me::list_devices,
+        handlers::me::kick_device,
+        handlers::me::list_my_channels,
+        handlers::me::history,
+        handlers::me::plan,
+        handlers::me::patch_settings,
+        handlers::playback::start,
+        handlers::playback::heartbeat,
+        handlers::playback::stop,
+        handlers::public::list_channels,
+        handlers::public::epg_programs,
+        handlers::public::epg_now,
+        handlers::admin::login,
+        handlers::admin::stats_overview,
+        handlers::admin::list_users,
+        handlers::admin::create_user,
+        handlers::admin::get_user,
+        handlers::admin::update_user,
+        handlers::admin::delete_user,
+        handlers::admin::list_tokens,
+        handlers::admin::create_token,
+        handlers::admin::update_token,
+        handlers::admin::delete_token,
+        handlers::admin::create_login_ticket,
+        handlers::admin::revoke_token_sessions,
+        handlers::admin::list_channels,
+        handlers::admin::create_channel,
+        handlers::admin::update_channel,
+        handlers::admin::delete_channel,
+        handlers::admin::list_sources,
+        handlers::admin::create_source,
+        handlers::admin::update_source,
+        handlers::admin::delete_source,
+        handlers::admin::upload_m3u,
+        handlers::admin::get_upload_task,
+        handlers::admin::trigger_sync,
+        handlers::admin::source_diff,
+        handlers::admin::source_logs,
+        handlers::admin::list_groups,
+        handlers::admin::create_group,
+        handlers::admin::update_group,
+        handlers::admin::delete_group,
+        handlers::admin::list_epg_sources,
+        handlers::admin::create_epg_source,
+        handlers::admin::update_epg_source,
+        handlers::admin::delete_epg_source,
+        handlers::admin::list_sessions,
+        handlers::admin::kick_session,
+        handlers::admin::list_plans,
+        handlers::admin::create_plan,
+        handlers::admin::update_plan,
+        handlers::admin::delete_plan,
+        handlers::admin::list_admins,
+        handlers::admin::create_admin,
+        handlers::admin::update_admin,
+        handlers::admin::delete_admin,
+        handlers::admin::reset_admin_totp,
+        handlers::admin::list_audit,
+        handlers::admin::export_audit,
+        handlers::admin::list_settings,
+        handlers::admin::update_settings,
+        handlers::admin::list_i18n_overrides,
+        handlers::admin::upsert_i18n_override,
+        handlers::admin::delete_i18n_override,
+        handlers::m18_m19::paste_m3u,
+        handlers::m18_m19::list_epg_channel_maps_for_source,
+        handlers::m18_m19::list_epg_channel_maps,
+        handlers::m18_m19::upsert_epg_channel_map,
+        handlers::m18_m19::delete_epg_channel_map,
+        proxy::proxy_manifest,
+        proxy::proxy_segment,
+        health,
+        metrics,
+        openapi_json
+    ),
+    components(schemas(
+        iptv_dto::TicketExchangeRequest,
+        iptv_dto::TokenLoginRequest,
+        iptv_dto::AdminLoginRequest,
+        iptv_dto::CreateUserRequest,
+        iptv_dto::UpdateUserRequest,
+        iptv_dto::CreateTokenRequest,
+        iptv_dto::UpdateTokenRequest,
+        iptv_dto::CreateChannelRequest,
+        iptv_dto::UpdateChannelRequest,
+        iptv_dto::CreateSourceRequest,
+        iptv_dto::UpdateSourceRequest,
+        iptv_dto::CreateGroupRequest,
+        iptv_dto::UpdateGroupRequest,
+        iptv_dto::UpdateEpgSourceRequest,
+        iptv_dto::CreatePlanRequest,
+        iptv_dto::UpdatePlanRequest,
+        iptv_dto::CreateAdminRequest,
+        iptv_dto::UpdateAdminRequest,
+        iptv_dto::MeSettingsPatch,
+        iptv_dto::PlaybackStartRequest,
+        iptv_dto::PlaybackHeartbeatRequest,
+        iptv_dto::PlaybackStopRequest,
+        iptv_dto::UpsertI18nOverrideRequest,
+        iptv_dto::PasteM3uRequest,
+        iptv_dto::UpsertEpgChannelMapRequest
+    )),
+    tags(
+        (name = "auth", description = "门户鉴权"),
+        (name = "me", description = "我的资料"),
+        (name = "playback", description = "播放会话与并发"),
+        (name = "channels", description = "频道与 EPG"),
+        (name = "admin", description = "管理后台")
+    )
+)]
+pub struct ApiDoc;
+
+#[utoipa::path(
+    get,
+    path = "/healthz",
+    tag = "auth",
+    responses((status = 200, description = "健康检查"))
+)]
 async fn health(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
 ) -> Json<HealthResponse> {
@@ -507,14 +810,18 @@ async fn health(
         },
         version: iptv_core::VERSION.into(),
         database: state.store.dialect().to_string(),
+        // M15：票据已落库（`login_ticket` 表），不再依赖 Redis/内存；
+        // `redis` 字段只报告并发限流器的 Redis 配置状态：配了且连上为
+        // `connected`，未配为 `not-configured`（限流器走内存兜底，见 state.rs）。
         redis: if state.limiter.uses_redis() {
             "connected".into()
         } else {
-            "memory-fallback".into()
+            "not-configured".into()
         },
     })
 }
 
+#[utoipa::path(get, path = "/metrics", tag = "auth", responses((status = 200, description = "Prometheus 指标")))]
 async fn metrics(axum::extract::State(state): axum::extract::State<Arc<AppState>>) -> Response {
     let body = format!(
         "# HELP iptv_http_requests_total Total HTTP requests\n# TYPE iptv_http_requests_total counter\niptv_http_requests_total {}\n# HELP iptv_playback_starts_total Playback starts\n# TYPE iptv_playback_starts_total counter\niptv_playback_starts_total {}\n# HELP iptv_concurrent_limit_hits_total Concurrent-limit rejections (42901)\n# TYPE iptv_concurrent_limit_hits_total counter\niptv_concurrent_limit_hits_total {}\n# HELP iptv_ticket_exchanges_total Ticket exchanges\n# TYPE iptv_ticket_exchanges_total counter\niptv_ticket_exchanges_total {}\n",
@@ -529,12 +836,11 @@ async fn metrics(axum::extract::State(state): axum::extract::State<Arc<AppState>
         .unwrap()
 }
 
-async fn openapi_json() -> Response {
-    let spec = include_str!("../openapi.json");
-    Response::builder()
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(axum::body::Body::from(spec.to_string()))
-        .unwrap()
+#[utoipa::path(get, path = "/api/v1/openapi.json", tag = "auth", responses((status = 200, description = "OpenAPI 规范")))]
+async fn openapi_json() -> Json<utoipa::openapi::OpenApi> {
+    // m21：返回 utoipa 从代码生成的文档（`ApiDoc::openapi()`），
+    // 版本号取 Cargo 包版本，不再读静态文件。
+    Json(ApiDoc::openapi())
 }
 
 // ---------------------------------------------------------------------------
@@ -630,6 +936,14 @@ impl AppState {
                 "/admin/sources/upload",
                 post(handlers::admin::upload_m3u).layer(axum::extract::DefaultBodyLimit::disable()),
             )
+            // M16：异步上传任务进度查询（§7.1）。
+            .route(
+                "/admin/upload-tasks/{id}",
+                get(handlers::admin::get_upload_task),
+            )
+            // m18：粘贴 M3U 文本导入（与上传同一解析器、同一入库路径；
+            // JSON 体仍受 axum 默认 2 MB 体限保护，超大文本请走上传）。
+            .route("/admin/sources/paste", post(handlers::m18_m19::paste_m3u))
             .route(
                 "/admin/sources/{id}/sync",
                 post(handlers::admin::trigger_sync),
@@ -658,6 +972,20 @@ impl AppState {
                 "/admin/epg/sources/{id}",
                 patch(handlers::admin::update_epg_source)
                     .delete(handlers::admin::delete_epg_source),
+            )
+            // m19：EPG 频道映射可配置（先查映射表，再回落 tvg-id/名称匹配）。
+            .route(
+                "/admin/epg/sources/{id}/maps",
+                get(handlers::m18_m19::list_epg_channel_maps_for_source)
+                    .put(handlers::m18_m19::upsert_epg_channel_map),
+            )
+            .route(
+                "/admin/epg/maps",
+                get(handlers::m18_m19::list_epg_channel_maps),
+            )
+            .route(
+                "/admin/epg/maps/{id}",
+                delete(handlers::m18_m19::delete_epg_channel_map),
             )
             .route("/admin/sessions", get(handlers::admin::list_sessions))
             .route(
@@ -689,6 +1017,12 @@ impl AppState {
             .route(
                 "/admin/settings",
                 get(handlers::admin::list_settings).patch(handlers::admin::update_settings),
+            )
+            .route(
+                "/admin/i18n-overrides",
+                get(handlers::admin::list_i18n_overrides)
+                    .put(handlers::admin::upsert_i18n_override)
+                    .delete(handlers::admin::delete_i18n_override),
             );
 
         Router::new()
@@ -710,23 +1044,9 @@ impl AppState {
                 state.clone(),
                 localize_errors_middleware,
             ))
-            .layer(axum::middleware::from_fn(csrf_origin_middleware))
+            .layer(axum::middleware::from_fn(csrf_middleware))
             .layer(axum::middleware::from_fn(security_headers_middleware))
-            .layer(
-                tower_http::cors::CorsLayer::new()
-                    .allow_origin(tower_http::cors::Any)
-                    .allow_methods([
-                        axum::http::Method::GET,
-                        axum::http::Method::POST,
-                        axum::http::Method::PATCH,
-                        axum::http::Method::DELETE,
-                    ])
-                    .allow_headers([
-                        header::AUTHORIZATION,
-                        header::CONTENT_TYPE,
-                        header::ACCEPT_LANGUAGE,
-                    ]),
-            )
+            .layer(build_cors_layer(&state.config.cors_origins))
             .with_state(state)
     }
 }
@@ -742,4 +1062,117 @@ pub fn error_response(state: &AppState, locale: &str, err: ApiError) -> Response
 /// 脱敏 IP（门户设备列表用，§4.1）。
 pub fn masked(ip: Option<&str>) -> String {
     ip.map(mask_ip).unwrap_or_else(|| "***".into())
+}
+
+#[cfg(test)]
+mod csrf_tests {
+    use super::*;
+    use crate::state::parse_cors_origins;
+
+    fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (k, v) in pairs {
+            h.insert(
+                axum::http::header::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                HeaderValue::from_str(v).unwrap(),
+            );
+        }
+        h
+    }
+
+    #[test]
+    fn double_submit_match_passes() {
+        let h = headers(&[
+            ("cookie", "iptv_portal_sid=abc; iptv_csrf=tok123"),
+            ("x-csrf-token", "tok123"),
+            ("origin", "https://evil.example.com"),
+        ]);
+        assert!(csrf_check(&h, &Method::POST));
+    }
+
+    #[test]
+    fn double_submit_mismatch_rejected() {
+        let h = headers(&[
+            ("cookie", "iptv_portal_sid=abc; iptv_csrf=tok123"),
+            ("x-csrf-token", "other"),
+        ]);
+        assert!(!csrf_check(&h, &Method::POST));
+    }
+
+    #[test]
+    fn double_submit_header_without_cookie_rejected() {
+        let h = headers(&[
+            ("cookie", "iptv_portal_sid=abc"),
+            ("x-csrf-token", "tok123"),
+        ]);
+        assert!(!csrf_check(&h, &Method::POST));
+    }
+
+    #[test]
+    fn origin_match_passes_without_token() {
+        // SSR 转发前的旧形态 / 无 token 的服务端调用：同源 Origin 放行。
+        let h = headers(&[
+            ("cookie", "iptv_portal_sid=abc"),
+            ("origin", "http://127.0.0.1:8081"),
+            ("x-forwarded-host", "127.0.0.1:8081"),
+        ]);
+        assert!(csrf_check(&h, &Method::POST));
+    }
+
+    #[test]
+    fn origin_mismatch_rejected_without_token() {
+        let h = headers(&[
+            ("cookie", "iptv_portal_sid=abc"),
+            ("origin", "https://evil.example.com"),
+            ("x-forwarded-host", "127.0.0.1:8081"),
+        ]);
+        assert!(!csrf_check(&h, &Method::POST));
+    }
+
+    #[test]
+    fn sec_fetch_site_cross_site_rejected_even_without_origin() {
+        let h = headers(&[
+            ("cookie", "iptv_portal_sid=abc"),
+            ("sec-fetch-site", "cross-site"),
+        ]);
+        assert!(!csrf_check(&h, &Method::POST));
+    }
+
+    #[test]
+    fn no_origin_no_token_server_to_server_passes() {
+        // reqwest 服务端调用：无 Origin、无头、无 Sec-Fetch-Site，放行。
+        let h = headers(&[("cookie", "iptv_portal_sid=abc")]);
+        assert!(csrf_check(&h, &Method::POST));
+    }
+
+    #[test]
+    fn get_requests_unaffected() {
+        let h = headers(&[
+            ("cookie", "iptv_portal_sid=abc"),
+            ("origin", "https://evil.example.com"),
+            ("sec-fetch-site", "cross-site"),
+        ]);
+        assert!(csrf_check(&h, &Method::GET));
+    }
+
+    #[test]
+    fn parse_cors_origins_trims_and_drops_empties() {
+        assert_eq!(
+            parse_cors_origins("https://a.example.com/, http://b:8080 , ,"),
+            vec![
+                "https://a.example.com".to_string(),
+                "http://b:8080".to_string()
+            ]
+        );
+        assert!(parse_cors_origins("").is_empty());
+        assert!(parse_cors_origins("   ").is_empty());
+    }
+
+    #[test]
+    fn tokens_equal_is_exact() {
+        assert!(tokens_equal("abc", "abc"));
+        assert!(!tokens_equal("abc", "abd"));
+        assert!(!tokens_equal("abc", "abcd"));
+        assert!(!tokens_equal("", "abc"));
+    }
 }

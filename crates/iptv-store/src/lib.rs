@@ -3,6 +3,12 @@
 //! 实现方式：`sqlx::AnyPool`，同一套 SQL 跑 PostgreSQL / MySQL / SQLite，
 //! 只改 `DATABASE_URL`，业务代码不改（§10.4）。
 //!
+//! 聚合的 trait 层见 `repositories`（m20）：`TokenRepository` /
+//! `ChannelRepository` / `UserRepository` / `SourceRepository` /
+//! `PlanRepository` / `GroupRepository` / `EpgRepository` /
+//! `TicketRepository`，`Store` 为其实现；方言不走 `db-*` feature 门控
+//! （理由见 `repositories` 模块头注释与 `docs/ACCEPTANCE.md`）。
+//!
 //! # 可移植性约定（§10.2 的坑位，写代码前先读）
 //! - 时间一律存 epoch 秒 `BIGINT`（docs/CONTRACTS.md）：`sqlx::Any` 只支持
 //!   `bool/i16/i32/i64/f32/f64/String/Vec<u8>`，没有 `DateTime`/`Json` 类型，
@@ -33,13 +39,22 @@ use std::collections::HashMap;
 mod admin;
 mod channels;
 mod epg;
+mod i18n;
 mod plans;
 mod playback;
 mod portal;
+mod repositories;
 mod settings;
 mod sources;
+mod tickets;
 mod tokens;
 mod users;
+
+pub use repositories::{
+    ChannelRepository, EpgRepository, GroupRepository, PlanRepository, SourceRepository,
+    TicketRepository, TokenRepository, UserRepository,
+};
+pub use tickets::ConsumedTicket;
 
 /// 数据库方言（由 `DATABASE_URL` 的 scheme 判定）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,7 +132,7 @@ impl Store {
         })
     }
 
-    /// 按方言依次执行内嵌的 V1–V6 迁移（`migrations/{dialect}/`）。
+    /// 按方言依次执行内嵌的 V1–V7 迁移（`migrations/{dialect}/`）。
     /// 幂等：V1 用 `CREATE TABLE IF NOT EXISTS` + `CREATE INDEX IF NOT EXISTS`
     /// （MySQL 不支持索引的 `IF NOT EXISTS` 语法，见 `exec_script` 的
     /// 重复索引容忍），V2 种子用各方言的忽略冲突写法，V5 是单条 UPDATE，
@@ -133,6 +148,7 @@ impl Store {
                 include_str!(
                     "../../../migrations/postgres/V6__settings_updated_at_and_user_theme.sql"
                 ),
+                include_str!("../../../migrations/postgres/V7__login_tickets.sql"),
             ],
             Dialect::MySql => &[
                 include_str!("../../../migrations/mysql/V1__init.sql"),
@@ -143,6 +159,7 @@ impl Store {
                 include_str!(
                     "../../../migrations/mysql/V6__settings_updated_at_and_user_theme.sql"
                 ),
+                include_str!("../../../migrations/mysql/V7__login_tickets.sql"),
             ],
             Dialect::Sqlite => &[
                 include_str!("../../../migrations/sqlite/V1__init.sql"),
@@ -153,6 +170,7 @@ impl Store {
                 include_str!(
                     "../../../migrations/sqlite/V6__settings_updated_at_and_user_theme.sql"
                 ),
+                include_str!("../../../migrations/sqlite/V7__login_tickets.sql"),
             ],
         };
         if self.dialect == Dialect::Sqlite {

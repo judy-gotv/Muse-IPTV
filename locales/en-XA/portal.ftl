@@ -24,6 +24,7 @@ portal-remember-device = Řḗɱḗɱƀḗř ŧĥîş ďḗṽîƈḗ (90 ďàŷ
 portal-quota-title = Ƈøñƈŭřřḗñŧ ʠŭøŧà [~~~]
 portal-player-retry = Řḗŧřŷ [~~~]
 portal-player-retrying = Řḗƈøññḗƈŧîñɠ… àŧŧḗɱƥŧ { $n }, řḗŧřŷ îñ { $secs }ş [~~~]
+portal-player-hls-auto = Àŭŧø [~~~]
 portal-allowed-groups = Àŀŀøŵḗď ɠřøŭƥş [~~~]
 portal-logout-all = Şîɠñ øŭŧ øƒ àŀŀ ďḗṽîƈḗş [~~~]
 portal-landing-hint = Ƥàşŧḗ ŷøŭř Ŧøķḗñ ŧø şîɠñ îñ, øř øƥḗñ ŧĥḗ ŧîƈķḗŧ ŀîñķ / şƈàñ ŧĥḗ ʠŘ ƈøďḗ ƒřøɱ ŷøŭř àďɱîñ. [~~~]

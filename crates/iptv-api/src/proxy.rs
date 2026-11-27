@@ -11,21 +11,18 @@ use crate::{ApiError, AppState};
 use axum::extract::{Path, Query, State};
 use axum::http::{header, StatusCode};
 use axum::response::Response;
-use iptv_core::{
-    all_ips_public, check_url_allowed, ips_overlap, resolve_host_ips, test_allow_private_upstreams,
-    verify_play_url,
-};
+use iptv_core::{pin_target, resolve_checked_ip, resolve_segment_ip, verify_play_url};
 use serde::Deserialize;
 use std::sync::Arc;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
 pub struct PlayQuery {
     pub exp: i64,
     pub session: String,
     pub sig: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
 pub struct SegQuery {
     pub u: String,
     pub exp: i64,
@@ -104,6 +101,7 @@ async fn primary_url(state: &Arc<AppState>, channel_id: i64) -> Result<String, A
 }
 
 /// GET /p/{channel_id}.m3u8（路由为 `/p/{*rest}`，此处拆 id 与后缀）。
+#[utoipa::path(get, path = "/p/{channel_id}.m3u8", tag = "playback", params(PlayQuery), responses((status = 200, description = "签名播放清单代理（HMAC，300s）")))]
 pub async fn proxy_manifest(
     State(state): State<Arc<AppState>>,
     Path(rest): Path<String>,
@@ -123,16 +121,7 @@ pub async fn proxy_manifest(
         ));
     }
     let upstream = primary_url(&state, channel_id).await?;
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .user_agent(format!("Muse-IPTV/{}", iptv_core::VERSION))
-        // M17①②：重定向不交给客户端自动跟（Policy::limited 只限跳数，
-        // 302 跳到内网仍会被跟进）；`fetch_checked` 手动跟，每跳先
-        // `check_url_allowed`（DB 里的上游 URL 也要验，M17②）。
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(ApiError::from)?;
-    let resp = fetch_checked(&client, &upstream).await?;
+    let resp = fetch_checked(&upstream).await?;
     // M4：流式读、边读边累计上限（20 MB），超限立即断流，不先整包进内存。
     let bytes = read_capped(resp, MANIFEST_MAX_BYTES).await?;
     let body = String::from_utf8_lossy(&bytes).into_owned();
@@ -150,15 +139,24 @@ pub async fn proxy_manifest(
 /// 上游清单单响应上限（M4）。清单本身很小，20 MB 是安全兜底。
 const MANIFEST_MAX_BYTES: usize = 20 * 1024 * 1024;
 
-/// 带逐跳 SSRF 校验的 GET（M17①②）：每跳先 `check_url_allowed`
-///（仅 http/https、DNS 解析后逐 IP 校验），再发请求；3xx 带 Location
-/// 时解析相对地址后继续，最多跟 3 跳。无 Location 的 3xx 直接返回响应。
-async fn fetch_checked(client: &reqwest::Client, url: &str) -> Result<reqwest::Response, ApiError> {
+/// 带逐跳 SSRF 校验的 GET（M17①② + N2）：每跳先 `resolve_checked_ip`
+///（解析一次、校验该组 IP 后取其中一个），再用 `pinned_client` 把连
+/// 接固定到该 IP（`ClientBuilder::resolve` 覆盖本次解析，reqwest 不再
+/// 二次解析同一主机名，DNS 重绑定无窗口；TLS SNI/Host 仍用原主机名）；
+/// 3xx 带 Location 时解析相对地址后继续，最多跟 3 跳。无 Location 的
+/// 3xx 直接返回响应。客户端每跳新建：重定向目标 host 不同，固定值也
+/// 不同。重定向仍手动跟（Policy::none）：`Policy::limited` 只限跳数，
+/// 302 跳到内网仍会被跟进。
+async fn fetch_checked(url: &str) -> Result<reqwest::Response, ApiError> {
     let mut current = url.to_string();
     for _ in 0..=3 {
-        check_url_allowed(&current).await.map_err(|_| {
+        let ip = resolve_checked_ip(&current).await.map_err(|_| {
             ApiError::new(iptv_dto::ErrorCode::Forbidden, "upstream url not allowed")
         })?;
+        let parsed = reqwest::Url::parse(&current).map_err(|_| {
+            ApiError::new(iptv_dto::ErrorCode::SourceUnavailable, "bad upstream url")
+        })?;
+        let client = pinned_client(&parsed, ip, 15);
         let resp = client.get(&current).send().await.map_err(|_| {
             ApiError::new(
                 iptv_dto::ErrorCode::SourceUnavailable,
@@ -279,6 +277,7 @@ fn seg_url(abs: &str, q: &PlayQuery) -> String {
 }
 
 /// GET /p/seg?u=...&exp&session&sig
+#[utoipa::path(get, path = "/p/seg", tag = "playback", params(SegQuery), responses((status = 200, description = "签名分片代理（Range 透传，SSRF 校验）")))]
 pub async fn proxy_segment(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
@@ -303,16 +302,8 @@ pub async fn proxy_segment(
     let target = reqwest::Url::parse(&q.u)
         .map_err(|_| ApiError::new(iptv_dto::ErrorCode::BadRequest, "bad segment url"))?;
     check_segment_target(&upstream_url, &target).await?;
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .user_agent(format!("Muse-IPTV/{}", iptv_core::VERSION))
-        // M17①：重定向不交给客户端自动跟，`fetch_segment_checked` 手动跟，
-        // 每跳都重做 `check_segment_target`。
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(ApiError::from)?;
     let range = headers.get(header::RANGE).cloned();
-    let resp = fetch_segment_checked(&client, &upstream_url, target, range).await?;
+    let resp = fetch_segment_checked(&upstream_url, target, range).await?;
     let status = resp.status();
     let content_type = resp.headers().get(header::CONTENT_TYPE).cloned();
     let content_length = resp.headers().get(header::CONTENT_LENGTH).cloned();
@@ -330,65 +321,56 @@ pub async fn proxy_segment(
     Ok(builder.body(axum::body::Body::from_stream(stream)).unwrap())
 }
 
-/// 分片目标校验（M17③）：字符串层 host/scheme/端口须与频道主地址一致；
-/// 再把 host 解析成 IP 比对——只比字符串时，同一主机名可在清单拉取与
-/// 分片拉取之间被 DNS 重绑定到内网地址（如 169.254.169.254）。
+/// 分片目标校验（M17③ + N2）：规则实现在 core 的 `resolve_segment_ip`
+///（字符串层 host/scheme/端口一致 + 解析成 IP 比对），此处只做错误
+/// 映射；只比字符串会被 DNS 重绑定绕过（同一主机名在清单拉取时解析
+/// 到公网、拉分片时解析到内网）。
 /// IP 层两条硬规则：① 目标解析出的任一 IP 落在禁段即拒绝（DNS 解析
 /// 失败也按拒绝处理，不按放行）；② 两侧都只解析出一个 IP 时要求严格
 /// 相等（同一主机名单 IP 场景，改解析即拦）。多 IP 场景（CDN 轮询、
 /// 两次解析返回的子集不同）只执行规则 ①，避免误杀正常轮询。
+/// 开关打开时跳过 IP 层两条硬规则（字符串层 host/scheme/端口一致性
+/// 仍保留）：本地 stub 走 127.0.0.1，否则分片永远 403。
 async fn check_segment_target(
     upstream: &reqwest::Url,
     target: &reqwest::Url,
 ) -> Result<(), ApiError> {
-    let forbidden = || ApiError::new(iptv_dto::ErrorCode::Forbidden, "segment host not allowed");
-    if target.host_str() != upstream.host_str()
-        || target.scheme() != upstream.scheme()
-        || target.port_or_known_default() != upstream.port_or_known_default()
-    {
-        return Err(forbidden());
-    }
-    let Some(target_host) = target.host_str() else {
-        return Err(forbidden());
-    };
-    let Some(upstream_host) = upstream.host_str() else {
-        return Err(forbidden());
-    };
-    // 冒烟开关打开时跳过 IP 层两条硬规则（字符串层 host/scheme/端口
-    // 一致性仍保留）：本地 stub 走 127.0.0.1，否则分片永远 403。
-    if test_allow_private_upstreams() {
-        return Ok(());
-    }
-    let target_port = target.port_or_known_default().unwrap_or(443);
-    let upstream_port = upstream.port_or_known_default().unwrap_or(443);
-    let target_ips = resolve_host_ips(target_host, target_port)
+    resolve_segment_ip(upstream, target)
         .await
-        .map_err(|_| forbidden())?;
-    if !all_ips_public(&target_ips) {
-        return Err(forbidden());
-    }
-    let upstream_ips = resolve_host_ips(upstream_host, upstream_port)
-        .await
-        .map_err(|_| forbidden())?;
-    if target_ips.len() == 1 && upstream_ips.len() == 1 && !ips_overlap(&target_ips, &upstream_ips)
-    {
-        return Err(forbidden());
-    }
-    Ok(())
+        .map(|_| ())
+        .map_err(|_| ApiError::new(iptv_dto::ErrorCode::Forbidden, "segment host not allowed"))
 }
 
-/// 带逐跳分片校验的 GET（M17①）：每跳都重做 `check_segment_target`
-/// 再发请求（Range 头透传）；3xx 带 Location 时解析相对地址后继续，
-/// 最多跟 3 跳。无 Location 的 3xx 直接返回响应。
+/// N2：按校验过的 IP 建客户端（`ClientBuilder::resolve` 覆盖本次 DNS
+/// 解析；字面 IP 主机无需固定，见 `pin_target`）。重定向目标 host
+/// 不同故每跳新建。
+fn pinned_client(url: &reqwest::Url, ip: std::net::IpAddr, timeout_secs: u64) -> reqwest::Client {
+    let mut builder = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(timeout_secs))
+        .user_agent(format!("Muse-IPTV/{}", iptv_core::VERSION))
+        .redirect(reqwest::redirect::Policy::none());
+    if let Some((host, addr)) = pin_target(url, ip) {
+        builder = builder.resolve(&host, addr);
+    }
+    builder.build().expect("http client")
+}
+
+/// 带逐跳分片校验的 GET（M17① + N2）：每跳都重做 `resolve_segment_ip`
+///（解析一次、校验后返回固定用的 IP），再用 `pinned_client` 把连接固
+/// 定到该 IP（不再二次解析，DNS 重绑定无窗口）；Range 头透传；3xx
+/// 带 Location 时解析相对地址后继续，最多跟 3 跳。无 Location 的 3xx
+/// 直接返回响应。
 async fn fetch_segment_checked(
-    client: &reqwest::Client,
     upstream: &reqwest::Url,
     target: reqwest::Url,
     range: Option<header::HeaderValue>,
 ) -> Result<reqwest::Response, ApiError> {
     let mut current = target;
     for _ in 0..=3 {
-        check_segment_target(upstream, &current).await?;
+        let ip = resolve_segment_ip(upstream, &current).await.map_err(|_| {
+            ApiError::new(iptv_dto::ErrorCode::Forbidden, "segment host not allowed")
+        })?;
+        let client = pinned_client(&current, ip, 30);
         let mut req = client.get(current.clone());
         if let Some(range) = &range {
             req = req.header(header::RANGE, range.clone());
@@ -419,4 +401,226 @@ async fn fetch_segment_checked(
         iptv_dto::ErrorCode::SourceUnavailable,
         "too many redirects",
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// 起一个本地 HTTP stub：每个连接读到请求头结束（`\r\n\r\n`）后
+    /// 回固定响应并关闭连接。返回监听地址。
+    async fn spawn_stub(ip: std::net::IpAddr, response: String) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind((ip, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let response = response.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let mut req = Vec::new();
+                    loop {
+                        match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => {
+                                req.extend_from_slice(&buf[..n]);
+                                if req.windows(4).any(|w| w == b"\r\n\r\n") {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    let _ = sock.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        addr
+    }
+
+    fn http_ok(body: &str) -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+    }
+
+    /// 分片 302 专用 stub：`/seg0.ts` → 302 到同端口相对路径
+    /// `/seg1.ts`，`/seg1.ts` → 200。跨端口重定向本就被 M17③ 的
+    /// 端口一致规则拒绝，故测例只覆盖同端口跳。
+    async fn spawn_segment_redirect_stub(ip: std::net::IpAddr) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind((ip, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let mut req = Vec::new();
+                    loop {
+                        match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => {
+                                req.extend_from_slice(&buf[..n]);
+                                if req.windows(4).any(|w| w == b"\r\n\r\n") {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    let text = String::from_utf8_lossy(&req);
+                    let path = text
+                        .lines()
+                        .next()
+                        .and_then(|l| l.split_whitespace().nth(1))
+                        .unwrap_or("");
+                    let resp = if path == "/seg0.ts" {
+                        "HTTP/1.1 302 Found\r\nLocation: /seg1.ts\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+                    } else {
+                        http_ok("redirect-ok")
+                    };
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        addr
+    }
+
+    /// 测试开关的 RAII 守卫：`IPTV_TEST_ALLOW_PRIVATE_UPSTREAMS` 是进
+    /// 程环境变量，测试 panic 时也要恢复，避免污染同进程其他测试。
+    struct TestSwitchGuard {
+        prev: Option<String>,
+    }
+
+    impl TestSwitchGuard {
+        fn set() -> Self {
+            let prev = std::env::var("IPTV_TEST_ALLOW_PRIVATE_UPSTREAMS").ok();
+            std::env::set_var("IPTV_TEST_ALLOW_PRIVATE_UPSTREAMS", "1");
+            Self { prev }
+        }
+    }
+
+    impl Drop for TestSwitchGuard {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(v) => std::env::set_var("IPTV_TEST_ALLOW_PRIVATE_UPSTREAMS", v),
+                None => std::env::remove_var("IPTV_TEST_ALLOW_PRIVATE_UPSTREAMS"),
+            }
+        }
+    }
+
+    /// 把域名追加进 `NO_PROXY`/`no_proxy` 的 RAII 守卫（只追加已有
+    /// 值、不替换，drop 时恢复原值）。reqwest 在 `Client::build` 时
+    /// 读代理环境变量，守卫须在建客户端之前生效。
+    struct NoProxyGuard {
+        prev_upper: Option<String>,
+        prev_lower: Option<String>,
+    }
+
+    impl NoProxyGuard {
+        fn append(domain: &str) -> Self {
+            let prev_upper = std::env::var("NO_PROXY").ok();
+            let prev_lower = std::env::var("no_proxy").ok();
+            let add = |prev: &Option<String>| match prev {
+                Some(v) if !v.is_empty() => format!("{v},{domain}"),
+                _ => domain.to_string(),
+            };
+            std::env::set_var("NO_PROXY", add(&prev_upper));
+            std::env::set_var("no_proxy", add(&prev_lower));
+            Self {
+                prev_upper,
+                prev_lower,
+            }
+        }
+    }
+
+    impl Drop for NoProxyGuard {
+        fn drop(&mut self) {
+            match &self.prev_upper {
+                Some(v) => std::env::set_var("NO_PROXY", v),
+                None => std::env::remove_var("NO_PROXY"),
+            }
+            match &self.prev_lower {
+                Some(v) => std::env::set_var("no_proxy", v),
+                None => std::env::remove_var("no_proxy"),
+            }
+        }
+    }
+
+    /// N2 核心行为：固定后的客户端实际连向校验过的 IP。
+    /// `pinned.test` 在 DNS 里不存在：未经固定的请求必然失败；固定
+    /// 到回环 stub 的 IP 后，请求必须打到本地 stub——证明
+    /// `ClientBuilder::resolve` 的覆盖真的生效，而不是又走了一次 DNS。
+    /// 注意：沙箱设了出口代理环境变量（`http_proxy` 等），reqwest
+    /// 默认会走代理——`pinned.test` 不在 `NO_PROXY` 里时请求根本到
+    /// 不了本地 stub。测试内把该域名追加进 `NO_PROXY`/`no_proxy`
+    /// （只追加、不替换已有项，同进程并行的其他测试不受影响）。
+    #[tokio::test]
+    async fn pinned_client_connects_to_validated_ip() {
+        let _no_proxy = NoProxyGuard::append("pinned.test");
+        let loopback = std::net::IpAddr::from([127, 0, 0, 1]);
+        let addr = spawn_stub(loopback, http_ok("pinned-ok")).await;
+        let url = reqwest::Url::parse(&format!("http://pinned.test:{}/x", addr.port())).unwrap();
+        let client = pinned_client(&url, addr.ip(), 15);
+        let resp = client.get(url).send().await.unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.text().await.unwrap(), "pinned-ok");
+    }
+
+    /// N2 接线：清单拉取与分片拉取都走“解析+校验+固定”全程，且开关
+    /// 语义不变。同一测试函数内顺序执行各阶段，避免多测试并行改进
+    /// 程环境变量竞态：① 开关开时清单拉取成功；② 同 host 分片拉取
+    /// 成功（`check_segment_target` 的委托也一并覆盖）；③ 分片 302
+    /// 跳到另一回环端口，逐跳重新固定后终点可达；④ 开关关时清单与
+    /// 分片目标双双被拒。
+    #[tokio::test]
+    async fn fetch_checked_and_segment_loopback() {
+        let v4 = std::net::IpAddr::from([127, 0, 0, 1]);
+        let _guard = TestSwitchGuard::set();
+
+        // ① 清单拉取成功。
+        let addr = spawn_stub(v4, http_ok("manifest-ok")).await;
+        let manifest = format!("http://127.0.0.1:{}/live.m3u8", addr.port());
+        let resp = fetch_checked(&manifest).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.text().await.unwrap(), "manifest-ok");
+
+        // ② 分片拉取成功（上游与目标同 host/scheme/端口）。
+        let seg_addr = spawn_stub(v4, http_ok("segment-ok")).await;
+        let upstream =
+            reqwest::Url::parse(&format!("http://127.0.0.1:{}/live.m3u8", seg_addr.port()))
+                .unwrap();
+        let target =
+            reqwest::Url::parse(&format!("http://127.0.0.1:{}/seg0.ts", seg_addr.port())).unwrap();
+        assert!(check_segment_target(&upstream, &target).await.is_ok());
+        let resp = fetch_segment_checked(&upstream, target, None)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.text().await.unwrap(), "segment-ok");
+        // 目标 host 与上游不一致仍拒绝（字符串层保留）。
+        let other =
+            reqwest::Url::parse(&format!("http://127.0.0.2:{}/seg0.ts", seg_addr.port())).unwrap();
+        assert!(check_segment_target(&upstream, &other).await.is_err());
+
+        // ③ 分片 302 跳到同端口另一路径：每跳重新解析+校验+固定。
+        // 注意：M17③ 要求目标端口与上游端口一致，故重定向必须留在同
+        // 端口（跨端口 302 本就应被拒，见 `resolve_segment_ip`）。
+        let redir_addr = spawn_segment_redirect_stub(v4).await;
+        let upstream2 =
+            reqwest::Url::parse(&format!("http://127.0.0.1:{}/live.m3u8", redir_addr.port()))
+                .unwrap();
+        let target2 =
+            reqwest::Url::parse(&format!("http://127.0.0.1:{}/seg0.ts", redir_addr.port()))
+                .unwrap();
+        let resp = fetch_segment_checked(&upstream2, target2, None)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.text().await.unwrap(), "redirect-ok");
+
+        // ④ 开关关时清单与分片目标双双被拒（开关只放行 IP 段）。
+        drop(_guard);
+        assert!(fetch_checked(&manifest).await.is_err());
+        assert!(check_segment_target(&upstream, &upstream).await.is_err());
+    }
 }

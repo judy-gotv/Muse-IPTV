@@ -26,6 +26,16 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     let state = Arc::new(AppState::new(config.clone()).await?);
+    // m22：启动时把 `i18n_override` 表装入进程内覆盖表（读库失败只记
+    // 警告，不阻塞启动；无覆盖时 FTL 兜底）。
+    match state.store.i18n_overrides_map().await {
+        Ok(map) => {
+            let n = map.len();
+            iptv_i18n::I18n::set_overrides(map);
+            tracing::info!("loaded {n} i18n overrides");
+        }
+        Err(e) => tracing::warn!("failed to load i18n overrides: {e}"),
+    }
     // 首次启动建超管（仅当库里一个管理员都没有时）。
     if state.store.list_admins().await?.is_empty() {
         if let (Ok(user), Ok(pass)) = (

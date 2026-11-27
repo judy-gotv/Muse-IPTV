@@ -26,7 +26,17 @@ pub(crate) fn row_to_program(row: &AnyRow) -> anyhow::Result<EpgProgram> {
     })
 }
 
+pub(crate) fn row_to_epg_channel_map(row: &AnyRow) -> anyhow::Result<EpgChannelMap> {
+    Ok(EpgChannelMap {
+        id: r_i64(row, "id")?,
+        epg_source_id: r_i64(row, "epg_source_id")?,
+        tvg_id: r_opt_string(row, "tvg_id")?,
+        channel_id: r_opt_i64(row, "channel_id")?,
+    })
+}
+
 const EPG_SOURCE_COLS: &str = "id, name, url, last_sync_at, last_status";
+const EPG_CHANNEL_MAP_COLS: &str = "id, epg_source_id, tvg_id, channel_id";
 const PROGRAM_COLS: &str =
     "id, channel_id, tvg_id, title, description, category, start_at, stop_at";
 
@@ -115,6 +125,109 @@ impl Store {
             .execute(&self.pool)
             .await?
             .rows_affected();
+        Ok(n > 0)
+    }
+
+    /// m19：列出 EPG 频道映射；两个过滤条件都可空（都不给 = 全表）。
+    pub async fn list_epg_channel_maps(
+        &self,
+        epg_source_id: Option<i64>,
+        channel_id: Option<i64>,
+    ) -> anyhow::Result<Vec<EpgChannelMap>> {
+        let mut sql = format!("SELECT {EPG_CHANNEL_MAP_COLS} FROM epg_channel_map");
+        let mut conds: Vec<&str> = Vec::new();
+        if epg_source_id.is_some() {
+            conds.push("epg_source_id = ?");
+        }
+        if channel_id.is_some() {
+            conds.push("channel_id = ?");
+        }
+        if !conds.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&conds.join(" AND "));
+        }
+        sql.push_str(" ORDER BY epg_source_id ASC, id ASC");
+        let sql = ph(&sql, self.dialect);
+        let mut q = sqlx::query(&sql);
+        if let Some(id) = epg_source_id {
+            q = q.bind(id);
+        }
+        if let Some(id) = channel_id {
+            q = q.bind(id);
+        }
+        let rows = q.fetch_all(&self.pool).await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for r in &rows {
+            out.push(row_to_epg_channel_map(r)?);
+        }
+        Ok(out)
+    }
+
+    /// m19：按 (epg_source_id, tvg_id) 查一条映射（Worker 匹配与
+    /// upsert 后回读共用）。
+    pub async fn get_epg_channel_map(
+        &self,
+        epg_source_id: i64,
+        tvg_id: &str,
+    ) -> anyhow::Result<Option<EpgChannelMap>> {
+        let row = sqlx::query(&ph(
+            &format!(
+                "SELECT {EPG_CHANNEL_MAP_COLS} FROM epg_channel_map WHERE epg_source_id = ? AND tvg_id = ?"
+            ),
+            self.dialect,
+        ))
+        .bind(epg_source_id)
+        .bind(tvg_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|r| row_to_epg_channel_map(&r)).transpose()
+    }
+
+    /// m19：新建或改写一条映射（`UNIQUE (epg_source_id, tvg_id)`）。
+    /// 三方言无统一 upsert 语法，故先 UPDATE、未命中再 INSERT；
+    /// 返回写完的映射行。
+    pub async fn upsert_epg_channel_map(
+        &self,
+        epg_source_id: i64,
+        tvg_id: &str,
+        channel_id: i64,
+    ) -> anyhow::Result<EpgChannelMap> {
+        let n = sqlx::query(&ph(
+            "UPDATE epg_channel_map SET channel_id = ? WHERE epg_source_id = ? AND tvg_id = ?",
+            self.dialect,
+        ))
+        .bind(channel_id)
+        .bind(epg_source_id)
+        .bind(tvg_id)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        if n == 0 {
+            sqlx::query(&ph(
+                "INSERT INTO epg_channel_map (epg_source_id, tvg_id, channel_id) VALUES (?, ?, ?)",
+                self.dialect,
+            ))
+            .bind(epg_source_id)
+            .bind(tvg_id)
+            .bind(channel_id)
+            .execute(&self.pool)
+            .await?;
+        }
+        self.get_epg_channel_map(epg_source_id, tvg_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("epg_channel_map upsert did not persist"))
+    }
+
+    /// m19：按映射行 id 删除一条映射。
+    pub async fn delete_epg_channel_map(&self, id: i64) -> anyhow::Result<bool> {
+        let n = sqlx::query(&ph(
+            "DELETE FROM epg_channel_map WHERE id = ?",
+            self.dialect,
+        ))
+        .bind(id)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
         Ok(n > 0)
     }
 

@@ -11,15 +11,19 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use chrono::{Duration, Utc};
 use iptv_auth::{generate_totp_secret, hash_password, verify_password, Totp};
-use iptv_core::{generate_token, hash_token, token_prefix};
+use iptv_core::{
+    generate_token, hash_token, mirror_logo_if_configured, token_prefix, S3Config,
+    LOGO_MIRROR_PER_SYNC,
+};
 use iptv_dto::{
     AdminLoginRequest, AdminRole, AdminUser, AppUser, AuditLog, Channel, ChannelGroup,
     CreateAdminRequest, CreateAdminResponse, CreateChannelRequest, CreateGroupRequest,
     CreatePlanRequest, CreateSourceRequest, CreateTokenRequest, CreateTokenResponse,
-    CreateUserRequest, EpgSource, ErrorCode, M3uImportReport, PageQuery, Paged, Plan,
-    PlaylistSource, StatsOverview, SyncDiff, SyncLog, SystemSetting, UpdateAdminRequest,
-    UpdateChannelRequest, UpdateEpgSourceRequest, UpdateGroupRequest, UpdatePlanRequest,
-    UpdateSourceRequest, UpdateTokenRequest, UpdateUserRequest, UserToken,
+    CreateUserRequest, EpgSource, ErrorCode, PageQuery, Paged, Plan, PlaylistSource, StatsOverview,
+    SyncDiff, SyncLog, SystemSetting, UpdateAdminRequest, UpdateChannelRequest,
+    UpdateEpgSourceRequest, UpdateGroupRequest, UpdatePlanRequest, UpdateSourceRequest,
+    UpdateTokenRequest, UpdateUserRequest, UploadTaskCreated, UploadTaskProgress, UploadTaskStatus,
+    UserToken,
 };
 use iptv_store::NewAuditLog;
 use std::sync::Arc;
@@ -32,6 +36,40 @@ fn require(admin: &AdminAuth, ok_roles: &[AdminRole], what: &str) -> Result<(), 
             ErrorCode::Forbidden,
             format!("role {:?} cannot {what}", admin.role),
         ))
+    }
+}
+
+/// m9 台标转存（频道创建 / M3U 上传共用）：未配置存储时直接返回；
+/// 单张转存失败只记日志、保留直链；成功才写回 `logo_url` 并更新
+/// 传入的频道对象（创建接口的返回体随之是转存后地址）。
+async fn mirror_channel_logos(state: &Arc<AppState>, channels: &mut [Channel]) {
+    let Some(cfg) = S3Config::from_env() else {
+        return;
+    };
+    let mut seen = std::collections::HashSet::new();
+    let mut n = 0;
+    for ch in channels.iter_mut() {
+        let Some(logo_url) = ch.logo_url.clone() else {
+            continue;
+        };
+        if logo_url.trim().is_empty() || !seen.insert(logo_url.clone()) {
+            continue;
+        }
+        if n >= LOGO_MIRROR_PER_SYNC {
+            break;
+        }
+        n += 1;
+        match mirror_logo_if_configured(Some(&cfg), &logo_url).await {
+            Ok(Some(new_url)) => {
+                if let Err(e) = state.store.update_channel_logo_url(ch.id, &new_url).await {
+                    tracing::warn!("update logo url channel {} failed: {e:#}", ch.id);
+                } else {
+                    ch.logo_url = Some(new_url);
+                }
+            }
+            Ok(None) => {}
+            Err(e) => tracing::warn!("logo mirror channel {} failed: {e:#}", ch.id),
+        }
     }
 }
 
@@ -72,6 +110,7 @@ fn ip_of(headers: &HeaderMap) -> Option<String> {
 // ---------------------------------------------------------------------------
 
 /// POST /api/v1/admin/auth/login
+#[utoipa::path(post, path = "/api/v1/admin/auth/login", tag = "admin", request_body = AdminLoginRequest, responses((status = 200, description = "ok，下发 iptv_admin_sid Cookie")))]
 pub async fn login(
     State(state): State<Arc<AppState>>,
     ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
@@ -185,6 +224,7 @@ pub async fn login(
 }
 
 /// GET /api/v1/admin/stats/overview
+#[utoipa::path(get, path = "/api/v1/admin/stats/overview", tag = "admin", responses((status = 200, description = "仪表盘总览（StatsOverview）")))]
 pub async fn stats_overview(
     State(state): State<Arc<AppState>>,
     _admin: AdminAuth,
@@ -197,6 +237,7 @@ pub async fn stats_overview(
 // 用户（§3.2 / §5.1）
 // ---------------------------------------------------------------------------
 
+#[utoipa::path(get, path = "/api/v1/admin/users", tag = "admin", params(PageQuery), responses((status = 200, description = "用户列表，Paged<AppUser>")))]
 pub async fn list_users(
     State(state): State<Arc<AppState>>,
     admin: AdminAuth,
@@ -211,6 +252,7 @@ pub async fn list_users(
     ok(users)
 }
 
+#[utoipa::path(post, path = "/api/v1/admin/users", tag = "admin", request_body = CreateUserRequest, responses((status = 200, description = "新建用户（AppUser）")))]
 pub async fn create_user(
     State(state): State<Arc<AppState>>,
     admin: AdminAuth,
@@ -247,6 +289,7 @@ pub async fn create_user(
     ok(user)
 }
 
+#[utoipa::path(get, path = "/api/v1/admin/users/{id}", tag = "admin", responses((status = 200, description = "用户详情（AppUser）")))]
 pub async fn get_user(
     State(state): State<Arc<AppState>>,
     _admin: AdminAuth,
@@ -261,6 +304,7 @@ pub async fn get_user(
     ok(user)
 }
 
+#[utoipa::path(patch, path = "/api/v1/admin/users/{id}", tag = "admin", request_body = UpdateUserRequest, responses((status = 200, description = "更新用户（AppUser）")))]
 pub async fn update_user(
     State(state): State<Arc<AppState>>,
     admin: AdminAuth,
@@ -296,6 +340,7 @@ pub async fn update_user(
 
 /// DELETE /api/v1/admin/users/{id}（M19a）：删用户——先释放其全部 Token
 /// 的播放会话并吊销门户会话、禁用 Token（store 层），再删用户行。
+#[utoipa::path(delete, path = "/api/v1/admin/users/{id}", tag = "admin", responses((status = 200, description = "ok")))]
 pub async fn delete_user(
     State(state): State<Arc<AppState>>,
     admin: AdminAuth,
@@ -338,6 +383,7 @@ pub async fn delete_user(
 // Token（§5.2）
 // ---------------------------------------------------------------------------
 
+#[utoipa::path(get, path = "/api/v1/admin/tokens", tag = "admin", params(PageQuery), responses((status = 200, description = "Token 列表，Paged<UserToken>")))]
 pub async fn list_tokens(
     State(state): State<Arc<AppState>>,
     admin: AdminAuth,
@@ -363,6 +409,7 @@ pub async fn list_tokens(
     ok(tokens)
 }
 
+#[utoipa::path(post, path = "/api/v1/admin/tokens", tag = "admin", request_body = CreateTokenRequest, responses((status = 200, description = "创建 Token（明文只返回一次），CreateTokenResponse")))]
 pub async fn create_token(
     State(state): State<Arc<AppState>>,
     admin: AdminAuth,
@@ -408,11 +455,15 @@ pub async fn create_token(
     // 登录票据 + 二维码（§5.2：portal_url 与 qr_png）。
     // M1：票据有效期读系统设置 `ticket_ttl_sec`（默认 60s）。
     let ticket_ttl = state.store.get_setting_i64("ticket_ttl_sec").await;
-    let ticket = state.tickets.issue(
-        token.id,
-        None,
-        std::time::Duration::from_secs(ticket_ttl.max(1) as u64),
-    );
+    let ticket = state
+        .tickets
+        .issue(
+            token.id,
+            None,
+            std::time::Duration::from_secs(ticket_ttl.max(1) as u64),
+        )
+        .await
+        .map_err(ApiError::from)?;
     let portal_url = format!(
         "{}/t/{ticket}",
         state.config.portal_base_url.trim_end_matches('/')
@@ -446,6 +497,7 @@ fn make_qr_png(url: &str) -> String {
     )
 }
 
+#[utoipa::path(patch, path = "/api/v1/admin/tokens/{id}", tag = "admin", request_body = UpdateTokenRequest, responses((status = 200, description = "更新 Token（UserToken）")))]
 pub async fn update_token(
     State(state): State<Arc<AppState>>,
     admin: AdminAuth,
@@ -481,6 +533,7 @@ pub async fn update_token(
 
 /// DELETE /api/v1/admin/tokens/{id}（M19b）：删 Token——先释放其播放会话
 /// 并吊销门户会话，再删 Token 行。
+#[utoipa::path(delete, path = "/api/v1/admin/tokens/{id}", tag = "admin", responses((status = 200, description = "ok")))]
 pub async fn delete_token(
     State(state): State<Arc<AppState>>,
     admin: AdminAuth,
@@ -513,6 +566,7 @@ pub async fn delete_token(
 }
 
 /// POST /api/v1/admin/tokens/{id}/login-ticket：生成一次性登录链接/二维码。
+#[utoipa::path(post, path = "/api/v1/admin/tokens/{id}/login-ticket", tag = "admin", responses((status = 200, description = "ticket + portal_url + qr_png")))]
 pub async fn create_login_ticket(
     State(state): State<Arc<AppState>>,
     admin: AdminAuth,
@@ -531,16 +585,20 @@ pub async fn create_login_ticket(
         .map_err(ApiError::from)?
         .ok_or_else(|| ApiError::new(ErrorCode::NotFound, "token not found"))?;
     let ticket_ttl = state.store.get_setting_i64("ticket_ttl_sec").await;
-    let ticket = state.tickets.issue(
-        id,
-        None,
-        std::time::Duration::from_secs(ticket_ttl.max(1) as u64),
-    );
+    let ticket = state
+        .tickets
+        .issue(
+            id,
+            None,
+            std::time::Duration::from_secs(ticket_ttl.max(1) as u64),
+        )
+        .await
+        .map_err(ApiError::from)?;
     let portal_url = format!(
         "{}/t/{ticket}",
         state.config.portal_base_url.trim_end_matches('/')
     );
-    // M20：签发票据是写操作，写审计（票据本身不入库、不进审计快照）。
+    // M20：签发票据是写操作，写审计（票据明文不进审计快照；库里只存其 SHA-256 哈希）。
     audit(
         &state,
         &admin,
@@ -585,6 +643,7 @@ async fn revoke_token_sessions_inner(
 }
 
 /// POST /api/v1/admin/tokens/{id}/revoke-sessions：吊销该 Token 全部会话。
+#[utoipa::path(post, path = "/api/v1/admin/tokens/{id}/revoke-sessions", tag = "admin", responses((status = 200, description = "revoked 计数")))]
 pub async fn revoke_token_sessions(
     State(state): State<Arc<AppState>>,
     admin: AdminAuth,
@@ -617,6 +676,7 @@ pub async fn revoke_token_sessions(
 // 频道（§5.1 / §3.2）
 // ---------------------------------------------------------------------------
 
+#[utoipa::path(get, path = "/api/v1/admin/channels", tag = "admin", params(PageQuery), responses((status = 200, description = "频道列表，Paged<Channel>")))]
 pub async fn list_channels(
     State(state): State<Arc<AppState>>,
     _admin: AdminAuth,
@@ -630,6 +690,7 @@ pub async fn list_channels(
     ok(channels)
 }
 
+#[utoipa::path(post, path = "/api/v1/admin/channels", tag = "admin", request_body = CreateChannelRequest, responses((status = 200, description = "新建频道（Channel）")))]
 pub async fn create_channel(
     State(state): State<Arc<AppState>>,
     admin: AdminAuth,
@@ -666,11 +727,13 @@ pub async fn create_channel(
             return Err(ApiError::new(ErrorCode::Conflict, "tvg_id already exists"));
         }
     }
-    let channel = state
+    let mut channel = state
         .store
         .create_channel(&req)
         .await
         .map_err(ApiError::from)?;
+    // m9：带台标且配了对象存储时转存；失败保留直链，不影响创建。
+    mirror_channel_logos(&state, std::slice::from_mut(&mut channel)).await;
     audit(
         &state,
         &admin,
@@ -685,6 +748,7 @@ pub async fn create_channel(
     ok(channel)
 }
 
+#[utoipa::path(patch, path = "/api/v1/admin/channels/{id}", tag = "admin", request_body = UpdateChannelRequest, responses((status = 200, description = "编辑频道（Channel）")))]
 pub async fn update_channel(
     State(state): State<Arc<AppState>>,
     admin: AdminAuth,
@@ -698,12 +762,21 @@ pub async fn update_channel(
         "update channels",
     )?;
     let before = state.store.get_channel(id).await.map_err(ApiError::from)?;
-    let channel = state
+    let mut channel = state
         .store
         .update_channel(id, &req)
         .await
         .map_err(ApiError::from)?
         .ok_or_else(|| ApiError::new(ErrorCode::NotFound, "channel not found"))?;
+    // m9：本次改了台标且配了对象存储时转存；失败保留直链，不影响更新。
+    // 只在 logo_url 本次被改写时转存，避免改名等无关更新重复下载。
+    let logo_changed = req
+        .logo_url
+        .as_ref()
+        .is_some_and(|u| before.as_ref().and_then(|c| c.logo_url.as_ref()) != Some(u));
+    if logo_changed {
+        mirror_channel_logos(&state, std::slice::from_mut(&mut channel)).await;
+    }
     audit(
         &state,
         &admin,
@@ -718,6 +791,7 @@ pub async fn update_channel(
     ok(channel)
 }
 
+#[utoipa::path(delete, path = "/api/v1/admin/channels/{id}", tag = "admin", responses((status = 200, description = "ok")))]
 pub async fn delete_channel(
     State(state): State<Arc<AppState>>,
     admin: AdminAuth,
@@ -756,6 +830,7 @@ pub async fn delete_channel(
 // 订阅源（§7）
 // ---------------------------------------------------------------------------
 
+#[utoipa::path(get, path = "/api/v1/admin/sources", tag = "admin", responses((status = 200, description = "订阅源列表，PlaylistSource[]")))]
 pub async fn list_sources(
     State(state): State<Arc<AppState>>,
     admin: AdminAuth,
@@ -767,6 +842,7 @@ pub async fn list_sources(
     ok(sources)
 }
 
+#[utoipa::path(post, path = "/api/v1/admin/sources", tag = "admin", request_body = CreateSourceRequest, responses((status = 200, description = "新建订阅源（PlaylistSource）")))]
 pub async fn create_source(
     State(state): State<Arc<AppState>>,
     admin: AdminAuth,
@@ -802,6 +878,7 @@ pub async fn create_source(
 }
 
 /// PATCH /api/v1/admin/sources/{id}（M19c）：改订阅源（仅超管）。
+#[utoipa::path(patch, path = "/api/v1/admin/sources/{id}", tag = "admin", request_body = UpdateSourceRequest, responses((status = 200, description = "更新订阅源（PlaylistSource）")))]
 pub async fn update_source(
     State(state): State<Arc<AppState>>,
     admin: AdminAuth,
@@ -841,6 +918,7 @@ pub async fn update_source(
 
 /// DELETE /api/v1/admin/sources/{id}（M19c）：删订阅源（仅超管；同步日志
 /// 随源清理，该源同步出的频道保留）。
+#[utoipa::path(delete, path = "/api/v1/admin/sources/{id}", tag = "admin", responses((status = 200, description = "ok")))]
 pub async fn delete_source(
     State(state): State<Arc<AppState>>,
     admin: AdminAuth,
@@ -875,14 +953,20 @@ pub async fn delete_source(
 ///
 /// **不限大小**（用户 2026-11-25 亲口批准，与文档 §7.1 的 20 MB 相悖，
 /// 见 README；远程订阅拉取仍限 20 MB）。安全兜底是流式：multipart field
-/// 按 chunk 落临时文件（不整包进内存），再逐行解析；解析仍在请求内同步
-/// 完成（§7.1 的“异步解析”未实现，见 docs/ACCEPTANCE.md）。
+/// 按 chunk 落临时文件（不整包进内存）。
+///
+/// M16（§7.1 异步解析）：本接口只收文件、注册任务后立即返回
+/// `{ task_id }`；解析 + 入库在后台 tokio 任务里做，进度见
+/// GET /api/v1/admin/upload-tasks/{id}。旧的同步返回体
+/// `M3uImportReport`（total_lines / channels_parsed / channels_imported /
+/// errors）不再由此接口返回，终态数字改从进度接口的同名字段读。
+#[utoipa::path(post, path = "/api/v1/admin/sources/upload", tag = "admin", responses((status = 200, description = "上传 M3U（multipart，异步解析，返回任务 id），UploadTaskCreated")))]
 pub async fn upload_m3u(
     State(state): State<Arc<AppState>>,
     admin: AdminAuth,
     headers: HeaderMap,
     mut multipart: Multipart,
-) -> ApiResult<M3uImportReport> {
+) -> ApiResult<UploadTaskCreated> {
     require(&admin, &[AdminRole::SuperAdmin], "upload sources")?;
     use tokio::io::AsyncWriteExt;
     let mut tmp_path: Option<std::path::PathBuf> = None;
@@ -939,25 +1023,115 @@ pub async fn upload_m3u(
     }
     let tmp_path =
         tmp_path.ok_or_else(|| ApiError::new(ErrorCode::BadRequest, "missing file field"))?;
-    // 逐行解析在阻塞线程跑（大文件解析是纯 CPU 活，不占 async 运行时），
-    // 临时文件随后删除。
-    let outcome = tokio::task::spawn_blocking(move || {
+    // M16：只注册任务、起后台任务，立即返回任务 id，不等解析完成。
+    let task_id = uuid::Uuid::new_v4().to_string();
+    crate::upload_tasks::create_queued(
+        &state.upload_tasks,
+        task_id.clone(),
+        filename.clone(),
+        source_id,
+    );
+    let bg_state = state.clone();
+    let bg_admin = AdminAuth {
+        admin_id: admin.admin_id,
+        username: admin.username.clone(),
+        role: admin.role,
+    };
+    let bg_ip = ip_of(&headers);
+    tokio::spawn(run_upload_task(
+        bg_state,
+        task_id.clone(),
+        tmp_path,
+        filename,
+        source_id,
+        bg_admin,
+        bg_ip,
+    ));
+    ok(UploadTaskCreated { task_id })
+}
+
+/// GET /api/v1/admin/upload-tasks/{id}（M16）：查异步上传任务进度。
+/// 未知 id 回 404；任务只在进程内内存，重启后全部丢失（见 upload_tasks.rs）。
+#[utoipa::path(get, path = "/api/v1/admin/upload-tasks/{id}", tag = "admin", responses((status = 200, description = "上传任务进度（UploadTaskProgress）")))]
+pub async fn get_upload_task(
+    State(state): State<Arc<AppState>>,
+    admin: AdminAuth,
+    Path(id): Path<String>,
+) -> ApiResult<UploadTaskProgress> {
+    require(&admin, &[AdminRole::SuperAdmin], "read upload tasks")?;
+    crate::upload_tasks::get(&state.upload_tasks, &id)
+        .map(ok)
+        .unwrap_or_else(|| Err(ApiError::new(ErrorCode::NotFound, "upload task not found")))
+}
+
+/// M16：后台上传任务——解析（阻塞线程跑，边解析边上报进度）→ 建源/取源
+/// → upsert 入库 → 台标转存 → 审计 → 置 done；任一步失败置 failed 并记错。
+/// 解析完即删临时文件；入库是单次 `upsert_channels` 全量调用（与同步版
+/// 完全一致的语义），故入库阶段进度停在“已解析终态、已入库 0”，完成后
+/// 一次跳到终态数字——不把 upsert 拆批，避免每批重读全源频道导致二次方开销。
+async fn run_upload_task(
+    state: Arc<AppState>,
+    task_id: String,
+    tmp_path: std::path::PathBuf,
+    filename: String,
+    source_id: Option<i64>,
+    admin: AdminAuth,
+    ip: Option<String>,
+) {
+    use crate::upload_tasks::update;
+    let tasks = state.upload_tasks.clone();
+    update(&tasks, &task_id, |p| p.status = UploadTaskStatus::Running);
+    let fail = |tasks: &crate::upload_tasks::UploadTasks, task_id: &str, msg: String| {
+        update(tasks, task_id, |p| {
+            p.status = UploadTaskStatus::Failed;
+            p.error = Some(msg);
+        });
+    };
+    // 解析：阻塞线程跑（纯 CPU 活），每 2000 行回写一次进度。
+    let parse_tasks = tasks.clone();
+    let parse_id = task_id.clone();
+    let parsed = tokio::task::spawn_blocking(move || {
         let file = std::fs::File::open(&tmp_path)?;
-        let parsed = iptv_m3u::parse_m3u_reader(std::io::BufReader::new(file));
+        let out = iptv_m3u::parse_m3u_reader_progress(std::io::BufReader::new(file), |l, c, e| {
+            update(&parse_tasks, &parse_id, |p| {
+                p.total_lines = l;
+                p.channels_parsed = c;
+                p.error_count = e;
+            });
+        });
         let _ = std::fs::remove_file(&tmp_path);
-        parsed
+        out
     })
-    .await
-    .map_err(|_| ApiError::new(ErrorCode::Internal, "parse upload failed"))?
-    .map_err(|_| ApiError::new(ErrorCode::BadRequest, "read upload failed"))?;
+    .await;
+    let outcome = match parsed {
+        Ok(Ok(o)) => o,
+        Ok(Err(_)) => {
+            fail(&tasks, &task_id, "read upload failed".to_string());
+            return;
+        }
+        Err(_) => {
+            fail(&tasks, &task_id, "parse upload failed".to_string());
+            return;
+        }
+    };
+    update(&tasks, &task_id, |p| {
+        p.total_lines = outcome.total_lines;
+        p.channels_parsed = outcome.channels.len();
+        p.error_count = outcome.errors.len();
+    });
     let source = match source_id {
-        Some(id) => state
-            .store
-            .get_source(id)
-            .await
-            .map_err(ApiError::from)?
-            .ok_or_else(|| ApiError::new(ErrorCode::NotFound, "source not found"))?,
-        None => state
+        Some(id) => match state.store.get_source(id).await {
+            Ok(Some(s)) => s,
+            Ok(None) => {
+                fail(&tasks, &task_id, "source not found".to_string());
+                return;
+            }
+            Err(e) => {
+                fail(&tasks, &task_id, format!("read source failed: {e}"));
+                return;
+            }
+        },
+        None => match state
             .store
             .create_source(&CreateSourceRequest {
                 name: filename.clone(),
@@ -970,13 +1144,36 @@ pub async fn upload_m3u(
                 enabled: Some(true),
             })
             .await
-            .map_err(ApiError::from)?,
+        {
+            Ok(s) => s,
+            Err(e) => {
+                fail(&tasks, &task_id, format!("create source failed: {e}"));
+                return;
+            }
+        },
     };
-    let sync = state
+    update(&tasks, &task_id, |p| p.source_id = Some(source.id));
+    let sync = match state
         .store
         .upsert_channels(source.id, outcome.channels.clone())
         .await
-        .map_err(ApiError::from)?;
+    {
+        Ok(s) => s,
+        Err(e) => {
+            fail(&tasks, &task_id, format!("import channels failed: {e}"));
+            return;
+        }
+    };
+    // m9：新增/变更频道的台标转存对象存储；未配置存储或转存失败时
+    // 保留直链，不影响导入结果。
+    let mut to_mirror: Vec<Channel> = sync
+        .added_channels
+        .iter()
+        .chain(sync.metadata_changed.iter())
+        .chain(sync.url_changed.iter())
+        .cloned()
+        .collect();
+    mirror_channel_logos(&state, &mut to_mirror).await;
     audit(
         &state,
         &admin,
@@ -985,18 +1182,18 @@ pub async fn upload_m3u(
         &source.id.to_string(),
         None,
         Some(serde_json::json!({ "added": sync.added, "updated": sync.updated })),
-        ip_of(&headers).as_deref(),
+        ip.as_deref(),
     )
     .await;
-    ok(M3uImportReport {
-        total_lines: outcome.total_lines,
-        channels_parsed: outcome.channels.len(),
-        channels_imported: (sync.added + sync.updated) as usize,
-        errors: outcome.errors,
-    })
+    update(&tasks, &task_id, |p| {
+        p.status = UploadTaskStatus::Done;
+        p.channels_imported = (sync.added + sync.updated) as usize;
+        p.error_count = outcome.errors.len();
+    });
 }
 
 /// POST /api/v1/admin/sources/{id}/sync：立即同步（把 next_sync_at 置为现在，worker 拾取）。
+#[utoipa::path(post, path = "/api/v1/admin/sources/{id}/sync", tag = "admin", responses((status = 200, description = "triggered")))]
 pub async fn trigger_sync(
     State(state): State<Arc<AppState>>,
     admin: AdminAuth,
@@ -1021,6 +1218,7 @@ pub async fn trigger_sync(
     ok(serde_json::json!({ "triggered": true }))
 }
 
+#[utoipa::path(get, path = "/api/v1/admin/sources/{id}/diff", tag = "admin", responses((status = 200, description = "同步差异（新增/变更/失效），SyncDiff")))]
 pub async fn source_diff(
     State(state): State<Arc<AppState>>,
     admin: AdminAuth,
@@ -1038,6 +1236,7 @@ pub async fn source_diff(
     ok(diff)
 }
 
+#[utoipa::path(get, path = "/api/v1/admin/sources/{id}/logs", tag = "admin", params(PageQuery), responses((status = 200, description = "同步日志，Paged<SyncLog>")))]
 pub async fn source_logs(
     State(state): State<Arc<AppState>>,
     admin: AdminAuth,
@@ -1059,6 +1258,7 @@ pub async fn source_logs(
 // 分组 / EPG / 会话 / 套餐 / 管理员 / 审计 / 设置
 // ---------------------------------------------------------------------------
 
+#[utoipa::path(get, path = "/api/v1/admin/groups", tag = "admin", responses((status = 200, description = "频道分组，ChannelGroup[]")))]
 pub async fn list_groups(
     State(state): State<Arc<AppState>>,
     _admin: AdminAuth,
@@ -1067,6 +1267,7 @@ pub async fn list_groups(
     ok(groups)
 }
 
+#[utoipa::path(post, path = "/api/v1/admin/groups", tag = "admin", request_body = CreateGroupRequest, responses((status = 200, description = "新建分组（ChannelGroup）")))]
 pub async fn create_group(
     State(state): State<Arc<AppState>>,
     admin: AdminAuth,
@@ -1106,6 +1307,7 @@ pub async fn create_group(
 }
 
 /// PATCH /api/v1/admin/groups/{id}（M19e）：改分组。
+#[utoipa::path(patch, path = "/api/v1/admin/groups/{id}", tag = "admin", request_body = UpdateGroupRequest, responses((status = 200, description = "更新分组（ChannelGroup）")))]
 pub async fn update_group(
     State(state): State<Arc<AppState>>,
     admin: AdminAuth,
@@ -1151,6 +1353,7 @@ pub async fn update_group(
 
 /// DELETE /api/v1/admin/groups/{id}（M19e）：删分组——`channel_group_map`
 /// 里的映射随分组清理（频道本身保留）。
+#[utoipa::path(delete, path = "/api/v1/admin/groups/{id}", tag = "admin", responses((status = 200, description = "ok")))]
 pub async fn delete_group(
     State(state): State<Arc<AppState>>,
     admin: AdminAuth,
@@ -1181,6 +1384,7 @@ pub async fn delete_group(
     ok(serde_json::json!({ "deleted": true }))
 }
 
+#[utoipa::path(get, path = "/api/v1/admin/epg/sources", tag = "admin", responses((status = 200, description = "EPG 源列表，EpgSource[]")))]
 pub async fn list_epg_sources(
     State(state): State<Arc<AppState>>,
     admin: AdminAuth,
@@ -1197,6 +1401,7 @@ pub async fn list_epg_sources(
     ok(sources)
 }
 
+#[utoipa::path(post, path = "/api/v1/admin/epg/sources", tag = "admin", responses((status = 200, description = "新建 EPG 源（EpgSource）")))]
 pub async fn create_epg_source(
     State(state): State<Arc<AppState>>,
     admin: AdminAuth,
@@ -1241,6 +1446,7 @@ pub async fn create_epg_source(
 }
 
 /// PATCH /api/v1/admin/epg/sources/{id}（M19f）：改 EPG 源（仅超管）。
+#[utoipa::path(patch, path = "/api/v1/admin/epg/sources/{id}", tag = "admin", request_body = UpdateEpgSourceRequest, responses((status = 200, description = "更新 EPG 源（EpgSource）")))]
 pub async fn update_epg_source(
     State(state): State<Arc<AppState>>,
     admin: AdminAuth,
@@ -1276,6 +1482,7 @@ pub async fn update_epg_source(
 
 /// DELETE /api/v1/admin/epg/sources/{id}（M19f）：删 EPG 源（仅超管；
 /// `epg_channel_map` 里的节目映射随源清理，已生成的节目行保留）。
+#[utoipa::path(delete, path = "/api/v1/admin/epg/sources/{id}", tag = "admin", responses((status = 200, description = "ok")))]
 pub async fn delete_epg_source(
     State(state): State<Arc<AppState>>,
     admin: AdminAuth,
@@ -1310,6 +1517,7 @@ pub async fn delete_epg_source(
     ok(serde_json::json!({ "deleted": true }))
 }
 
+#[utoipa::path(get, path = "/api/v1/admin/sessions", tag = "admin", params(PageQuery), responses((status = 200, description = "实时会话看板，Paged<PlaybackSession>")))]
 pub async fn list_sessions(
     State(state): State<Arc<AppState>>,
     admin: AdminAuth,
@@ -1326,6 +1534,7 @@ pub async fn list_sessions(
     ok(sessions)
 }
 
+#[utoipa::path(delete, path = "/api/v1/admin/sessions/{id}", tag = "admin", responses((status = 200, description = "ok")))]
 pub async fn kick_session(
     State(state): State<Arc<AppState>>,
     admin: AdminAuth,
@@ -1383,6 +1592,7 @@ pub async fn kick_session(
     ok(serde_json::json!({ "kicked": true }))
 }
 
+#[utoipa::path(get, path = "/api/v1/admin/plans", tag = "admin", responses((status = 200, description = "套餐列表，Plan[]")))]
 pub async fn list_plans(
     State(state): State<Arc<AppState>>,
     _admin: AdminAuth,
@@ -1391,6 +1601,7 @@ pub async fn list_plans(
     ok(plans)
 }
 
+#[utoipa::path(post, path = "/api/v1/admin/plans", tag = "admin", request_body = CreatePlanRequest, responses((status = 200, description = "新建套餐（Plan）")))]
 pub async fn create_plan(
     State(state): State<Arc<AppState>>,
     admin: AdminAuth,
@@ -1426,6 +1637,7 @@ pub async fn create_plan(
 }
 
 /// PATCH /api/v1/admin/plans/{id}（M19d）：改套餐（仅超管）。
+#[utoipa::path(patch, path = "/api/v1/admin/plans/{id}", tag = "admin", request_body = UpdatePlanRequest, responses((status = 200, description = "更新套餐（Plan）")))]
 pub async fn update_plan(
     State(state): State<Arc<AppState>>,
     admin: AdminAuth,
@@ -1467,6 +1679,7 @@ pub async fn update_plan(
 
 /// DELETE /api/v1/admin/plans/{id}（M19d）：删套餐（仅超管）；仍有用户
 /// 引用该套餐时拒绝（409）并明示人数。
+#[utoipa::path(delete, path = "/api/v1/admin/plans/{id}", tag = "admin", responses((status = 200, description = "ok")))]
 pub async fn delete_plan(
     State(state): State<Arc<AppState>>,
     admin: AdminAuth,
@@ -1481,9 +1694,13 @@ pub async fn delete_plan(
         .await
         .map_err(ApiError::from)?;
     if n_users > 0 {
-        return Err(ApiError::new(
+        // N1：被引用文案走 FTL（`errors.plan-in-use`，$n 为引用人数），
+        // 不再拼英文；code 仍为 40900，message 由序列化层按 locale 渲染。
+        return Err(ApiError::with_key(
             ErrorCode::Conflict,
+            "errors.plan-in-use",
             format!("plan is in use by {n_users} user(s); reassign them first"),
+            vec![("n".to_string(), serde_json::json!(n_users))],
         ));
     }
     let deleted = state.store.delete_plan(id).await.map_err(ApiError::from)?;
@@ -1504,6 +1721,7 @@ pub async fn delete_plan(
     ok(serde_json::json!({ "deleted": true }))
 }
 
+#[utoipa::path(get, path = "/api/v1/admin/admins", tag = "admin", responses((status = 200, description = "管理员列表（超管），AdminUser[]")))]
 pub async fn list_admins(
     State(state): State<Arc<AppState>>,
     admin: AdminAuth,
@@ -1513,6 +1731,7 @@ pub async fn list_admins(
     ok(admins)
 }
 
+#[utoipa::path(post, path = "/api/v1/admin/admins", tag = "admin", request_body = CreateAdminRequest, responses((status = 200, description = "新建管理员（超管），CreateAdminResponse")))]
 pub async fn create_admin(
     State(state): State<Arc<AppState>>,
     admin: AdminAuth,
@@ -1590,6 +1809,7 @@ pub async fn create_admin(
 }
 
 /// PATCH /api/v1/admin/admins/{id}：改角色 / 是否强制 TOTP（仅超管）。
+#[utoipa::path(patch, path = "/api/v1/admin/admins/{id}", tag = "admin", request_body = UpdateAdminRequest, responses((status = 200, description = "更新管理员（AdminUser）")))]
 pub async fn update_admin(
     State(state): State<Arc<AppState>>,
     admin: AdminAuth,
@@ -1650,6 +1870,7 @@ pub async fn update_admin(
 
 /// DELETE /api/v1/admin/admins/{id}：删除管理员（仅超管；不删自己、
 /// 不删最后一个超管）。
+#[utoipa::path(delete, path = "/api/v1/admin/admins/{id}", tag = "admin", responses((status = 200, description = "ok")))]
 pub async fn delete_admin(
     State(state): State<Arc<AppState>>,
     admin: AdminAuth,
@@ -1702,6 +1923,7 @@ pub async fn delete_admin(
 
 /// POST /api/v1/admin/admins/{id}/reset-totp：重新配给 TOTP 密钥（仅超管）。
 /// 旧密钥立即作废，新密钥回到待验证态；密钥/URI/二维码只返回一次。
+#[utoipa::path(post, path = "/api/v1/admin/admins/{id}/reset-totp", tag = "admin", responses((status = 200, description = "ok")))]
 pub async fn reset_admin_totp(
     State(state): State<Arc<AppState>>,
     admin: AdminAuth,
@@ -1739,7 +1961,7 @@ pub async fn reset_admin_totp(
     ok(serde_json::json!({ "totp_secret": secret, "totp_uri": uri, "qr_png": qr_png }))
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize, utoipa::IntoParams)]
 pub struct AuditQuery {
     pub actor: Option<String>,
     pub action: Option<String>,
@@ -1757,6 +1979,7 @@ fn default_page_size() -> u32 {
     20
 }
 
+#[utoipa::path(get, path = "/api/v1/admin/audit", tag = "admin", params(AuditQuery), responses((status = 200, description = "审计检索（超管），Paged<AuditLog>")))]
 pub async fn list_audit(
     State(state): State<Arc<AppState>>,
     admin: AdminAuth,
@@ -1781,6 +2004,7 @@ pub async fn list_audit(
 /// GET /api/v1/admin/audit/export：审计导出（m10，§5.1“审计检索与导出”）。
 /// 与列表同款过滤条件，返回 CSV 文件下载；单页上限 100 行，逐页取到
 /// 10000 行为止。仅超管可读（与列表同权限）。
+#[utoipa::path(get, path = "/api/v1/admin/audit/export", tag = "admin", params(AuditQuery), responses((status = 200, description = "审计导出（CSV 文件）")))]
 pub async fn export_audit(
     State(state): State<Arc<AppState>>,
     admin: AdminAuth,
@@ -1846,6 +2070,7 @@ fn csv_field(s: &str) -> String {
     }
 }
 
+#[utoipa::path(get, path = "/api/v1/admin/settings", tag = "admin", responses((status = 200, description = "系统设置（超管），SystemSetting[]")))]
 pub async fn list_settings(
     State(state): State<Arc<AppState>>,
     admin: AdminAuth,
@@ -1857,6 +2082,7 @@ pub async fn list_settings(
     ok(settings)
 }
 
+#[utoipa::path(patch, path = "/api/v1/admin/settings", tag = "admin", responses((status = 200, description = "更新系统设置（超管，仅 §3.2 的键），SystemSetting[]")))]
 pub async fn update_settings(
     State(state): State<Arc<AppState>>,
     admin: AdminAuth,
@@ -1905,4 +2131,138 @@ pub async fn update_settings(
     .await;
     let settings = state.store.list_settings().await.map_err(ApiError::from)?;
     ok(settings)
+}
+
+// ---------------------------------------------------------------------------
+// m22：文案覆盖（§12.8 `i18n_override`）
+// ---------------------------------------------------------------------------
+
+/// 校验覆盖的 locale（须为支持语言）与 key（点分 FTL key 形）。
+fn validate_override(locale: &str, key: &str, value: &str) -> Result<String, ApiError> {
+    let locale = iptv_i18n::normalize_locale(locale).unwrap_or_else(|| locale.to_string());
+    let supported = iptv_i18n::I18n::supported_locales();
+    if !supported.contains(&locale.as_str()) && locale != "en-XA" {
+        return Err(ApiError::new(
+            ErrorCode::ValidationFailed,
+            format!("unsupported locale: {locale}"),
+        ));
+    }
+    if key.is_empty()
+        || !key.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+        || !key
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+    {
+        return Err(ApiError::new(
+            ErrorCode::ValidationFailed,
+            format!("invalid i18n key: {key}"),
+        ));
+    }
+    if value.is_empty() || value.chars().count() > 4096 {
+        return Err(ApiError::new(
+            ErrorCode::ValidationFailed,
+            "override value must be non-empty and at most 4096 chars",
+        ));
+    }
+    Ok(locale)
+}
+
+/// 读库刷新本进程覆盖表（写覆盖后调用；失败只记日志，不让写操作失败，
+/// 下次启动仍会从库重装）。
+async fn refresh_overrides(state: &Arc<AppState>) {
+    match state.store.i18n_overrides_map().await {
+        Ok(map) => iptv_i18n::I18n::set_overrides(map),
+        Err(e) => tracing::warn!("刷新 i18n 覆盖失败：{e}"),
+    }
+}
+
+/// m22：文案覆盖列表（任意管理员可读，与 `list_settings` 同权限）。
+#[utoipa::path(get, path = "/api/v1/admin/i18n-overrides", tag = "admin", responses((status = 200, description = "文案覆盖列表，I18nOverride[]")))]
+pub async fn list_i18n_overrides(
+    State(state): State<Arc<AppState>>,
+    _admin: AdminAuth,
+) -> ApiResult<Vec<iptv_dto::I18nOverride>> {
+    let list = state
+        .store
+        .list_i18n_overrides()
+        .await
+        .map_err(ApiError::from)?;
+    ok(list)
+}
+
+/// m22：新增/修改单条覆盖（仅超管；空串不许覆盖，用 DELETE 删覆盖）。
+#[utoipa::path(put, path = "/api/v1/admin/i18n-overrides", tag = "admin", request_body = iptv_dto::UpsertI18nOverrideRequest, responses((status = 200, description = "新增/改写文案覆盖，I18nOverride[]")))]
+pub async fn upsert_i18n_override(
+    State(state): State<Arc<AppState>>,
+    admin: AdminAuth,
+    headers: HeaderMap,
+    Json(req): Json<iptv_dto::UpsertI18nOverrideRequest>,
+) -> ApiResult<Vec<iptv_dto::I18nOverride>> {
+    require(&admin, &[AdminRole::SuperAdmin], "update i18n overrides")?;
+    let locale = validate_override(&req.locale, &req.key, &req.value)?;
+    state
+        .store
+        .upsert_i18n_override(&locale, &req.key, &req.value)
+        .await
+        .map_err(ApiError::from)?;
+    refresh_overrides(&state).await;
+    audit(
+        &state,
+        &admin,
+        "i18n_override.upsert",
+        "i18n_override",
+        &format!("{locale}:{}", req.key),
+        None,
+        Some(serde_json::json!({"value": req.value})),
+        ip_of(&headers).as_deref(),
+    )
+    .await;
+    let list = state
+        .store
+        .list_i18n_overrides()
+        .await
+        .map_err(ApiError::from)?;
+    ok(list)
+}
+
+#[derive(Debug, serde::Deserialize, utoipa::IntoParams)]
+pub struct I18nOverrideQuery {
+    pub locale: String,
+    pub key: String,
+}
+
+/// m22：删除单条覆盖（仅超管；不存在也返回当前列表，不报 404，
+/// 与“覆盖不存在即无覆盖”语义一致）。
+#[utoipa::path(delete, path = "/api/v1/admin/i18n-overrides", tag = "admin", params(I18nOverrideQuery), responses((status = 200, description = "删除文案覆盖，I18nOverride[]")))]
+pub async fn delete_i18n_override(
+    State(state): State<Arc<AppState>>,
+    admin: AdminAuth,
+    headers: HeaderMap,
+    Query(q): Query<I18nOverrideQuery>,
+) -> ApiResult<Vec<iptv_dto::I18nOverride>> {
+    require(&admin, &[AdminRole::SuperAdmin], "delete i18n overrides")?;
+    let locale = iptv_i18n::normalize_locale(&q.locale).unwrap_or(q.locale.clone());
+    state
+        .store
+        .delete_i18n_override(&locale, &q.key)
+        .await
+        .map_err(ApiError::from)?;
+    refresh_overrides(&state).await;
+    audit(
+        &state,
+        &admin,
+        "i18n_override.delete",
+        "i18n_override",
+        &format!("{locale}:{}", q.key),
+        None,
+        None,
+        ip_of(&headers).as_deref(),
+    )
+    .await;
+    let list = state
+        .store
+        .list_i18n_overrides()
+        .await
+        .map_err(ApiError::from)?;
+    ok(list)
 }

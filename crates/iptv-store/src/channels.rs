@@ -212,6 +212,21 @@ impl Store {
         })
     }
 
+    /// 只改频道台标地址（m9：转存成功后把 `logo_url` 从上游直链换成
+    /// 对象存储地址；转存失败不调这里，直链原样保留）。
+    pub async fn update_channel_logo_url(&self, id: i64, logo_url: &str) -> anyhow::Result<()> {
+        sqlx::query(&ph(
+            "UPDATE channel SET logo_url = ?, updated_at = ? WHERE id = ?",
+            self.dialect,
+        ))
+        .bind(logo_url)
+        .bind(epoch(Utc::now()))
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     pub async fn update_channel(
         &self,
         id: i64,
@@ -514,7 +529,9 @@ impl Store {
                 endpoints.entry(e.channel_id).or_default().push(e);
             }
         }
-        let key_of_existing = |ch: &Channel| -> String {
+        // M16：原为闭包、借住 `endpoints`，导致循环内无法再补登新插入行
+        // 的端点（E0502）；改成独立函数、每次传 `endpoints` 引用。
+        fn key_of_existing(ch: &Channel, endpoints: &HashMap<i64, Vec<ChannelEndpoint>>) -> String {
             if let Some(t) = &ch.tvg_id {
                 if !t.trim().is_empty() {
                     return format!("tvg:{t}");
@@ -528,17 +545,17 @@ impl Store {
                     .map(|e| normalize_play_url(&e.url))
                     .unwrap_or_default()
             )
-        };
+        }
         let mut by_key: HashMap<String, Channel> = HashMap::new();
         for ch in &existing {
-            by_key.insert(key_of_existing(ch), ch.clone());
+            by_key.insert(key_of_existing(ch, &endpoints), ch.clone());
         }
         // 全局匹配补进同一张去重表（本源优先；键冲突即同一行，唯一索引保证）。
         // 注意：`existing` 仍只含本源频道——下面的“订阅里消失”逻辑只对本源
         // 频道生效，全局匹配的频道不会被误停用/误删。
         for ch in &global_matches {
             by_key
-                .entry(key_of_existing(ch))
+                .entry(key_of_existing(ch, &endpoints))
                 .or_insert_with(|| ch.clone());
         }
         let mut seen_keys: HashSet<String> = HashSet::with_capacity(items.len());
@@ -555,7 +572,28 @@ impl Store {
             match by_key.get(&key) {
                 Some(cur) => {
                     if cur.content_hash.as_deref() == Some(hash.as_str()) {
-                        continue; // 无变化
+                        // m9：content_hash 不含 logo（normalize::content_hash
+                        // 只取 tvg_id/url/name/group），故仅台标变化时哈希
+                        // 不变；单独比对 logo，变了就只更新 logo_url 并记
+                        // 入 metadata_changed，让 worker 的 mirror_logos
+                        // 接手转存；logo 没变才真正跳过。
+                        if cur.logo_url != item.logo {
+                            sqlx::query(&ph(
+                                "UPDATE channel SET logo_url = ?, updated_at = ? WHERE id = ?",
+                                self.dialect,
+                            ))
+                            .bind(item.logo.clone())
+                            .bind(epoch(now))
+                            .bind(cur.id)
+                            .execute(&self.pool)
+                            .await?;
+                            let mut updated = cur.clone();
+                            updated.logo_url = item.logo.clone();
+                            updated.updated_at = now;
+                            outcome.metadata_changed.push(updated);
+                            outcome.updated += 1;
+                        }
+                        continue; // 其余字段无变化
                     }
                     let old_url = endpoints
                         .get(&cur.id)
@@ -648,7 +686,7 @@ impl Store {
                         epoch(now)
                     )?;
                     let proto = protocol_for(&item.url, None);
-                    self.insert_endpoint(id, &item.url, &proto, true, 0).await?;
+                    let ep_id = self.insert_endpoint(id, &item.url, &proto, true, 0).await?;
                     let ch = Channel {
                         id,
                         tvg_id: tvg,
@@ -672,6 +710,21 @@ impl Store {
                         created_at: now,
                         updated_at: now,
                     };
+                    // M16：新插入行立即补登 `by_key` 与 `endpoints`——同一批里
+                    // 再出现同 tvg_id（或同 URL）时走更新分支（后者胜出），
+                    // 不再重走 INSERT 撞 `uq_channel_tvg`、整批失败（§7.2
+                    // 容错：重复不得整批失败）。不补登时第二条同 tvg_id
+                    // 仍命中 None 分支 INSERT，报 UNIQUE constraint failed。
+                    by_key.insert(key.clone(), ch.clone());
+                    endpoints.entry(id).or_default().push(ChannelEndpoint {
+                        id: ep_id,
+                        channel_id: id,
+                        url: item.url.clone(),
+                        protocol: proto,
+                        quality: None,
+                        is_primary: true,
+                        priority: 0,
+                    });
                     outcome.added_channels.push(ch);
                     outcome.added += 1;
                 }
@@ -684,7 +737,7 @@ impl Store {
         // 停滞。分批（500 个 id 一批）后同等规模约数十秒内完成。
         let mut missing_ids: Vec<i64> = Vec::new();
         for cur in &existing {
-            let key = key_of_existing(cur);
+            let key = key_of_existing(cur, &endpoints);
             if seen_keys.contains(&key) {
                 continue;
             }

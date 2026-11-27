@@ -24,6 +24,7 @@ portal-remember-device = 记住此设备（90 天）
 portal-quota-title = 并发额度
 portal-player-retry = 重试
 portal-player-retrying = 正在重新连接…第 { $n } 次尝试，{ $secs } 秒后重试
+portal-player-hls-auto = 自动
 portal-allowed-groups = 允许的分组
 portal-logout-all = 退出全部设备
 portal-landing-hint = 粘贴 Token 登录，或打开管理员发给你的登录链接／扫描二维码。

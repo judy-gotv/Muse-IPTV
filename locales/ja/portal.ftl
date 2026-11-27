@@ -24,6 +24,7 @@ portal-remember-device = このデバイスを記憶する（90 日間）
 portal-quota-title = 同時視聴枠
 portal-player-retry = 再試行
 portal-player-retrying = 再接続中…{ $n } 回目の試行、{ $secs } 秒後に再試行します
+portal-player-hls-auto = 自動
 portal-allowed-groups = 許可されたグループ
 portal-logout-all = すべてのデバイスからサインアウト
 portal-landing-hint = トークンを貼り付けてサインインするか、管理者から受け取ったログインリンクを開くか、QR コードをスキャンしてください。

@@ -9,6 +9,13 @@ use serde::Deserialize;
 use std::sync::Arc;
 
 /// GET /api/v1/channels（按 Token 授权过滤，见 store.list_channels_for_token）。
+#[utoipa::path(
+    get,
+    path = "/api/v1/channels",
+    tag = "channels",
+    params(PageQuery),
+    responses((status = 200, description = "频道列表（按 Token 授权过滤），Paged<Channel>"))
+)]
 pub async fn list_channels(
     State(state): State<Arc<AppState>>,
     auth: PortalAuth,
@@ -33,13 +40,14 @@ pub async fn list_channels(
     ok(channels)
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
 pub struct EpgQuery {
     pub from: Option<DateTime<Utc>>,
     pub to: Option<DateTime<Utc>>,
 }
 
 /// GET /api/v1/epg/channels/{channel_id}/programs：7 天节目单（§14.1）。
+#[utoipa::path(get, path = "/api/v1/epg/channels/{channel_id}/programs", tag = "channels", params(EpgQuery), responses((status = 200, description = "节目单（默认 7 天），EpgProgram[]")))]
 pub async fn epg_programs(
     State(state): State<Arc<AppState>>,
     _auth: PortalAuth,
@@ -58,11 +66,12 @@ pub async fn epg_programs(
 }
 
 /// GET /api/v1/epg/now：当前节目（?channel_ids=1,2,3）。
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
 pub struct NowQuery {
     pub channel_ids: String,
 }
 
+#[utoipa::path(get, path = "/api/v1/epg/now", tag = "channels", params(NowQuery), responses((status = 200, description = "当前节目，EpgProgram[]")))]
 pub async fn epg_now(
     State(state): State<Arc<AppState>>,
     _auth: PortalAuth,

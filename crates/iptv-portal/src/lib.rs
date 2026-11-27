@@ -22,6 +22,7 @@ use iptv_dto::{
 // 只在服务端用（api_get/api_post 解 Envelope）。
 #[cfg(feature = "ssr")]
 use iptv_dto::Envelope;
+use iptv_ui::dpad::TvRemoteHint;
 use iptv_ui::{
     fmt_dt, t_args_or, t_or, ChannelCard, DeviceRow, EpgSidebar, LanguageSwitcher, LocaleCtx,
     Player, QuotaRing,
@@ -102,6 +103,25 @@ fn parts_accept_language() -> Option<String> {
     web_sys::window()?.navigator().language()
 }
 
+/// 请求上下文里的 User-Agent（m23：Cookie 未设置 `iptv_device` 时按 UA
+/// 兜底判定电视端；见 `cookie_device`）。
+#[cfg(feature = "ssr")]
+fn parts_user_agent() -> Option<String> {
+    let parts = use_context::<axum::http::request::Parts>()?;
+    parts
+        .headers
+        .get(axum::http::header::USER_AGENT)?
+        .to_str()
+        .ok()
+        .map(|s| s.to_string())
+}
+
+/// WASM 侧读浏览器 UA。
+#[cfg(not(feature = "ssr"))]
+fn parts_user_agent() -> Option<String> {
+    web_sys::window()?.navigator().user_agent().ok()
+}
+
 /// 请求上下文里的原始客户端 IP（网关写好的 X-Forwarded-For 首项，或
 /// X-Real-IP），调 API 时原样转发，API 才能按真实 IP 做限流分桶（M2）；
 /// 直连门户时浏览器一般不带这两个头，返回 None，API 回落到对端 IP。
@@ -177,8 +197,22 @@ async fn api_post<B: Serialize, T: DeserializeOwned>(
 ) -> Result<(Option<T>, Option<String>), String> {
     let url = format!("{}{path}", api_base());
     let mut req = http_client().post(&url).json(body);
+    // m14：server fn 的内部 POST 也带双提交——token 取自浏览器发来的
+    // `iptv_csrf` Cookie（SSR 中间件签发），以请求头 + Cookie 头同时发给
+    // API；尚无会话（票据兑换）时没有 token，API 走 Origin 兜底。
+    let mut cookie = String::new();
     if let Some(s) = sid {
-        req = req.header("Cookie", format!("iptv_portal_sid={s}"));
+        cookie.push_str(&format!("iptv_portal_sid={s}"));
+    }
+    if let Some(c) = parts_cookie("iptv_csrf") {
+        if !cookie.is_empty() {
+            cookie.push_str("; ");
+        }
+        cookie.push_str(&format!("iptv_csrf={c}"));
+        req = req.header("x-csrf-token", c);
+    }
+    if !cookie.is_empty() {
+        req = req.header("Cookie", cookie);
     }
     if let Some(xff) = parts_forwarded_for() {
         req = req.header("X-Forwarded-For", xff);
@@ -413,7 +447,15 @@ fn cookie_theme() -> String {
 }
 
 fn cookie_device() -> String {
-    parts_cookie("iptv_device").unwrap_or_else(|| "web".to_string())
+    // m23：Cookie 显式值优先；此前全仓没有任何代码写 `iptv_device`
+    // Cookie，电视/盒子靠 UA 兜底，否则电视端（含 D-pad 导航）永远进不去。
+    if let Some(d) = parts_cookie("iptv_device") {
+        return d;
+    }
+    if parts_user_agent().is_some_and(|ua| iptv_ui::dpad::looks_like_tv(&ua)) {
+        return "tv".to_string();
+    }
+    "web".to_string()
 }
 
 /// HTML 外壳（普通函数，由 main 的 `leptos_routes` 调用）。
@@ -439,7 +481,20 @@ pub fn shell(props: leptos::config::LeptosOptions) -> impl IntoView {
                 <link rel="stylesheet" href="/design.css"/>
                 <Title text="IPTV 播放平台"/>
             </head>
-            <body>
+            <body
+                // m23 电视端 D-pad：只在 data-device="tv" 时由
+                // `handle_keydown` 接管方向/确认/返回键；普通 web 端不启用。
+                // 监听挂在 <body> 上：焦点在页面内任何元素或 <body> 本身时
+                // 按键都会冒泡到这里；SSR 渲染不输出任何属性，hydrate 后生效。
+                on:keydown=move |ev| {
+                    #[cfg(target_arch = "wasm32")]
+                    iptv_ui::dpad::handle_keydown(&ev, "/");
+                    #[cfg(not(target_arch = "wasm32"))]
+                    {
+                        let _ = ev;
+                    }
+                }
+            >
                 <App/>
             </body>
         </html>
@@ -452,8 +507,11 @@ pub fn App() -> impl IntoView {
     // 每请求协商 locale 并注入上下文（§12.2 / §12.4）。
     let loc = negotiated_locale();
     provide_context(LocaleCtx(loc));
+    // m23：电视端在页面底部显示遥控用法提示。
+    let is_tv = cookie_device() == "tv";
     view! {
         <Router>
+            <TvRemoteHint is_tv=is_tv/>
             <Routes fallback=|| view! { <NotFoundPage/> }>
                 <Route path=path!("/") view=LandingPage/>
                 <Route path=path!("/t/:ticket") view=TicketPage/>

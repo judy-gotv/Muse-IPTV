@@ -24,6 +24,7 @@ portal-remember-device = 이 기기 기억하기(90일)
 portal-quota-title = 동시 시청 할당량
 portal-player-retry = 다시 시도
 portal-player-retrying = 다시 연결하는 중… { $n }번째 시도, { $secs }초 후 다시 시도합니다
+portal-player-hls-auto = 자동
 portal-allowed-groups = 허용된 그룹
 portal-logout-all = 모든 기기에서 로그아웃
 portal-landing-hint = 토큰을 붙여넣어 로그인하거나, 관리자에게 받은 로그인 링크를 열거나 QR 코드를 스캔하세요.

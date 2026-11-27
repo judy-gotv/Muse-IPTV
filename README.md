@@ -101,6 +101,8 @@ docker compose -f deploy/docker-compose.yml up -d
 | `IPTV_PORT` | 8081 | compose 映射到宿主的端口（只映射网关一个） |
 | `GATEWAY_BIND_ADDR` | `0.0.0.0:8081` | 网关监听地址 |
 | `IPTV_PORTAL_ADDR` / `IPTV_ADMIN_ADDR` | `0.0.0.0:18081` / `0.0.0.0:18082` | 门户/后台内部监听地址（.env 方式部署时用） |
+| `S3_ENDPOINT` / `S3_BUCKET` / `S3_ACCESS_KEY` / `S3_SECRET_KEY` | 空（不转存） | 台标转存对象存储（§7.2）：四项全配才启用，`logo_url` 转存为 `logos/<sha256>.<ext>` 后入库；缺一即保持上游直链；`S3_REGION` 缺省 `us-east-1`，`S3_PUBLIC_BASE_URL` 可选（公开访问前缀，如 CDN 域名） |
+| `IPTV_CORS_ORIGINS` | 空（只同源） | CORS 允许源，逗号分隔，如 `https://app.example.com`；写请求仍须过 CSRF 双提交/Origin 检查，且永不配 `allow_credentials`（会话 Cookie 只走同源网关） |
 
 
 ## 快速开始（源码）

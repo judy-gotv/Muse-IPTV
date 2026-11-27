@@ -24,6 +24,7 @@ portal-remember-device = Remember this device (90 days)
 portal-quota-title = Concurrent quota
 portal-player-retry = Retry
 portal-player-retrying = Reconnecting… attempt { $n }, retry in { $secs }s
+portal-player-hls-auto = Auto
 portal-allowed-groups = Allowed groups
 portal-logout-all = Sign out of all devices
 portal-landing-hint = Paste your Token to sign in, or open the ticket link / scan the QR code from your admin.

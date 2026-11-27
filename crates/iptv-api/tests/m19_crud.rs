@@ -38,6 +38,7 @@ async fn setup() -> Fixture {
         admin_secret: "test-admin-secret".to_string(),
         portal_base_url: "http://127.0.0.1:8081".to_string(),
         bind_addr: "127.0.0.1:0".to_string(),
+        cors_origins: vec![],
     };
     let state = Arc::new(AppState::new(config).await.expect("AppState::new"));
     Fixture { state, path }
@@ -402,6 +403,15 @@ async fn m19d_plan_in_use_conflicts_then_deletes_after_user_gone() {
     .unwrap_err();
     assert_eq!(err.code, ErrorCode::Conflict);
     assert_eq!(err.code.http_status(), 409);
+    // N1：文案走 FTL key（带人数参数），英文 message 只作兜底。
+    assert_eq!(err.message_key.as_deref(), Some("errors.plan-in-use"));
+    assert_eq!(
+        err.args
+            .iter()
+            .find(|(k, _)| k == "n")
+            .map(|(_, v)| v.clone()),
+        Some(serde_json::json!(1))
+    );
     // 用户删掉后即可删套餐。
     let _ = admin::delete_user(
         State(state.clone()),

@@ -26,6 +26,11 @@ anyhow = { workspace = true }
 # ssrf.rs 的异步 DNS 解析用 tokio（仅 lookup_host）；其余领域规则仍是纯函数。
 tokio = { workspace = true }
 url = { workspace = true }
+# logo_store.rs 的台标下载 + S3 PUT 用 reqwest（§7.2，m9）。
+# iptv-core 只被服务端 crate（iptv-api / iptv-store / iptv-worker）依赖，
+# 不进 Leptos WASM 构建，故可直接依赖 reqwest。
+reqwest = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }

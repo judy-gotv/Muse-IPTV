@@ -15,12 +15,21 @@ use serde::{Deserialize, Serialize};
 // ---------------------------------------------------------------------------
 
 /// 成功 / 失败统一包。`code == 0` 成功；其余见 [`ErrorCode`]。
+/// N1：`message_key` + `args`（均可选）——同一错误码在不同场景下文案
+/// 不同时（如 40900 通用“已存在” vs 删套餐“被 N 人引用”），业务层
+/// 只抛 key 与参数，序列化层按 locale 渲染（§12.5：业务层只抛错误码
+/// 与文案参数）。无 key 时按 `errors.e<code>` 渲染；`message` 仍保留
+/// 英文兜底，供无 key 的旧路径与日志用。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Envelope<T> {
     pub code: i32,
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<T>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub args: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 impl<T> Envelope<T> {
@@ -29,6 +38,8 @@ impl<T> Envelope<T> {
             code: 0,
             message: "ok".to_string(),
             data: Some(data),
+            message_key: None,
+            args: None,
         }
     }
     pub fn err(code: ErrorCode, message: impl Into<String>) -> Envelope<()> {
@@ -36,6 +47,24 @@ impl<T> Envelope<T> {
             code: code as i32,
             message: message.into(),
             data: None,
+            message_key: None,
+            args: None,
+        }
+    }
+    /// 带本地化 key 的错误包：`message` 为英文兜底，`message_key` 为 FTL
+    /// 点分 key（如 `errors.plan-in-use`），`args` 为文案参数。
+    pub fn err_with_key(
+        code: ErrorCode,
+        message: impl Into<String>,
+        message_key: impl Into<String>,
+        args: serde_json::Map<String, serde_json::Value>,
+    ) -> Envelope<()> {
+        Envelope {
+            code: code as i32,
+            message: message.into(),
+            data: None,
+            message_key: Some(message_key.into()),
+            args: Some(args),
         }
     }
 }
@@ -97,7 +126,8 @@ impl ErrorCode {
 }
 
 /// 分页请求（§4.5 / §5.2 各列表接口通用）。
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// m21：派生 `IntoParams` 供 utoipa 从 `Query<PageQuery>` 生成查询参数。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, utoipa::IntoParams)]
 pub struct PageQuery {
     #[serde(default = "default_page")]
     pub page: u32,
@@ -126,7 +156,7 @@ pub struct Paged<T> {
 // §9 / §3.2：用户、套餐、Token
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum UserStatus {
     Active,
@@ -150,7 +180,7 @@ pub struct AppUser {
     pub updated_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct CreateUserRequest {
     pub display_name: String,
     pub email: Option<String>,
@@ -161,7 +191,7 @@ pub struct CreateUserRequest {
     pub expires_at: Option<DateTime<Utc>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct UpdateUserRequest {
     pub display_name: Option<String>,
     pub email: Option<String>,
@@ -188,7 +218,7 @@ pub struct Plan {
     pub created_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct CreatePlanRequest {
     pub name: String,
     pub max_concurrent_sessions: i32,
@@ -200,7 +230,7 @@ pub struct CreatePlanRequest {
 }
 
 /// M19d：套餐 PATCH——只改提供的字段。
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct UpdatePlanRequest {
     pub name: Option<String>,
     pub max_concurrent_sessions: Option<i32>,
@@ -211,7 +241,7 @@ pub struct UpdatePlanRequest {
     pub currency: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum TokenStatus {
     Active,
@@ -220,7 +250,7 @@ pub enum TokenStatus {
 }
 
 /// Token 能力开关（§3.2：回看/录制权限、清晰度上限）。
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct TokenFeatures {
     #[serde(default)]
     pub catchup: bool,
@@ -268,7 +298,7 @@ impl UserToken {
 }
 
 /// §5.2 创建 Token 请求示例（文档原字段逐一对应）。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct CreateTokenRequest {
     pub user_id: i64,
     pub name: String,
@@ -284,7 +314,7 @@ pub struct CreateTokenRequest {
     pub features: TokenFeatures,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct UpdateTokenRequest {
     pub name: Option<String>,
     pub device_type: Option<String>,
@@ -313,7 +343,7 @@ pub struct CreateTokenResponse {
 // §9：频道、分组、订阅源、EPG
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ChannelStatus {
     Active,
@@ -341,7 +371,7 @@ pub struct Channel {
     pub updated_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct CreateChannelRequest {
     pub tvg_id: Option<String>,
     pub name: String,
@@ -357,7 +387,7 @@ pub struct CreateChannelRequest {
     pub visibility: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct UpdateChannelRequest {
     pub tvg_id: Option<String>,
     pub name: Option<String>,
@@ -390,7 +420,7 @@ pub struct ChannelGroup {
     pub is_default: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct CreateGroupRequest {
     pub name: String,
     pub sort_weight: Option<i32>,
@@ -399,7 +429,7 @@ pub struct CreateGroupRequest {
 }
 
 /// M19e：分组 PATCH——只改提供的字段。
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct UpdateGroupRequest {
     pub name: Option<String>,
     pub sort_weight: Option<i32>,
@@ -408,7 +438,7 @@ pub struct UpdateGroupRequest {
 }
 
 /// 订阅源（§7.4 全部配置项）。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum OnMissing {
     Disable,
@@ -433,7 +463,7 @@ pub struct PlaylistSource {
     pub created_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct CreateSourceRequest {
     pub name: String,
     pub url: Option<String>,
@@ -446,7 +476,7 @@ pub struct CreateSourceRequest {
 }
 
 /// M19c：订阅源 PATCH——只改提供的字段（其余保持原值，先读后写）。
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct UpdateSourceRequest {
     pub name: Option<String>,
     pub url: Option<String>,
@@ -504,10 +534,40 @@ pub struct EpgSource {
 }
 
 /// M19f：EPG 源 PATCH——只改提供的字段。
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct UpdateEpgSourceRequest {
     pub name: Option<String>,
     pub url: Option<String>,
+}
+
+/// m19：`epg_channel_map` 一行——某 EPG 源的某个 EPG 频道（`tvg_id`，即
+/// XMLTV `<channel id>`）固定对应某个本台频道（`channel_id`）。
+/// Worker 同步时优先按此映射落节目，不再走 tvg-id/名称猜测。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EpgChannelMap {
+    pub id: i64,
+    pub epg_source_id: i64,
+    pub tvg_id: Option<String>,
+    pub channel_id: Option<i64>,
+}
+
+/// m19：PUT `/admin/epg/sources/{id}/maps` 入参——新建或改写一条映射。
+/// `tvg_id` 为该 EPG 源内的 EPG 频道 id（XMLTV `<channel id>`）。
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct UpsertEpgChannelMapRequest {
+    pub tvg_id: String,
+    pub channel_id: i64,
+}
+
+/// m18：POST `/admin/sources/paste` 入参——直接贴 M3U 文本导入。
+/// `source_id` 给了就导入该源，否则按 `name`（缺省 `pasted.m3u`）新建源；
+/// 与文件上传走同一解析器（`iptv_m3u::parse_m3u` / `parse_m3u_reader`
+/// 共用 `M3uParser` 状态机）。
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct PasteM3uRequest {
+    pub content: String,
+    pub source_id: Option<i64>,
+    pub name: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -583,13 +643,13 @@ pub struct MePlan {
     pub expires_at: Option<DateTime<Utc>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct TicketExchangeRequest {
     pub ticket: String,
     pub device_fingerprint: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct TokenLoginRequest {
     pub token: String,
     pub device_fingerprint: String,
@@ -597,7 +657,7 @@ pub struct TokenLoginRequest {
     pub remember_device: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct MeSettingsPatch {
     pub display_name: Option<String>,
     pub locale: Option<String>,
@@ -620,7 +680,7 @@ pub struct PlaybackSession {
     pub status: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct PlaybackStartRequest {
     pub channel_id: i64,
     pub quality: Option<String>,
@@ -637,12 +697,12 @@ pub struct PlaybackStartResponse {
     pub heartbeat_interval_sec: i64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct PlaybackHeartbeatRequest {
     pub session_uid: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct PlaybackStopRequest {
     pub session_uid: String,
 }
@@ -662,7 +722,7 @@ pub struct PlaybackEvent {
 // §5：管理后台 — 管理员、RBAC、审计、系统设置、仪表盘
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum AdminRole {
     SuperAdmin,
@@ -718,14 +778,14 @@ pub struct AdminUser {
     pub created_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct AdminLoginRequest {
     pub username: String,
     pub password: String,
     pub totp_code: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct CreateAdminRequest {
     pub username: String,
     pub password: String,
@@ -743,7 +803,7 @@ pub struct CreateAdminResponse {
     pub qr_png: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct UpdateAdminRequest {
     pub role: Option<AdminRole>,
     pub totp_required: Option<bool>,
@@ -770,6 +830,26 @@ pub struct SystemSetting {
     pub key: String,
     pub value: serde_json::Value,
     pub updated_at: DateTime<Utc>,
+}
+
+/// m22：文案覆盖（§12.8 `i18n_override` 表）。`key` 为点分逻辑 key
+/// （如 `admin.settings`），`value` 为覆盖文案（可含 `{ $var }` 占位符，
+/// 按调用方参数替换）；覆盖只作用于指定 key 与 locale。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct I18nOverride {
+    pub id: i64,
+    pub locale: String,
+    pub key: String,
+    pub value: String,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// m22：文案覆盖写请求（PUT `/api/v1/admin/i18n-overrides`）。
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct UpsertI18nOverrideRequest {
+    pub locale: String,
+    pub key: String,
+    pub value: String,
 }
 
 /// §5.2 `GET /api/v1/admin/stats/overview`。
@@ -802,6 +882,36 @@ pub struct M3uImportReport {
     pub channels_parsed: usize,
     pub channels_imported: usize,
     pub errors: Vec<M3uLineError>,
+}
+
+/// M16：异步上传任务状态（§7.1 异步解析）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UploadTaskStatus {
+    Queued,
+    Running,
+    Done,
+    Failed,
+}
+
+/// M16：异步上传任务进度（GET /api/v1/admin/upload-tasks/{id} 返回体）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UploadTaskProgress {
+    pub task_id: String,
+    pub status: UploadTaskStatus,
+    pub filename: String,
+    pub source_id: Option<i64>,
+    pub total_lines: usize,
+    pub channels_parsed: usize,
+    pub channels_imported: usize,
+    pub error_count: usize,
+    pub error: Option<String>,
+}
+
+/// M16：POST /api/v1/admin/sources/upload 的即时返回体（只含任务 id）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UploadTaskCreated {
+    pub task_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

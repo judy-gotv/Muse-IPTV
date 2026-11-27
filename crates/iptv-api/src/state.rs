@@ -8,6 +8,10 @@
 //!   生产必须固定，否则重启后已签发的播放地址与管理员会话全部失效）。
 //! - `PORTAL_BASE_URL`：生成 Token 登录链接用。
 //! - `BIND_ADDR`：默认 `0.0.0.0:8080`。
+//! - `IPTV_CORS_ORIGINS`：m14，逗号分隔的允许跨域源列表（§13）；默认空 =
+//!   只同源，浏览器跨域调用一律不放行。注意：即使配了源，也绝不配
+//!   `allow_credentials`——会话 Cookie 只走同源网关（SameSite=Lax），
+//!   跨域凭据访问不在设计内；配了源也只放行无凭据的读请求。
 // 作者: Passwd Word
 
 use iptv_concurrency::ConcurrencyLimiter;
@@ -25,6 +29,18 @@ pub struct Config {
     pub admin_secret: String,
     pub portal_base_url: String,
     pub bind_addr: String,
+    /// m14：CORS 允许源列表（`IPTV_CORS_ORIGINS` 逗号分隔）；空 = 只同源。
+    pub cors_origins: Vec<String>,
+}
+
+/// m14：解析 `IPTV_CORS_ORIGINS`（逗号分隔）：去空白、去空项、去末尾 `/`
+///（`https://example.com/` 与 `https://example.com` 是同一源，CORS 比对
+/// 按精确字符串来，尾斜杠会让命中失败）。
+pub fn parse_cors_origins(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(|s| s.trim().trim_end_matches('/').to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
 }
 
 impl Config {
@@ -49,6 +65,9 @@ impl Config {
             portal_base_url: std::env::var("PORTAL_BASE_URL")
                 .unwrap_or_else(|_| "http://127.0.0.1:8081".to_string()),
             bind_addr: std::env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string()),
+            cors_origins: std::env::var("IPTV_CORS_ORIGINS")
+                .map(|v| parse_cors_origins(&v))
+                .unwrap_or_default(),
         }
     }
 }
@@ -77,6 +96,8 @@ pub struct AppState {
     /// 不分桶时全站每分钟只能登录 5 人次。
     pub login_limiter: Arc<iptv_auth::RateLimiter>,
     pub login_ip_limiter: Arc<iptv_auth::RateLimiter>,
+    /// M16：异步上传任务注册表（进程内内存；重启即失，见 upload_tasks.rs）。
+    pub upload_tasks: crate::upload_tasks::UploadTasks,
 }
 
 impl AppState {
@@ -92,17 +113,20 @@ impl AppState {
         let limiter = Arc::new(ConcurrencyLimiter::new(config.redis_url.as_deref()));
         // M1：会话超时读系统设置 `session_timeout_sec`（默认 90s）。
         limiter.set_ttl_sec(store.get_setting_i64("session_timeout_sec").await);
+        // M15：票据落库，TicketStore 以同一 Store 为事实来源。
+        let tickets = Arc::new(crate::tickets::TicketStore::new(store.clone()));
         Ok(Self {
             store,
             limiter,
             i18n: Arc::new(I18n::new()),
             config: Arc::new(config),
             metrics: Arc::new(Metrics::default()),
-            tickets: Arc::new(crate::tickets::TicketStore::new()),
+            tickets,
             // §13：登录口限流 5 次/分钟/复合 key；另按 IP 聚合 30 次/分钟，
             // 防单 IP 在多账号/多 Token 间轮换刷登录。
             login_limiter: Arc::new(iptv_auth::RateLimiter::new(5, 60)),
             login_ip_limiter: Arc::new(iptv_auth::RateLimiter::new(30, 60)),
+            upload_tasks: crate::upload_tasks::new_upload_tasks(),
         })
     }
 }

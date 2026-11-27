@@ -15,6 +15,7 @@ iptv-store = { path = "../iptv-store" }
 iptv-m3u = { path = "../iptv-m3u" }
 iptv-epg = { path = "../iptv-epg" }
 tokio = { workspace = true }
+tokio-cron-scheduler = { workspace = true }
 reqwest = { workspace = true }
 futures-util = { workspace = true }
 serde_json = { workspace = true }

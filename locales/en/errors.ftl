@@ -14,3 +14,5 @@ errors-e42902 = Bound device limit reached
 errors-e42903 = Too many requests, please try again later
 errors-e50301 = Channel source unavailable
 errors-e50000 = Internal server error
+# N1：delete_plan 被引用时带人数的 409 文案（$n 为引用该套餐的用户数）
+errors-plan-in-use = Plan is in use by { $n } user(s); reassign them first

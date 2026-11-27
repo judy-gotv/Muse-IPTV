@@ -24,6 +24,7 @@ portal-remember-device = 記住此裝置（90 天）
 portal-quota-title = 並發額度
 portal-player-retry = 重試
 portal-player-retrying = 重新連線中…第 { $n } 次嘗試，{ $secs } 秒後重試
+portal-player-hls-auto = 自動
 portal-allowed-groups = 允許的分組
 portal-logout-all = 登出全部裝置
 portal-landing-hint = 貼上 Token 登入，或打開管理員發給你的登入連結／掃描 QR Code。

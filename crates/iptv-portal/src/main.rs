@@ -14,9 +14,10 @@
 // 作者: Passwd Word
 
 use axum::{
-    extract::{Form, Path},
-    http::{header, HeaderMap},
-    response::Redirect,
+    extract::{Form, Path, Request},
+    http::{header, HeaderMap, Method, StatusCode},
+    middleware::Next,
+    response::{IntoResponse, Redirect, Response},
     routing::{get, post},
     Router,
 };
@@ -43,6 +44,7 @@ async fn main() {
     let routes = generate_route_list(App);
     let app = Router::new()
         .route("/design.css", get(design_css))
+        .route("/vendor/hls.min.js", get(hls_vendor_js))
         .route("/healthz", get(|| async { "ok" }))
         .route("/login", post(login))
         .route("/logout", post(logout))
@@ -59,6 +61,9 @@ async fn main() {
         // 服务；/pkg/*.js 与 /pkg/*.wasm 必须由这个 fallback 经 ServeDir
         // 从 LEPTOS_SITE_ROOT 指出，否则 hydrate 产物永远 404（空体）。
         .fallback(leptos_axum::file_and_error_handler(shell))
+        // m14：所有 POST 先过 CSRF 中间件（浏览器→SSR 的第一道防线，
+        // 见 `csrf_middleware`）；再由各 handler 把 token 转发给 API。
+        .layer(axum::middleware::from_fn(csrf_middleware))
         .with_state(leptos_options);
     tracing::info!("portal listening on {addr}");
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
@@ -69,6 +74,20 @@ async fn main() {
 
 async fn design_css() -> ([(header::HeaderName, &'static str); 1], &'static str) {
     ([(header::CONTENT_TYPE, "text/css")], design_tokens_css())
+}
+
+/// m16：`GET /vendor/hls.min.js`——hls.js 1.5.13 打进二进制（`include_bytes!`），
+/// 播放器非 Safari 时经 MSE 接它；不走运行时 CDN 外链，离线部署不断链。
+/// 文件在 `crates/iptv-portal/vendor/hls.min.js`（固定版本，见该目录 README）。
+/// 网关把 `/{*rest}` 全量代理到门户，故经 8081 同样可达。
+async fn hls_vendor_js() -> ([(header::HeaderName, &'static str); 2], &'static [u8]) {
+    (
+        [
+            (header::CONTENT_TYPE, "text/javascript"),
+            (header::CACHE_CONTROL, "public, max-age=31536000, immutable"),
+        ],
+        include_bytes!("../vendor/hls.min.js"),
+    )
 }
 
 fn client() -> reqwest::Client {
@@ -89,11 +108,102 @@ fn portal_sid(headers: &HeaderMap) -> Option<String> {
     cookie_header(headers).and_then(|h| cookie_value(&h, "iptv_portal_sid"))
 }
 
+/// m14：入站请求里的双提交 token（`iptv_csrf` Cookie 值），供转发给 API 用。
+fn csrf_token(headers: &HeaderMap) -> Option<String> {
+    cookie_header(headers).and_then(|h| cookie_value(&h, "iptv_csrf"))
+}
+
+/// m14 双提交 Cookie（§13）：浏览器写请求的第一道防线在 SSR 层。
+///
+/// 浏览器→SSR 的写请求分两类，都过这个中间件：
+/// - 纯 Axum POST 表单（登录/退出/语言/设置/下线设备/切清晰度）与 Leptos
+///   server fn POST：表单发不出自定义头，故不走双提交字段，改走
+///   Origin 比对（有 Origin 时必须与 `X-Forwarded-Host` 或 `Host` 同源，
+///   网关会覆盖写 XFH）+ 辅助信号 `Sec-Fetch-Site: cross-site` 直接拒。
+///   现代浏览器对 POST 一定带 Origin / Sec-Fetch-Site，跨站表单 POST
+///   两项全中、必然被拦；同源请求两项都过。
+/// - 带 `X-CSRF-Token` 头的请求（如将来浏览器直调 API 的 fetch）：头值
+///   必须与 `iptv_csrf` Cookie 等时一致，否则 403。
+///
+/// 另：响应时若请求带会话 Cookie 却没有 `iptv_csrf` Cookie，就签发一个
+/// （256 bit 换算：uuid v4 122 bit 熵，CSRF token 够用；非 HttpOnly，
+/// 供前端/SSR 读取；`SameSite=Lax`）。这样登录成功后的首个页面响应就把
+/// token 交给浏览器，之后的 SSR→API 转发才能带上双提交头；旧会话
+/// （部署前已登录、尚无该 Cookie）也在下一次响应里自动补发，无需重新登录。
+/// 退出时由各 logout handler 清掉该 Cookie（见下）。
+async fn csrf_middleware(req: Request, next: Next) -> Response {
+    let headers = req.headers().clone();
+    if matches!(
+        *req.method(),
+        Method::POST | Method::PUT | Method::PATCH | Method::DELETE
+    ) {
+        if let Some(token) = headers.get("x-csrf-token").and_then(|v| v.to_str().ok()) {
+            let ok = csrf_token(&headers).is_some_and(|c| {
+                !token.is_empty() && {
+                    let (a, b) = (token.as_bytes(), c.as_bytes());
+                    a.len() == b.len()
+                        && a.iter()
+                            .zip(b.iter())
+                            .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+                            == 0
+                }
+            });
+            if !ok {
+                return (StatusCode::FORBIDDEN, "cross-site write rejected").into_response();
+            }
+        } else {
+            if headers
+                .get("sec-fetch-site")
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| v.trim().eq_ignore_ascii_case("cross-site"))
+            {
+                return (StatusCode::FORBIDDEN, "cross-site write rejected").into_response();
+            }
+            if let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
+                let origin_host = origin.split("://").nth(1).unwrap_or("");
+                let host_ok = headers
+                    .get("x-forwarded-host")
+                    .and_then(|v| v.to_str().ok())
+                    .filter(|s| !s.trim().is_empty())
+                    .map(|s| s.trim())
+                    .or_else(|| headers.get(header::HOST).and_then(|v| v.to_str().ok()))
+                    .is_some_and(|host| {
+                        origin_host.trim_end_matches('/') == host.trim_end_matches('/')
+                    });
+                if !host_ok {
+                    return (StatusCode::FORBIDDEN, "cross-site write rejected").into_response();
+                }
+            }
+        }
+    }
+    let had_session = headers
+        .get(header::COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|c| cookie_value(c, "iptv_portal_sid"))
+        .is_some();
+    let had_csrf = csrf_token(&headers).is_some();
+    let mut resp = next.run(req).await;
+    if had_session && !had_csrf {
+        let token = uuid::Uuid::new_v4().simple().to_string();
+        if let Ok(v) = header::HeaderValue::from_str(&format!(
+            "iptv_csrf={token}; Path=/; SameSite=Lax; Max-Age=7776000"
+        )) {
+            resp.headers_mut().append(header::SET_COOKIE, v);
+        }
+    }
+    resp
+}
+
 /// POST 后端 JSON 接口；返回 `(http_status, data, set_cookie)`。
+/// `csrf` 为入站请求的 `iptv_csrf` Cookie 值：有则同时以
+/// `X-CSRF-Token` 头 + `Cookie` 头里的 `iptv_csrf` 发给 API，走双提交
+/// 比对；无则只发会话 Cookie，API 退回 Origin 兜底（登录/票据兑换尚无
+/// token 时就是这个形态）。
 async fn backend_post(
     path: &str,
     body: serde_json::Value,
     sid: Option<&str>,
+    csrf: Option<&str>,
 ) -> (
     reqwest::StatusCode,
     Option<serde_json::Value>,
@@ -101,8 +211,19 @@ async fn backend_post(
 ) {
     let url = format!("{}{path}", api_base());
     let mut req = client().post(&url).json(&body);
+    let mut cookie = String::new();
     if let Some(s) = sid {
-        req = req.header("Cookie", format!("iptv_portal_sid={s}"));
+        cookie.push_str(&format!("iptv_portal_sid={s}"));
+    }
+    if let Some(c) = csrf {
+        if !cookie.is_empty() {
+            cookie.push_str("; ");
+        }
+        cookie.push_str(&format!("iptv_csrf={c}"));
+        req = req.header("x-csrf-token", c);
+    }
+    if !cookie.is_empty() {
+        req = req.header("Cookie", cookie);
     }
     let Ok(res) = req.send().await else {
         return (reqwest::StatusCode::BAD_GATEWAY, None, None);
@@ -131,11 +252,22 @@ async fn backend_post(
     (status, data, set_cookie)
 }
 
-async fn backend_delete(path: &str, sid: Option<&str>) -> bool {
+async fn backend_delete(path: &str, sid: Option<&str>, csrf: Option<&str>) -> bool {
     let url = format!("{}{path}", api_base());
     let mut req = client().delete(&url);
+    let mut cookie = String::new();
     if let Some(s) = sid {
-        req = req.header("Cookie", format!("iptv_portal_sid={s}"));
+        cookie.push_str(&format!("iptv_portal_sid={s}"));
+    }
+    if let Some(c) = csrf {
+        if !cookie.is_empty() {
+            cookie.push_str("; ");
+        }
+        cookie.push_str(&format!("iptv_csrf={c}"));
+        req = req.header("x-csrf-token", c);
+    }
+    if !cookie.is_empty() {
+        req = req.header("Cookie", cookie);
     }
     req.send()
         .await
@@ -197,7 +329,8 @@ async fn login(headers: HeaderMap, Form(form): Form<LoginForm>) -> (HeaderMap, R
         "device_fingerprint": device_id,
         "remember_device": form.remember_device.as_deref() == Some("true"),
     });
-    let (_status, data, set_cookie) = backend_post("/api/v1/auth/token-login", body, None).await;
+    let (_status, data, set_cookie) =
+        backend_post("/api/v1/auth/token-login", body, None, None).await;
     if let Some(sc) = set_cookie {
         cookies.push(sc);
     }
@@ -214,25 +347,40 @@ async fn login(headers: HeaderMap, Form(form): Form<LoginForm>) -> (HeaderMap, R
 /// POST /logout：调后端退出并清除会话 Cookie。
 async fn logout(headers: HeaderMap) -> (HeaderMap, Redirect) {
     let sid = portal_sid(&headers);
-    let _ = backend_post("/api/v1/auth/logout", serde_json::json!({}), sid.as_deref()).await;
+    let csrf = csrf_token(&headers);
+    let _ = backend_post(
+        "/api/v1/auth/logout",
+        serde_json::json!({}),
+        sid.as_deref(),
+        csrf.as_deref(),
+    )
+    .await;
     redirect_with_cookies(
         "/",
-        &["iptv_portal_sid=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0".to_string()],
+        &[
+            "iptv_portal_sid=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0".to_string(),
+            "iptv_csrf=; Path=/; SameSite=Lax; Max-Age=0".to_string(),
+        ],
     )
 }
 
 /// POST /logout-all（M14）：调后端吊销该 Token 全部会话（含当前），并清除 Cookie。
 async fn logout_all(headers: HeaderMap) -> (HeaderMap, Redirect) {
     let sid = portal_sid(&headers);
+    let csrf = csrf_token(&headers);
     let _ = backend_post(
         "/api/v1/auth/logout-all",
         serde_json::json!({}),
         sid.as_deref(),
+        csrf.as_deref(),
     )
     .await;
     redirect_with_cookies(
         "/",
-        &["iptv_portal_sid=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0".to_string()],
+        &[
+            "iptv_portal_sid=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0".to_string(),
+            "iptv_csrf=; Path=/; SameSite=Lax; Max-Age=0".to_string(),
+        ],
     )
 }
 
@@ -255,7 +403,9 @@ async fn set_locale(headers: HeaderMap, Form(form): Form<LocaleForm>) -> (Header
     let sid = portal_sid(&headers);
     if sid.is_some() {
         let body = serde_json::json!({ "locale": loc });
-        let (_, _, _) = backend_post("/api/v1/me/settings", body, sid.as_deref()).await;
+        let csrf = csrf_token(&headers);
+        let (_, _, _) =
+            backend_post("/api/v1/me/settings", body, sid.as_deref(), csrf.as_deref()).await;
     }
     let to = safe_redirect(form.redirect_to.as_deref().unwrap_or("/me"), "/me");
     redirect_with_cookies(&to, &cookies)
@@ -264,7 +414,13 @@ async fn set_locale(headers: HeaderMap, Form(form): Form<LocaleForm>) -> (Header
 /// POST /me/devices/{id}/kick：下线自己的设备（服务端只认本 token 的会话）。
 async fn kick_device(headers: HeaderMap, Path(session_id): Path<i64>) -> Redirect {
     let sid = portal_sid(&headers);
-    let _ = backend_delete(&format!("/api/v1/me/devices/{session_id}"), sid.as_deref()).await;
+    let csrf = csrf_token(&headers);
+    let _ = backend_delete(
+        &format!("/api/v1/me/devices/{session_id}"),
+        sid.as_deref(),
+        csrf.as_deref(),
+    )
+    .await;
     Redirect::to("/me/devices")
 }
 
@@ -296,10 +452,12 @@ async fn save_settings(
         body.insert("theme".to_string(), serde_json::json!(t));
     }
     if sid.is_some() && !body.is_empty() {
+        let csrf = csrf_token(&headers);
         let _ = backend_post(
             "/api/v1/me/settings",
             serde_json::Value::Object(body),
             sid.as_deref(),
+            csrf.as_deref(),
         )
         .await;
     }
@@ -334,8 +492,15 @@ async fn change_quality(
     Form(form): Form<QualityForm>,
 ) -> Redirect {
     let sid = portal_sid(&headers);
+    let csrf = csrf_token(&headers);
     let body = serde_json::json!({ "session_uid": form.session_uid });
-    let _ = backend_post("/api/v1/playback/stop", body, sid.as_deref()).await;
+    let _ = backend_post(
+        "/api/v1/playback/stop",
+        body,
+        sid.as_deref(),
+        csrf.as_deref(),
+    )
+    .await;
     Redirect::to(&format!(
         "/watch/{channel_id}?quality={}",
         pct_encode(&form.quality)

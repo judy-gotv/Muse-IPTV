@@ -364,6 +364,67 @@ async fn upsert_matches_manual_channel_by_tvg_id() {
 }
 
 #[tokio::test]
+async fn upsert_logo_only_change_updates_logo_url() {
+    // m9 回归：content_hash 不含 logo，仅台标变化时也须更新 logo_url
+    // 并记入 metadata_changed（否则 worker 的 mirror_logos 永远看不到它）。
+    let fx = setup().await;
+    let s = &fx.store;
+    let src = s
+        .create_source(&CreateSourceRequest {
+            name: "台标源".to_string(),
+            url: Some("https://example.com/list.m3u".to_string()),
+            sync_interval_sec: None,
+            http_headers: None,
+            epg_url: None,
+            on_missing: None,
+            auto_enable_new: Some(true),
+            enabled: None,
+        })
+        .await
+        .unwrap();
+    let ch = |logo: &str| NormalizedChannel {
+        tvg_id: Some("cctv1.cn".to_string()),
+        name: "CCTV-1".to_string(),
+        logo: Some(logo.to_string()),
+        group: Some("央视".to_string()),
+        url: "https://x.example/cctv1.m3u8".to_string(),
+        catchup: None,
+        catchup_source: None,
+    };
+    let first = s
+        .upsert_channels(src.id, vec![ch("https://cdn.example.com/old.png")])
+        .await
+        .unwrap();
+    assert_eq!((first.added, first.updated, first.removed), (1, 0, 0));
+    // 仅换台标，其余字段全同：应算 1 次元数据变更，logo_url 落库。
+    let out = s
+        .upsert_channels(src.id, vec![ch("https://cdn.example.com/new.png")])
+        .await
+        .unwrap();
+    assert_eq!((out.added, out.updated, out.removed), (0, 1, 0));
+    assert_eq!(out.metadata_changed.len(), 1);
+    assert_eq!(
+        out.metadata_changed[0].logo_url.as_deref(),
+        Some("https://cdn.example.com/new.png")
+    );
+    let stored = s
+        .get_channel(out.metadata_changed[0].id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        stored.logo_url.as_deref(),
+        Some("https://cdn.example.com/new.png")
+    );
+    // 台标不变再同步一次：应全部为 0，不重复记变更。
+    let out = s
+        .upsert_channels(src.id, vec![ch("https://cdn.example.com/new.png")])
+        .await
+        .unwrap();
+    assert_eq!((out.added, out.updated, out.removed), (0, 0, 0));
+}
+
+#[tokio::test]
 async fn playback_session_lifecycle_and_expiry() {
     let fx = setup().await;
     let s = &fx.store;
@@ -887,4 +948,144 @@ async fn v6_user_theme_persists_and_setting_updated_at_rewritten() {
     s.migrate().await.unwrap();
     let again2 = s.get_user(user.id).await.unwrap().unwrap();
     assert_eq!(again2.theme, "dark");
+}
+
+/// M15（DB 层）：票据原子消费——第二次消费失败、过期票据消费失败、
+/// 已用票据在新开连接（模拟重启）后仍不可用；过期行可被清理。
+#[tokio::test]
+async fn login_ticket_atomic_consume() {
+    let fx = setup().await;
+    let s = &fx.store;
+    // 固定 64 位 hex 占位哈希（store 层只存字符串，不算哈希）。
+    let hash_a = "a".repeat(64);
+    let hash_b = "b".repeat(64);
+    let hash_c = "c".repeat(64);
+    let now = Utc::now();
+    s.issue_login_ticket(&hash_a, 42, Some("10.0."), now + Duration::seconds(60))
+        .await
+        .unwrap();
+    s.issue_login_ticket(&hash_b, 43, None, now + Duration::seconds(60))
+        .await
+        .unwrap();
+    // 已过期的票据。
+    s.issue_login_ticket(&hash_c, 44, None, now - Duration::seconds(1))
+        .await
+        .unwrap();
+
+    // 第一次消费成功，带回 token_id 与 ip_prefix。
+    let got = s
+        .consume_login_ticket(&hash_a, Utc::now())
+        .await
+        .unwrap()
+        .expect("first consume works");
+    assert_eq!(got.token_id, 42);
+    assert_eq!(got.ip_prefix.as_deref(), Some("10.0."));
+    // 第二次消费失败（已用）。
+    assert!(s
+        .consume_login_ticket(&hash_a, Utc::now())
+        .await
+        .unwrap()
+        .is_none());
+    // 过期票据消费失败。
+    assert!(s
+        .consume_login_ticket(&hash_c, Utc::now())
+        .await
+        .unwrap()
+        .is_none());
+    // 不存在的哈希消费失败。
+    assert!(s
+        .consume_login_ticket(&"d".repeat(64), Utc::now())
+        .await
+        .unwrap()
+        .is_none());
+
+    // 消费 hash_b 一次，再新开连接（模拟重启）：hash_b 仍不可用。
+    assert!(s
+        .consume_login_ticket(&hash_b, Utc::now())
+        .await
+        .unwrap()
+        .is_some());
+    let url = format!("sqlite://{}?mode=rwc", fx.path.display());
+    let reopened = Store::connect(&url).await.expect("reconnect sqlite");
+    reopened.migrate().await.expect("migrate again");
+    assert!(reopened
+        .consume_login_ticket(&hash_a, Utc::now())
+        .await
+        .unwrap()
+        .is_none());
+    assert!(reopened
+        .consume_login_ticket(&hash_b, Utc::now())
+        .await
+        .unwrap()
+        .is_none());
+
+    // 过期清理：hash_c 已过期（消费时顺带清过，残留只可能是 0 行或 1 行）。
+    let _n = reopened.purge_expired_tickets(Utc::now()).await.unwrap();
+    assert!(reopened
+        .consume_login_ticket(&hash_c, Utc::now())
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
+async fn i18n_override_crud() {
+    // m22：i18n_override 表接上读取——增/改/查/列/删全链路（SQLite 方言）。
+    let fx = setup().await;
+    let s = &fx.store;
+    assert!(s
+        .get_i18n_override("zh-Hans-CN", "admin.settings")
+        .await
+        .unwrap()
+        .is_none());
+    s.upsert_i18n_override("zh-Hans-CN", "admin.settings", "系统设置（覆盖）")
+        .await
+        .unwrap();
+    let got = s
+        .get_i18n_override("zh-Hans-CN", "admin.settings")
+        .await
+        .unwrap()
+        .expect("upsert 后可读");
+    assert_eq!(got.value, "系统设置（覆盖）");
+    assert_eq!(got.locale, "zh-Hans-CN");
+    // 同 key 改值走 UPDATE（不新增行）。
+    s.upsert_i18n_override("zh-Hans-CN", "admin.settings", "系统设置（改）")
+        .await
+        .unwrap();
+    assert_eq!(
+        s.get_i18n_override("zh-Hans-CN", "admin.settings")
+            .await
+            .unwrap()
+            .unwrap()
+            .value,
+        "系统设置（改）"
+    );
+    // 不同 locale 的同 key 互不干扰；map 形式供 I18n 装入用。
+    s.upsert_i18n_override("en", "admin.settings", "System Settings (override)")
+        .await
+        .unwrap();
+    let map = s.i18n_overrides_map().await.unwrap();
+    assert_eq!(map.len(), 2);
+    assert_eq!(
+        map.get(&("en".to_string(), "admin.settings".to_string()))
+            .unwrap(),
+        "System Settings (override)"
+    );
+    let list = s.list_i18n_overrides().await.unwrap();
+    assert_eq!(list.len(), 2);
+    // 删除：存在返回 true，再删返回 false，删后读不到。
+    assert!(s
+        .delete_i18n_override("en", "admin.settings")
+        .await
+        .unwrap());
+    assert!(!s
+        .delete_i18n_override("en", "admin.settings")
+        .await
+        .unwrap());
+    assert!(s
+        .get_i18n_override("en", "admin.settings")
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(s.list_i18n_overrides().await.unwrap().len(), 1);
 }

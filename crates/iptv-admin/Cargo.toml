@@ -30,6 +30,8 @@ console_error_panic_hook = { workspace = true, optional = true }
 # uuid 在本包未使用（v0.1.2 清理），reqwest 的 multipart 供 main.rs 的
 # M3U 上传转发用。
 reqwest = { workspace = true, features = ["multipart"], optional = true }
+# m14：`new_csrf_token` 用 rand 填 32 字节（仅 ssr 用，WASM 不参与）。
+rand = { workspace = true, optional = true }
 leptos_axum = { workspace = true, optional = true }
 axum = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
@@ -53,6 +55,7 @@ ssr = [
     "dep:axum",
     "dep:dotenvy",
     "dep:leptos_axum",
+    "dep:rand",
     "dep:reqwest",
     "dep:tokio",
     "dep:tracing",

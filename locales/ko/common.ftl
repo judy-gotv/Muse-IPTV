@@ -111,3 +111,4 @@ common-edit = 편집
 common-disabled = 비활성화됨
 common-disable = 비활성화
 common-on-missing = 누락 시 처리
+common-tv-remote-hint = TV 리모컨: 방향 키로 이동, 확인 키로 선택, 뒤로 키로 돌아가기.

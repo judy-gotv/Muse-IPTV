@@ -3,6 +3,7 @@
 
 pub mod admin;
 pub mod auth;
+pub mod m18_m19;
 pub mod me;
 pub mod playback;
 pub mod public;

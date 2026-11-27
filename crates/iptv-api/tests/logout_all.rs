@@ -38,6 +38,7 @@ async fn setup() -> Fixture {
         admin_secret: "test-admin-secret".to_string(),
         portal_base_url: "http://127.0.0.1:8081".to_string(),
         bind_addr: "127.0.0.1:0".to_string(),
+        cors_origins: vec![],
     };
     let state = Arc::new(AppState::new(config).await.expect("AppState::new"));
     Fixture { state, path }

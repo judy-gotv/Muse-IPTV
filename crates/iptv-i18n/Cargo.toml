@@ -13,7 +13,10 @@ repository.workspace = true
 fluent-bundle = { workspace = true }
 unic-langid = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 chrono = { workspace = true }
+chrono-tz = { workspace = true }
+pinyin = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }

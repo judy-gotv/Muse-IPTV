@@ -19,13 +19,14 @@ use iptv_design::{
     StatusKind, TextField, Toggle, Toolbar,
 };
 use iptv_dto::{
-    AdminRole, AdminUser, AppUser, AuditLog, Channel, ChannelGroup, EpgProgram, EpgSource, Paged,
-    Plan, PlaybackSession, PlaylistSource, StatsOverview, SyncDiff, SyncLog, SystemSetting,
-    TokenStatus, UserStatus, UserToken,
+    AdminRole, AdminUser, AppUser, AuditLog, Channel, ChannelGroup, EpgChannelMap, EpgProgram,
+    EpgSource, I18nOverride, Paged, Plan, PlaybackSession, PlaylistSource, StatsOverview, SyncDiff,
+    SyncLog, SystemSetting, TokenStatus, UserStatus, UserToken,
 };
 // 只在服务端用（admin_get 解 Envelope）。
 #[cfg(feature = "ssr")]
 use iptv_dto::Envelope;
+use iptv_ui::dpad::TvRemoteHint;
 use iptv_ui::{fmt_dt, role_label, status_label, t_args_or, t_or, LanguageSwitcher, LocaleCtx};
 use leptos::prelude::*;
 use leptos_meta::{provide_meta_context, MetaTags, Title};
@@ -142,6 +143,37 @@ fn cookie_theme() -> String {
     parts_cookie("iptv_theme").unwrap_or_else(|| "system".to_string())
 }
 
+/// 设备形态（m23）：`iptv_device` Cookie 显式值优先；未设置时按 UA 兜底
+/// （电视/盒子 UA 默认进电视端，否则电视端永远进不去——此前全仓没有任何
+/// 代码写该 Cookie；与门户 `cookie_device` 同款逻辑）。
+fn cookie_device() -> String {
+    if let Some(d) = parts_cookie("iptv_device") {
+        return d;
+    }
+    if parts_user_agent().is_some_and(|ua| iptv_ui::dpad::looks_like_tv(&ua)) {
+        return "tv".to_string();
+    }
+    "web".to_string()
+}
+
+/// 请求上下文里的 User-Agent（m23，见 `cookie_device`）。
+#[cfg(feature = "ssr")]
+fn parts_user_agent() -> Option<String> {
+    let parts = use_context::<axum::http::request::Parts>()?;
+    parts
+        .headers
+        .get(axum::http::header::USER_AGENT)?
+        .to_str()
+        .ok()
+        .map(|s| s.to_string())
+}
+
+/// WASM 侧读浏览器 UA。
+#[cfg(not(feature = "ssr"))]
+fn parts_user_agent() -> Option<String> {
+    web_sys::window()?.navigator().user_agent().ok()
+}
+
 // ---------------------------------------------------------------------------
 // Server functions（SSR 数据获取，§5.2）
 // ---------------------------------------------------------------------------
@@ -238,6 +270,20 @@ pub async fn admin_epg_sources() -> Result<Option<Vec<EpgSource>>, ServerFnError
         .map_err(ServerFnError::new)
 }
 
+/// m19：某 EPG 源的全部映射（`epg_source_id` 为空 = 全表）。
+#[server]
+pub async fn admin_epg_maps(
+    epg_source_id: Option<i64>,
+) -> Result<Option<Vec<EpgChannelMap>>, ServerFnError> {
+    let path = match epg_source_id {
+        Some(id) => format!("/api/v1/admin/epg/sources/{id}/maps"),
+        None => "/api/v1/admin/epg/maps".to_string(),
+    };
+    admin_get::<Vec<EpgChannelMap>>(&path)
+        .await
+        .map_err(ServerFnError::new)
+}
+
 #[server]
 pub async fn admin_epg_programs(channel_id: i64) -> Result<Option<Vec<EpgProgram>>, ServerFnError> {
     admin_get::<Vec<EpgProgram>>(&format!("/api/v1/epg/channels/{channel_id}/programs"))
@@ -294,6 +340,23 @@ pub async fn admin_settings() -> Result<Option<Vec<SystemSetting>>, ServerFnErro
         .map_err(ServerFnError::new)
 }
 
+/// m22：文案覆盖列表。读到的覆盖顺手装入本进程覆盖表（§12.8），后续
+/// SSR 渲染即用覆盖文案；未登录返回 `Ok(None)`（与 `admin_get` 一致）。
+#[server]
+pub async fn admin_i18n_overrides() -> Result<Option<Vec<I18nOverride>>, ServerFnError> {
+    let list = admin_get::<Vec<I18nOverride>>("/api/v1/admin/i18n-overrides")
+        .await
+        .map_err(ServerFnError::new)?;
+    if let Some(list) = &list {
+        let map = list
+            .iter()
+            .map(|o| ((o.locale.clone(), o.key.clone()), o.value.clone()))
+            .collect();
+        iptv_i18n::I18n::set_overrides(map);
+    }
+    Ok(list)
+}
+
 #[cfg(feature = "ssr")]
 fn pct_encode(s: &str) -> String {
     let mut out = String::new();
@@ -315,6 +378,7 @@ fn pct_encode(s: &str) -> String {
 /// HTML 外壳（普通函数，由 main 的 `leptos_routes` 调用）。
 pub fn shell(props: leptos::config::LeptosOptions) -> impl IntoView {
     let theme = cookie_theme();
+    let device = cookie_device();
     let data_theme = match theme.as_str() {
         "dark" => "dark",
         "light" => "light",
@@ -322,7 +386,7 @@ pub fn shell(props: leptos::config::LeptosOptions) -> impl IntoView {
     };
     view! {
         <!DOCTYPE html>
-        <html lang=negotiated_locale() data-theme=data_theme>
+        <html lang=negotiated_locale() data-theme=data_theme data-device=device>
             <head>
                 <meta charset="utf-8"/>
                 <meta name="viewport" content="width=device-width, initial-scale=1"/>
@@ -333,7 +397,19 @@ pub fn shell(props: leptos::config::LeptosOptions) -> impl IntoView {
                 <link rel="stylesheet" href="/design.css"/>
                 <Title text="IPTV 管理后台"/>
             </head>
-            <body>
+            <body
+                // m23 电视端 D-pad：只在 data-device="tv" 时由
+                // `handle_keydown` 接管方向/确认/返回键；普通 web 端不启用。
+                // 无历史时返回键回后台首页 `/admin`。
+                on:keydown=move |ev| {
+                    #[cfg(target_arch = "wasm32")]
+                    iptv_ui::dpad::handle_keydown(&ev, "/admin");
+                    #[cfg(not(target_arch = "wasm32"))]
+                    {
+                        let _ = ev;
+                    }
+                }
+            >
                 <App/>
             </body>
         </html>
@@ -353,8 +429,11 @@ pub fn App() -> impl IntoView {
         _ => None,
     });
     provide_context(AdminRoleCtx(role));
+    // m23：电视端在页面底部显示遥控用法提示。
+    let is_tv = cookie_device() == "tv";
     view! {
         <Router>
+            <TvRemoteHint is_tv=is_tv/>
             <Routes fallback=|| view! { <NotFoundPage/> }>
                 <Route path=path!("/admin/login") view=LoginPage/>
                 <Route path=path!("/admin") view=DashboardPage/>
@@ -1003,6 +1082,18 @@ fn SourcesPage() -> impl IntoView {
                         </div>
                         <button class="btn btn-filled" type="submit">{t_or("admin.upload-parse", "Upload & parse")}</button>
                     </form>
+                    <h3>{t_or("admin.paste-m3u-title", "Paste M3U text")}</h3>
+                    <form method="post" action="/admin/sources/paste">
+                        <div class="field">
+                            <label for="m3u-paste-name">{t_or("common.source-name", "Source name")}</label>
+                            <input class="textfield" id="m3u-paste-name" name="name" placeholder="pasted.m3u"/>
+                        </div>
+                        <div class="field">
+                            <label for="m3u-paste-content">{t_or("admin.paste-m3u-content", "M3U text")}</label>
+                            <textarea class="textfield" id="m3u-paste-content" name="content" rows="8" required placeholder="#EXTM3U&#10;#EXTINF:-1 tvg-id=&quot;cctv1.cn&quot;,CCTV-1&#10;https://example.com/live/cctv1.m3u8"/>
+                        </div>
+                        <button class="btn btn-filled" type="submit">{t_or("admin.paste-parse", "Paste & import")}</button>
+                    </form>
                 </div>
             })}
             <Suspense fallback=LoadingSkeleton>
@@ -1223,6 +1314,8 @@ fn EpgPage() -> impl IntoView {
             None => Ok(None),
         }
     });
+    // m19：全部映射（按 EPG 源 + tvg-id 列出，配映射与删映射共用）。
+    let maps = Resource::new_blocking(|| (), |_| async move { admin_epg_maps(None).await });
     let can_write = admin_role().map(|r| r.can_write_sources()).unwrap_or(false);
     view! {
         <AdminLayout title=t_or("admin.epg", "EPG") active="epg">
@@ -1239,6 +1332,58 @@ fn EpgPage() -> impl IntoView {
                     </form>
                 </div>
             })}
+            {can_write.then(|| view! {
+                <div class="card">
+                    <h3 style="margin-top:0">{t_or("admin.epg-channel-map-title", "EPG channel mapping")}</h3>
+                    <form method="post" action="/admin/epg/maps">
+                        <div class="form-grid">
+                            <TextField label=t_or("admin.epg-map-source-id", "EPG source ID") name="epg_source_id" input_type="number" required=true/>
+                            <TextField label=t_or("admin.epg-map-tvg-id", "EPG channel ID (tvg-id)") name="tvg_id" required=true/>
+                            <TextField label=t_or("admin.epg-map-channel-id", "Channel ID") name="channel_id" input_type="number" required=true/>
+                        </div>
+                        <button class="btn btn-filled" type="submit">{t_or("admin.epg-map-add", "Add mapping")}</button>
+                    </form>
+                </div>
+            })}
+            <Suspense fallback=LoadingSkeleton>
+                {move || maps.get().map(|res| match res {
+                    Ok(Some(list)) => {
+                        if list.is_empty() {
+                            view! { <EmptyState title=t_or("admin.epg-map-empty", "No mappings yet") icon="▦">{view! { <></> }}</EmptyState> }.into_any()
+                        } else {
+                            view! {
+                                <div class="table-wrap">
+                                    <table class="admin-table">
+                                        <thead><tr><th>{t_or("common.id", "ID")}</th><th>{t_or("admin.epg-map-source-id", "EPG source ID")}</th><th>{t_or("admin.epg-map-tvg-id", "EPG channel ID (tvg-id)")}</th><th>{t_or("admin.epg-map-channel-id", "Channel ID")}</th><th>{t_or("common.actions", "Actions")}</th></tr></thead>
+                                        <tbody>
+                                            {list.into_iter().map(|m| {
+                                                let mid = m.id;
+                                                view! {
+                                                    <tr>
+                                                        <td>{m.id}</td>
+                                                        <td>{m.epg_source_id}</td>
+                                                        <td class="mono">{m.tvg_id.unwrap_or_default()}</td>
+                                                        <td>{m.channel_id.map(|c| c.to_string()).unwrap_or_default()}</td>
+                                                        <td>
+                                                            {can_write.then(|| view! {
+                                                                <form method="post" action=format!("/admin/epg/maps/{mid}/delete") style="display:inline">
+                                                                    <button class="btn btn-destructive" type="submit">{t_or("common.delete", "Delete")}</button>
+                                                                </form>
+                                                            })}
+                                                        </td>
+                                                    </tr>
+                                                }
+                                            }).collect_view()}
+                                        </tbody>
+                                    </table>
+                                </div>
+                            }.into_any()
+                        }
+                    }
+                    Ok(None) => view! { <LoginPrompt/> }.into_any(),
+                    Err(e) => view! { <div class="notice notice-error" role="alert">{e.to_string()}</div> }.into_any(),
+                })}
+            </Suspense>
             <div class="card">
                 <h3 style="margin-top:0">{t_or("admin.program-preview", "Program preview")}</h3>
                 <form method="get" action="/admin/epg" style="display:flex;gap:8px">
@@ -1671,6 +1816,8 @@ fn setting_status(key: &str) -> &'static str {
 #[component]
 fn SettingsPage() -> impl IntoView {
     let settings = Resource::new_blocking(|| (), |_| async move { admin_settings().await });
+    // m22：文案覆盖列表（读到的覆盖由 server fn 装入本进程覆盖表）。
+    let overrides = Resource::new_blocking(|| (), |_| async move { admin_i18n_overrides().await });
     let can_write = admin_role()
         .map(|r| r.can_write_settings())
         .unwrap_or(false);
@@ -1721,6 +1868,61 @@ fn SettingsPage() -> impl IntoView {
                     Err(e) => view! { <div class="notice notice-error" role="alert">{e.to_string()}</div> }.into_any(),
                 })}
             </Suspense>
+            <div class="card">
+                <h3 style="margin-top:0">{t_or("admin.i18n-overrides", "Text overrides")}</h3>
+                <p style="font-size:var(--text-footnote);color:var(--c-label-secondary)">
+                    {t_or("admin.i18n-overrides-hint", "Override individual strings without a release (applies to the given key and locale only).")}
+                </p>
+                {can_write.then(|| view! {
+                    <form method="post" action="/admin/i18n-overrides">
+                        <div class="form-grid">
+                            <TextField label=t_or("admin.i18n-overrides-locale", "Locale") name="locale" required=true/>
+                            <TextField label=t_or("admin.i18n-overrides-key", "Key") name="key" required=true/>
+                            <TextField label=t_or("admin.i18n-overrides-value", "Override value") name="value" required=true/>
+                        </div>
+                        <button class="btn btn-filled" type="submit">{t_or("admin.i18n-overrides-save", "Save override")}</button>
+                    </form>
+                })}
+                <Suspense fallback=LoadingSkeleton>
+                    {move || overrides.get().map(|res| match res {
+                        Ok(Some(list)) => {
+                            if list.is_empty() {
+                                view! { <EmptyState title=t_or("admin.i18n-overrides-empty", "No overrides yet") icon="✎">{view! { <></> }}</EmptyState> }.into_any()
+                            } else {
+                                view! {
+                                    <div class="table-wrap">
+                                        <table class="admin-table">
+                                            <thead><tr><th>{t_or("admin.i18n-overrides-locale", "Locale")}</th><th>{t_or("common.key", "Key")}</th><th>{t_or("admin.i18n-overrides-value", "Override value")}</th><th>{t_or("common.updated", "Updated")}</th><th>{t_or("common.actions", "Actions")}</th></tr></thead>
+                                            <tbody>
+                                                {list.into_iter().map(|o| {
+                                                    let delete_action = format!("/admin/i18n-overrides/delete?locale={}&key={}", o.locale, o.key);
+                                                    view! {
+                                                        <tr>
+                                                            <td class="mono">{o.locale.clone()}</td>
+                                                            <td class="mono">{o.key.clone()}</td>
+                                                            <td class="mono">{o.value.clone()}</td>
+                                                            <td>{if o.updated_at.timestamp() == 0 { "—".to_string() } else { fmt_dt(o.updated_at) }}</td>
+                                                            <td>
+                                                                {can_write.then(|| view! {
+                                                                    <form method="post" action=delete_action style="display:inline">
+                                                                        <button class="btn btn-destructive" type="submit">{t_or("common.delete", "Delete")}</button>
+                                                                    </form>
+                                                                })}
+                                                            </td>
+                                                        </tr>
+                                                    }
+                                                }).collect_view()}
+                                            </tbody>
+                                        </table>
+                                    </div>
+                                }.into_any()
+                            }
+                        }
+                        Ok(None) => view! { <LoginPrompt/> }.into_any(),
+                        Err(e) => view! { <div class="notice notice-error" role="alert">{e.to_string()}</div> }.into_any(),
+                    })}
+                </Suspense>
+            </div>
         </AdminLayout>
     }
 }

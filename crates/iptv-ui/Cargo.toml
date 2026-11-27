@@ -16,6 +16,24 @@ leptos = { workspace = true }
 serde = { workspace = true }
 chrono = { workspace = true }
 fluent-bundle = { workspace = true }
+# m16：hls.js 接线（window.Hls 经 js-sys Reflect 调，非 Safari 走 MSE）。
+wasm-bindgen = { workspace = true }
+# m23 电视端遥控：wasm 接线用（`dpad` 模块 `#[cfg(target_arch = "wasm32")]`，
+# 纯函数部分不依赖它；特性在 workspace 的 Window/Document/HtmlDocument/
+# Navigator 基础上追加）。
+web-sys = {
+    workspace = true,
+    features = [
+        "DomRect",
+        "Element",
+        "History",
+        "HtmlElement",
+        "KeyboardEvent",
+        "Location",
+        "NodeList",
+    ],
+}
+js-sys = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }

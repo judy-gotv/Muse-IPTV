@@ -12,7 +12,7 @@
 | 本地 M3U 上传可解析全部常见扩展属性，异常行有逐条报告 | ✅ | `iptv-m3u` 单测（BOM/CRLF/重复/非法 URL）；`M3uImportReport.errors` 逐条；本地上传不限大小（用户 2026-11-25 批准，与 §7.1 的 20 MB 相悖，流式落盘+逐行解析兜底）；远程订阅拉取仍限 20 MB |
 | 远程订阅按周期同步，可查看新增/变更/失效差异与日志 | ✅ | `iptv-worker::sync_source`（§7.3 九步）；`GET /admin/sources/{id}/diff`、`/logs` |
 | 后台写操作均可在审计日志检索到前后快照 | ✅ | 全部 admin 写 handler 调 `audit()`；`GET /admin/audit` 检索 + `GET /admin/audit/export` 导出 CSV（最多 10000 行） |
-| 台标转存对象存储并生成缩略图（§7.2） | ❌ 未实现 | `logo_url` 只原样入库，无对象存储/S3/minio 实现；v0.1.2 未做，需接对象存储服务后实现 |
+| 台标转存对象存储并生成缩略图（§7.2） | ✅ | 台标转存 S3 已实现（`iptv-core::logo_store` 手写 SigV4 PUT，`logos/<sha256>.<ext>`；创建/上传/订阅同步三路接入，转存失败记日志回落直链、不影响入库；未配置存储时回落直链，行为不变；`iptv-core` 单测 5 项含 AWS 官方 SigV4 向量）；缩略图未做（§7.2 后半句，转存的是原图，待后续） |
 | 门户接口无法通过篡改参数访问他人数据 | ✅ | `PortalAuth` 以会话内 `token_id` 为准；kick_device 只查本 token 会话；playback heartbeat/stop 校验 token 归属 |
 
 ## §16 数据库验收
@@ -21,7 +21,7 @@
 |---|---|---|
 | 同一套契约测试在 PostgreSQL 与 MySQL 上全部通过；SQLite 至少通过核心用例 | 🟡 | `crates/iptv-store/tests/contract.rs`（原先缺失、2026-11-25 补齐）；`ci.yml` 有 contract-postgres / contract-mysql 两个 job；沙箱无 PG/MySQL，本地只跑过 SQLite 集成测试 7/7，PG/MySQL 等 CI 首跑验证 |
 | 方言迁移脚本可在空库一键建表，也可在旧版本上升级 | ✅ | `migrations/{postgres,mysql,sqlite}/` V1/V2/V3；`Store::migrate()` 按 dialect 执行 |
-| 切换数据库只需改配置与 feature，不改业务代码 | ✅ | SQLx Any：只改 `DATABASE_URL`；业务层只依赖 `Store` 方法 |
+| 切换数据库只需改配置，不改业务代码 | ✅ | SQLx Any：只改 `DATABASE_URL`；业务层只依赖 `Store` 方法；m20：`Store` 实现 `TokenRepository` / `ChannelRepository` / `UserRepository` / `SourceRepository` / `PlanRepository` / `GroupRepository` / `EpgRepository` / `TicketRepository` 八个 trait（`crates/iptv-store/src/repositories.rs`），代表性调用方已改走 trait（`iptv-api::TicketStore` 以 `Arc<dyn TicketRepository>` 注入；`iptv-worker` 的 `probe_sample` / `import_epg_source` 以泛型约束依赖 `ChannelRepository` / `EpgRepository`）。注：开发文档 §10.4 原文另要求 `db-postgres` / `db-mysql` / `db-sqlite` Cargo feature（一次只启用一个）与方言拆 `pg.rs` / `mysql.rs` / `sqlite.rs`，已被单 `Any` 代码路径取代——同一二进制连三种库、契约测试同一批用例跑三套库；feature 若只做薄门控是名不副实的摆设，若真开关驱动则破坏“只改 URL 就换库”与契约测试，故不设该 feature（m20 选 B，见 `repositories.rs` 模块头注释）；开发文档 §10.4 相应措辞待同步修正 |
 
 ## §16 界面验收
 
@@ -57,7 +57,7 @@
 | §7 | M3U 导入/解析规则/同步流程/订阅源配置项 | ✅（解析器单测 + worker 九步 + 退避） |
 | §8 | 播放协议 + 播放地址安全 | ✅（HLS 主场景、签名代理、SSRF 校验；DASH/RTSP/RTMP 为扩展方向，见 M7） |
 | §9 | 数据库 19 张表 | ✅（三方言迁移） |
-| §10 | DB 选型与抽象层 | ✅（Any + Repository 方法 + 契约测试） |
+| §10 | DB 选型与抽象层 | ✅（Any + Repository trait 方法 + 契约测试；`db-*` feature 一节见 §16 数据库验收注：已被运行时 `DATABASE_URL` 切换取代，不设 feature） |
 | §11 | HIG 设计（边界、授权红线、令牌、Liquid Glass、组件清单、平台自适应、可访问性、页面草图） | ✅（令牌逐字、组件清单齐全；SF 素材按授权红线不用） |
 | §12 | i18n（范围、标识规范、Fluent 组织、技术实现、后端本地化、细节、内容本地化、管理流程、测试） | ✅（`xtask i18n-check` = CI 校验；`channel_i18n` / `epg_program_i18n` 表已建） |
 | §13 | 安全设计 12 条 | ✅（HTTPS/HSTS 部署层、Argon2id/SHA-256、票据、CSRF Origin 校验、XSS 转义、SSRF、本地上传不限大小（流式兜底）、三维限流、越权防护、审计 180 天、脱敏） |

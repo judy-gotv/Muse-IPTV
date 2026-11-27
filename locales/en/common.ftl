@@ -111,3 +111,4 @@ common-edit = Edit
 common-disabled = Disabled
 common-disable = Disable
 common-on-missing = On missing
+common-tv-remote-hint = TV remote: arrow keys to move, OK to confirm, Back to go back.

@@ -72,6 +72,17 @@ fn json_response<T: serde::Serialize>(
 }
 
 /// POST /api/v1/auth/ticket-exchange（§4.3 流程图）。
+#[utoipa::path(
+    post,
+    path = "/api/v1/auth/ticket-exchange",
+    tag = "auth",
+    request_body = TicketExchangeRequest,
+    responses(
+        (status = 200, description = "票据换会话（60s 单次消费），成功后 302 到 /me"),
+        (status = 401, description = "票据无效/过期（40101）"),
+        (status = 429, description = "限流（42903）")
+    )
+)]
 pub async fn ticket_exchange(
     State(state): State<Arc<AppState>>,
     ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
@@ -91,6 +102,8 @@ pub async fn ticket_exchange(
     let ticket = state
         .tickets
         .consume(&req.ticket)
+        .await
+        .map_err(ApiError::from)?
         .ok_or_else(|| ApiError::new(ErrorCode::SessionExpired, "ticket invalid or expired"))?;
     // 可绑 IP 段：票据签发时若绑定了 IP 前缀，兑换 IP 必须匹配。
     if let Some(prefix) = &ticket.ip_prefix {
@@ -167,6 +180,7 @@ pub async fn ticket_exchange(
 }
 
 /// POST /api/v1/auth/token-login（§4.2 方式 B）。
+#[utoipa::path(post, path = "/api/v1/auth/token-login", tag = "auth", request_body = TokenLoginRequest, responses((status = 200, description = "ok，下发 iptv_portal_sid Cookie"), (status = 429, description = "设备数达上限（42902）")))]
 pub async fn token_login(
     State(state): State<Arc<AppState>>,
     ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
@@ -257,6 +271,7 @@ pub async fn token_login(
 }
 
 /// POST /api/v1/auth/logout（§4.3：退出当前设备）。
+#[utoipa::path(post, path = "/api/v1/auth/logout", tag = "auth", responses((status = 200, description = "ok")))]
 pub async fn logout(
     State(state): State<Arc<AppState>>,
     auth: PortalAuth,
@@ -271,6 +286,13 @@ pub async fn logout(
         header::SET_COOKIE,
         clear_portal_cookie_header().parse().unwrap(),
     );
+    // m14：退出时一并清除双提交 Cookie（SSR 层下次有会话时会重新签发）。
+    h.append(
+        header::SET_COOKIE,
+        "iptv_csrf=; Path=/; SameSite=Lax; Max-Age=0"
+            .parse()
+            .unwrap(),
+    );
     Ok(json_response(
         StatusCode::OK,
         h,
@@ -280,6 +302,7 @@ pub async fn logout(
 
 /// POST /api/v1/auth/logout-all（M14：退出全部设备）。
 /// 传 `None`：吊销该 Token 的全部会话，含当前会话；写审计；并清除会话 Cookie。
+#[utoipa::path(post, path = "/api/v1/auth/logout-all", tag = "auth", responses((status = 200, description = "ok")))]
 pub async fn logout_all(
     State(state): State<Arc<AppState>>,
     auth: PortalAuth,
@@ -309,6 +332,13 @@ pub async fn logout_all(
     h.insert(
         header::SET_COOKIE,
         clear_portal_cookie_header().parse().unwrap(),
+    );
+    // m14：退出时一并清除双提交 Cookie（SSR 层下次有会话时会重新签发）。
+    h.append(
+        header::SET_COOKIE,
+        "iptv_csrf=; Path=/; SameSite=Lax; Max-Age=0"
+            .parse()
+            .unwrap(),
     );
     Ok(json_response(
         StatusCode::OK,

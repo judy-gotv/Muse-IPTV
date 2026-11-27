@@ -201,6 +201,9 @@ fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
 /// 在一段 Rust 源码里找出全部 `t_or("key", …)` / `t_args_or("key", …)`
 /// 调用，返回 `(key, key 所在行号)`。key 与调用可能跨行（如
 /// `t_args_or(\n    "portal.quota-used", …)`），故按整段文本扫描而非逐行。
+/// N1：另覆盖 `main.rs` 的 locale 首参形式
+/// `t_or(locale, "key", fallback)` / `t_args_or(locale, "key", …)`——
+/// 首参不是字符串时跳到第一个顶层逗号后再取字符串 key。
 fn scan_t_or_calls(text: &str) -> Vec<(String, usize)> {
     let mut out = Vec::new();
     let bytes = text.as_bytes();
@@ -229,12 +232,57 @@ fn scan_t_or_calls(text: &str) -> Vec<(String, usize)> {
         while j < bytes.len() && (bytes[j] as char).is_whitespace() {
             j += 1;
         }
-        if j >= bytes.len() || bytes[j] != b'"' {
-            // 不是字符串首参（如 `pub fn t_or(key: &str, …)` 的定义处），跳过。
-            i += pat_len;
-            continue;
+        if j >= bytes.len() {
+            break;
         }
-        let start = j + 1;
+        // key 所在位置：首参是字符串即 key；否则（locale 首参形式）
+        // 跳到第一个顶层逗号，再取其后的字符串。
+        let start = if bytes[j] == b'"' {
+            j + 1
+        } else {
+            let mut depth = 0i32;
+            let mut k = j;
+            let mut comma: Option<usize> = None;
+            while k < bytes.len() {
+                match bytes[k] {
+                    b'(' | b'[' | b'{' => depth += 1,
+                    b')' | b']' | b'}' => {
+                        if depth == 0 {
+                            break;
+                        }
+                        depth -= 1;
+                    }
+                    b',' if depth == 0 => {
+                        comma = Some(k);
+                        break;
+                    }
+                    b'"' => {
+                        // 首参里的字符串字面量（如 `t_or("x", …)` 不会走到
+                        // 这里；locale 表达式里若含字符串也一并跳过）。
+                        k += 1;
+                        while k < bytes.len() && bytes[k] != b'"' {
+                            k += 1;
+                        }
+                    }
+                    _ => {}
+                }
+                k += 1;
+            }
+            let Some(c) = comma else {
+                // 不是字符串首参（如 `pub fn t_or(key: &str, …)` 的定义处），跳过。
+                i += pat_len;
+                continue;
+            };
+            let mut m = c + 1;
+            while m < bytes.len() && (bytes[m] as char).is_whitespace() {
+                m += 1;
+            }
+            if m >= bytes.len() || bytes[m] != b'"' {
+                i += pat_len;
+                continue;
+            }
+            m + 1
+        };
         let mut k = start;
         while k < bytes.len() && bytes[k] != b'"' {
             k += 1;
@@ -252,6 +300,8 @@ fn scan_t_or_calls(text: &str) -> Vec<(String, usize)> {
 /// 扫描 `crates/` 下全部 `.rs` 的 `t_or(`/`t_args_or(` 引用，与 FTL key 集
 /// 比对。返回（引用的不同 key 数，缺 key 错误列表）。`t()` 的点转横线规则
 /// 与 `I18n::t` 一致：全部 `.` 转 `-`（如 `portal.quota-used`）。
+/// N1：同时覆盖 `main.rs` 的 locale 首参形式
+/// `t_or(locale, "key", …)`，否则一次性页的新 key 下轮又漏网。
 fn scan_code_references(ftl_keys: &BTreeSet<String>) -> (usize, Vec<String>) {
     let root = workspace_root();
     let mut files = Vec::new();
@@ -341,5 +391,38 @@ fn main() -> ExitCode {
             eprintln!("{e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scan_t_or_calls_key_first_form() {
+        // lib.rs / ui 的 key 首参形式（含跨行调用）。
+        let src = "let a = t_or(\"common.save\", \"Save\");\nlet b = t_args_or(\n    \"portal.quota-used\", &args, fallback);";
+        let found = scan_t_or_calls(src);
+        assert_eq!(
+            found,
+            vec![
+                ("common.save".to_string(), 1),
+                ("portal.quota-used".to_string(), 3),
+            ]
+        );
+    }
+
+    #[test]
+    fn scan_t_or_calls_locale_first_form() {
+        // N1：main.rs 的 locale 首参形式；定义处与标识符内命中须跳过。
+        let src = "fn t_or(locale: &str, key: &str, fallback: &str) -> String { String::new() }\nlet a = t_or(&locale, \"admin.onetime-token-created\", \"Token created\");\nlet b = t_args_or(&locale, \"admin.onetime-m3u-report\", &args, fb);\nlet c = foo_t_or(\"not.a.key\", \"x\");";
+        let found = scan_t_or_calls(src);
+        assert_eq!(
+            found,
+            vec![
+                ("admin.onetime-token-created".to_string(), 2),
+                ("admin.onetime-m3u-report".to_string(), 3),
+            ]
+        );
     }
 }

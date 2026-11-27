@@ -1,6 +1,7 @@
 //! 后台任务 Worker（开发文档 §3.1、§7.3、§6.3）。
 //!
-//! 循环任务（tokio interval，多实例安全靠 DB 认领：
+//! 循环任务（m21：tokio-cron-scheduler 调度，`WORKER_CRON_SCHEDULE`
+//! 每 15 秒一档，与原 15s interval 轮询同节奏；多实例安全靠 DB 认领：
 //! `next_sync_at <= now` 的源先被 `update_source_sync` 置为 syncing 状态，
 //! 其他实例看到 status=syncing 且未超时则跳过）：
 //! - 订阅同步：按 `next_sync_at` 取任务 → 拉取 → 解析 → 规范化 → 差异分类 →
@@ -12,37 +13,45 @@
 // 作者: Passwd Word
 
 use chrono::{Duration, Utc};
-use iptv_core::check_url_allowed;
+use iptv_core::{pin_target, resolve_checked_ip};
 use iptv_epg::parse_xmltv;
 use iptv_m3u::parse_m3u;
-use iptv_store::{EpgProgramInput, NewAuditLog, Store};
+use iptv_store::{ChannelRepository, EpgProgramInput, EpgRepository, NewAuditLog, Store};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
+use tokio_cron_scheduler::{Job, JobScheduler};
 
+/// m21：Worker 定时表达式（croner，秒在首位）：每 15 秒一档
+/// （:00/:15/:30/:45），与原 `tokio::time::interval(15s)` 轮询同节奏。
+pub const WORKER_CRON_SCHEDULE: &str = "*/15 * * * * *";
+
+#[derive(Clone)]
 pub struct Worker {
     pub store: Arc<Store>,
-    pub http: reqwest::Client,
     /// 连续失败次数（源 id → 次数），用于退避进档（§7.3 第 9 步）。
     /// 只是缓存：worker 重启后按 `sync_log` 恢复（M18，见 `load_failures`）。
-    failures: std::sync::Mutex<std::collections::HashMap<i64, u32>>,
+    failures: Arc<std::sync::Mutex<std::collections::HashMap<i64, u32>>>,
+    /// 上一轮 `run_once` 是否仍在跑：cron 档到期时若上一轮未完则跳过，
+    /// 保持原 interval 循环“一次只跑一轮”的语义（重叠的清理/同步无意义）。
+    round_running: Arc<AtomicBool>,
+    /// 已完成轮数（调度单测的观测点；跳过不计）。
+    rounds: Arc<AtomicU64>,
 }
 
 impl Worker {
     pub fn new(store: Arc<Store>) -> Self {
-        let http = reqwest::Client::builder()
-            .timeout(StdDuration::from_secs(30))
-            .user_agent(format!("Muse-IPTV-Worker/{}", iptv_core::VERSION))
-            // M17①：重定向由 `fetch_checked` 手动跟（Policy::none），每跳
-            // 都重做 DNS 解析 + IP 校验。`Policy::limited(3)` 只限跳数，
-            // 302 跳到内网仍会被跟进（M3 残留），故不能再交给客户端自动跟。
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .expect("http client");
         Self {
             store,
-            http,
-            failures: std::sync::Mutex::new(std::collections::HashMap::new()),
+            failures: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            round_running: Arc::new(AtomicBool::new(false)),
+            rounds: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// 已完成的 `run_once` 轮数。
+    pub fn rounds_completed(&self) -> u64 {
+        self.rounds.load(Ordering::Relaxed)
     }
 
     /// 失败退避档位（§7.3）：1m → 5m → 30m → 2h（按连续失败次数进档）。
@@ -89,20 +98,28 @@ impl Worker {
         self.failures.lock().unwrap().remove(&source_id);
     }
 
-    /// 带逐跳 SSRF 校验的请求（M17①）：每跳先 `check_url_allowed`
-    ///（DNS 解析后逐 IP 校验），再发请求；3xx 带 Location 时解析相对
-    /// 地址后继续，最多跟 3 跳（与旧 `Policy::limited(3)` 同限）。
-    /// 无 Location 的 3xx 直接返回响应（由调用方按状态码处理）。
+    /// 带逐跳 SSRF 校验的请求（M17① + N2）：每跳先 `resolve_checked_ip`
+    ///（解析一次、校验该组 IP 后取其中一个），再用 `pinned_client` 把
+    /// 连接固定到该 IP（`ClientBuilder::resolve` 覆盖本次解析，reqwest
+    /// 不再二次解析同一主机名，DNS 重绑定无窗口；TLS SNI/Host 仍用原
+    /// 主机名）；3xx 带 Location 时解析相对地址后继续，最多跟 3 跳
+    /// （与旧 `Policy::limited(3)` 同限）。无 Location 的 3xx 直接返
+    /// 回响应（由调用方按状态码处理）。
+    /// 客户端每跳新建：重定向目标 host 不同，固定值也不同；订阅/EPG
+    /// 拉取本就是低频操作，复用连接池的收益可忽略。重定向仍由本函数
+    /// 手动跟（Policy::none）：`Policy::limited(3)` 只限跳数，302 跳
+    /// 到内网仍会被跟进（M3 残留），故不能再交给客户端自动跟。
     async fn fetch_checked(
-        &self,
         method: reqwest::Method,
         url: &str,
         headers: Option<&serde_json::Map<String, serde_json::Value>>,
     ) -> anyhow::Result<reqwest::Response> {
         let mut current = url.to_string();
         for _ in 0..=3 {
-            check_url_allowed(&current).await?;
-            let mut req = self.http.request(method.clone(), &current);
+            let ip = resolve_checked_ip(&current).await?;
+            let parsed = reqwest::Url::parse(&current)?;
+            let client = pinned_client(&parsed, ip);
+            let mut req = client.request(method.clone(), &current);
             if let Some(headers) = headers {
                 for (k, v) in headers {
                     if let Some(v) = v.as_str() {
@@ -128,23 +145,83 @@ impl Worker {
         }
         anyhow::bail!("too many redirects");
     }
+}
 
-    /// 主循环：每 15 秒扫一轮到期任务。
+/// N2：按校验过的 IP 建客户端（`ClientBuilder::resolve` 覆盖本次 DNS
+/// 解析；字面 IP 主机无需固定，见 `pin_target`）。重定向目标 host
+/// 不同故每跳新建，见 `Worker::fetch_checked`。
+fn pinned_client(url: &reqwest::Url, ip: std::net::IpAddr) -> reqwest::Client {
+    let mut builder = reqwest::Client::builder()
+        .timeout(StdDuration::from_secs(30))
+        .user_agent(format!("Muse-IPTV-Worker/{}", iptv_core::VERSION))
+        .redirect(reqwest::redirect::Policy::none());
+    if let Some((host, addr)) = pin_target(url, ip) {
+        builder = builder.resolve(&host, addr);
+    }
+    builder.build().expect("http client")
+}
+
+impl Worker {
+    /// 主循环：m21 改走 tokio-cron-scheduler（`WORKER_CRON_SCHEDULE`
+    /// 每 15 秒一档）。启动时先立即跑一轮（原 interval 首 tick 立即触发），
+    /// 随后调度器接管；`migrate` 与认领行为在 `main.rs` / `run_once` 里，
+    /// 本函数不改。调度器在后台跑，本任务挂起直至进程退出。
     pub async fn run_forever(&self) -> anyhow::Result<()> {
-        let mut tick = tokio::time::interval(StdDuration::from_secs(15));
-        loop {
-            tick.tick().await;
-            if let Err(e) = self.run_once().await {
-                tracing::error!("worker round failed: {e:#}");
-            }
+        if let Err(e) = self.run_once().await {
+            tracing::error!("worker round failed: {e:#}");
         }
+        let sched = self.build_scheduler().await?;
+        sched.start().await?;
+        tracing::info!("worker scheduler started ({WORKER_CRON_SCHEDULE})");
+        std::future::pending::<()>().await;
+        #[allow(unreachable_code)]
+        Ok(())
     }
 
+    /// 按 `WORKER_CRON_SCHEDULE` 装配调度器（不启动）：每档触发一次
+    /// `run_once`，失败只记日志，不停调度器。
+    pub async fn build_scheduler(&self) -> anyhow::Result<JobScheduler> {
+        self.build_scheduler_with(WORKER_CRON_SCHEDULE).await
+    }
+
+    /// 同 `build_scheduler`，表达式可换（单测用 1 秒档验证触发）。
+    pub async fn build_scheduler_with(&self, schedule: &str) -> anyhow::Result<JobScheduler> {
+        let sched = JobScheduler::new().await?;
+        let worker = self.clone();
+        let job = Job::new_async(schedule, move |_uuid, _lock| {
+            let worker = worker.clone();
+            Box::pin(async move {
+                if let Err(e) = worker.run_once().await {
+                    tracing::error!("worker round failed: {e:#}");
+                }
+            })
+        })?;
+        sched.add(job).await?;
+        Ok(sched)
+    }
+
+    /// 一轮活：订阅/EPG 同步认领、过期会话清理、审计保留、过期票据
+    /// 清理（原 15s interval 每轮做的事，一项不丢）。上一轮仍在跑时
+    /// 本轮跳过（cron 档到期不排队）。
     pub async fn run_once(&self) -> anyhow::Result<()> {
+        if self.round_running.swap(true, Ordering::SeqCst) {
+            tracing::debug!("worker round skipped: previous round still running");
+            return Ok(());
+        }
+        let r = self.run_once_inner().await;
+        self.round_running.store(false, Ordering::SeqCst);
+        if r.is_ok() {
+            self.rounds.fetch_add(1, Ordering::Relaxed);
+        }
+        r
+    }
+
+    async fn run_once_inner(&self) -> anyhow::Result<()> {
         self.sync_due_sources().await?;
         self.sync_due_epg().await?;
         self.expire_stale_sessions().await?;
         self.cleanup_audit().await?;
+        self.purge_expired_tickets().await?;
         Ok(())
     }
 
@@ -286,9 +363,8 @@ impl Worker {
     ) -> anyhow::Result<(i64, i64, i64)> {
         // SSRF 校验（§13）+ 逐跳重校验在 `fetch_checked` 内做（M17①）：
         // 仅 http/https，解析后目标 IP 不在私网段，重定向目标同款重验。
-        let resp = self
-            .fetch_checked(reqwest::Method::GET, url, source.http_headers.as_object())
-            .await?;
+        let resp =
+            Self::fetch_checked(reqwest::Method::GET, url, source.http_headers.as_object()).await?;
         if !resp.status().is_success() {
             anyhow::bail!("subscription fetch failed: {}", resp.status());
         }
@@ -300,83 +376,86 @@ impl Worker {
             .store
             .upsert_channels(source.id, outcome.channels)
             .await?;
+        // m9：新增/变更频道的台标转存对象存储（§7.2）。未配置存储时
+        // `mirror_logos` 直接返回，直链行为不变；单张转存失败只记日志、
+        // 保留直链，不影响同步结果。
+        self.mirror_logos(&sync).await;
         // 抽样健康探测（§7.3 第 7 步）：前 5 个新增/变更频道 HEAD + manifest 前 1 KB。
-        self.probe_sample(&sync.added_channels).await;
+        // m20：以 `ChannelRepository` trait 为依赖（泛型约束），不依赖具体 `Store`。
+        probe_sample(&*self.store, &sync.added_channels).await;
         Ok((sync.added, sync.updated, sync.removed))
     }
 
-    /// 抽样健康探测（§7.3 第 7 步）：前 5 个新增/变更频道 HEAD + 取 manifest
-    /// 前 1 KB 校验可解析性；结果写回频道行（M8，`last_checked_at` /
-    /// `last_available`），不再只打日志丢弃。非 http(s) 端点（RTMP/RTSP）
-    /// 不在 HTTP 探测范围内，不写回（保持“未探测”）。
-    async fn probe_sample(&self, channels: &[iptv_dto::Channel]) {
-        for ch in channels.iter().take(5) {
-            let endpoints = match self.store.list_endpoints(ch.id).await {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-            let Some(ep) = endpoints.into_iter().find(|e| e.is_primary) else {
-                continue;
-            };
-            let Ok(url) = reqwest::Url::parse(&ep.url) else {
-                continue;
-            };
-            if url.scheme() != "http" && url.scheme() != "https" {
-                continue;
-            }
-            let available = match self
-                .fetch_checked(reqwest::Method::HEAD, &ep.url, None)
-                .await
-            {
-                Ok(resp) if resp.status().is_success() => {
-                    // 再取 manifest 前 1 KB：HEAD 成功不代表清单可解析。
-                    self.fetch_manifest_head_ok(&ep.url).await
+    /// m9 台标转存：只处理本轮新增/变更且带 `logo_url` 的频道，去重后
+    /// 最多 `LOGO_MIRROR_PER_SYNC` 张；转存成功才写回 `logo_url`。
+    async fn mirror_logos(&self, sync: &iptv_store::SyncOutcome) {
+        let Some(cfg) = iptv_core::S3Config::from_env() else {
+            return;
+        };
+        let mut seen = std::collections::HashSet::new();
+        let candidates: Vec<&iptv_dto::Channel> = sync
+            .added_channels
+            .iter()
+            .chain(sync.metadata_changed.iter())
+            .chain(sync.url_changed.iter())
+            .filter(|ch| {
+                ch.logo_url
+                    .as_deref()
+                    .is_some_and(|u| !u.trim().is_empty() && seen.insert(u.to_string()))
+            })
+            .take(iptv_core::logo_store::LOGO_MIRROR_PER_SYNC)
+            .collect();
+        if candidates.is_empty() {
+            return;
+        }
+        for ch in candidates {
+            let logo_url = ch.logo_url.clone().unwrap_or_default();
+            match self.mirror_one_logo(&cfg, &logo_url).await {
+                Some(new_url) => {
+                    if let Err(e) = self.store.update_channel_logo_url(ch.id, &new_url).await {
+                        tracing::warn!("update logo url channel {} failed: {e:#}", ch.id);
+                    }
                 }
-                Ok(resp) => {
-                    tracing::info!("probe channel {} {} -> {}", ch.id, ep.url, resp.status());
-                    false
+                None => {
+                    tracing::info!("logo kept direct for channel {}: {logo_url}", ch.id);
                 }
-                Err(e) => {
-                    tracing::warn!("probe channel {} failed: {e}", ch.id);
-                    false
-                }
-            };
-            if let Err(e) = self.store.record_channel_probe(ch.id, available).await {
-                tracing::warn!("record probe channel {} failed: {e:#}", ch.id);
             }
         }
     }
 
-    /// 取上游前 1 KB：清单地址（.m3u8）须含 `#EXTM3U` 才算可解析；
-    /// 其他地址只要返回非空体即算可达。同样走 `fetch_checked`，
-    /// 重定向目标逐跳重校验（M17①）。
-    async fn fetch_manifest_head_ok(&self, url: &str) -> bool {
-        let Ok(resp) = self.fetch_checked(reqwest::Method::GET, url, None).await else {
-            return false;
+    /// 单张台标：下载走本 crate 的 `fetch_checked`（N2：解析一次、连接
+    /// 固定到校验过的 IP，逐跳重验），上传走 core 的 `upload_logo`；
+    /// 任一步失败返回 `None`（保留直链，不影响同步）。
+    async fn mirror_one_logo(&self, cfg: &iptv_core::S3Config, logo_url: &str) -> Option<String> {
+        let resp = match Self::fetch_checked(reqwest::Method::GET, logo_url, None).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!("logo fetch {logo_url} failed: {e:#}");
+                return None;
+            }
         };
         if !resp.status().is_success() {
-            return false;
+            tracing::warn!("logo fetch {logo_url} failed: {}", resp.status());
+            return None;
         }
-        use futures_util::StreamExt;
-        let mut first_kb = Vec::new();
-        let mut stream = resp.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            match chunk {
-                Ok(c) => {
-                    let need = 1024usize.saturating_sub(first_kb.len());
-                    first_kb.extend_from_slice(&c[..c.len().min(need)]);
-                    if first_kb.len() >= 1024 {
-                        break;
-                    }
-                }
-                Err(_) => return false,
+        let content_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+        let bytes = match read_capped(resp, iptv_core::LOGO_MAX_BYTES).await {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!("logo read {logo_url} failed: {e:#}");
+                return None;
             }
-        }
-        let text = String::from_utf8_lossy(&first_kb);
-        if url.contains(".m3u8") {
-            text.contains("#EXTM3U")
-        } else {
-            !text.trim().is_empty()
+        };
+        match iptv_core::upload_logo(cfg, &bytes, content_type.as_deref(), logo_url).await {
+            Ok(url) => Some(url),
+            Err(e) => {
+                tracing::warn!("logo upload {logo_url} failed: {e:#}");
+                None
+            }
         }
     }
 
@@ -399,65 +478,10 @@ impl Worker {
             }
         }
         for source in sources {
-            // M3/M17①：EPG 拉取与订阅同款逐跳 SSRF 校验（此前完全无校验，
-            // 之后只验首跳；现每跳重验，失败即跳过该源）。
-            let resp = match self
-                .fetch_checked(reqwest::Method::GET, &source.url, None)
-                .await
-            {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::warn!("epg fetch {} blocked/failed: {e}", source.url);
-                    continue;
-                }
-            };
-            if !resp.status().is_success() {
-                continue;
-            }
-            // M4：边读边累计上限（20 MB），超限立即断流。
-            let bytes = match read_capped(resp, FETCH_MAX_BYTES).await {
-                Ok(b) => b,
-                Err(e) => {
-                    tracing::warn!("epg fetch {} too large: {e:#}", source.url);
-                    continue;
-                }
-            };
-            let data = match parse_xmltv(&bytes) {
-                Ok(d) => d,
-                Err(e) => {
-                    tracing::warn!("epg parse {} failed: {e}", source.url);
-                    continue;
-                }
-            };
-            let mut inputs = Vec::new();
-            for prog in data.programmes {
-                // 先精确 tvg-id 命中；再按旧 LIKE 语义（name/tvg_id 含子串，
-                // sort_weight DESC、id ASC 的首个）在内存里扫一遍。
-                let channel_id = by_tvg_id.get(&prog.channel).copied().or_else(|| {
-                    match_keys
-                        .iter()
-                        .find(|(_, tvg_id, name, _)| {
-                            tvg_id.as_deref().is_some_and(|t| t.contains(&prog.channel))
-                                || name.contains(&prog.channel)
-                        })
-                        .map(|(id, _, _, _)| *id)
-                });
-                if let Some(channel_id) = channel_id {
-                    inputs.push(EpgProgramInput {
-                        channel_id,
-                        tvg_id: Some(prog.channel.clone()),
-                        title: prog.title,
-                        description: prog.desc,
-                        category: prog.category,
-                        start_at: prog.start,
-                        stop_at: prog.stop,
-                    });
-                }
-            }
-            if !inputs.is_empty() {
-                let n = self.store.upsert_epg_programs(inputs).await?;
-                tracing::info!("epg {} imported {} programmes", source.url, n);
-            }
+            // m20：单源导入只依赖 `EpgRepository` trait（泛型约束），
+            // 不依赖具体 `Store`；拉取/解析失败只跳过该源（函数内 Ok），
+            // 入库层报错才向上传播（与原循环内 `?` 的语义一致）。
+            import_epg_source(&*self.store, &source, &by_tvg_id, &match_keys).await?;
         }
         Ok(())
     }
@@ -484,6 +508,191 @@ impl Worker {
         }
         Ok(())
     }
+
+    /// 过期登录票据清理（M15：票据落库后过期行需定期清；消费时已顺带清，
+    /// 这里是第二道清理，随每 15 秒 cron 档走，不另起进程）。
+    pub async fn purge_expired_tickets(&self) -> anyhow::Result<()> {
+        let n = self.store.purge_expired_tickets(Utc::now()).await?;
+        if n > 0 {
+            tracing::info!("cleaned {n} expired login tickets");
+        }
+        Ok(())
+    }
+}
+
+/// 抽样健康探测（§7.3 第 7 步，m20）：前 5 个新增/变更频道 HEAD + 取
+/// manifest 前 1 KB 校验可解析性；结果写回频道行（M8，`last_checked_at` /
+/// `last_available`），不再只打日志丢弃。非 http(s) 端点（RTMP/RTSP）
+/// 不在 HTTP 探测范围内，不写回（保持“未探测”）。
+///
+/// 存储访问只经 `ChannelRepository` trait（泛型约束），不依赖具体
+/// `Store`——`sync_source_inner` 以 `&*self.store` 传入，trait 层真实
+/// 接线而非摆设；换实现只需换传入对象。
+async fn probe_sample<R: ChannelRepository>(repo: &R, channels: &[iptv_dto::Channel]) {
+    for ch in channels.iter().take(5) {
+        let endpoints = match repo.list_endpoints(ch.id).await {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let Some(ep) = endpoints.into_iter().find(|e| e.is_primary) else {
+            continue;
+        };
+        let Ok(url) = reqwest::Url::parse(&ep.url) else {
+            continue;
+        };
+        if url.scheme() != "http" && url.scheme() != "https" {
+            continue;
+        }
+        let available = match Worker::fetch_checked(reqwest::Method::HEAD, &ep.url, None).await {
+            Ok(resp) if resp.status().is_success() => {
+                // 再取 manifest 前 1 KB：HEAD 成功不代表清单可解析。
+                fetch_manifest_head_ok(&ep.url).await
+            }
+            Ok(resp) => {
+                tracing::info!("probe channel {} {} -> {}", ch.id, ep.url, resp.status());
+                false
+            }
+            Err(e) => {
+                tracing::warn!("probe channel {} failed: {e}", ch.id);
+                false
+            }
+        };
+        if let Err(e) = repo.record_channel_probe(ch.id, available).await {
+            tracing::warn!("record probe channel {} failed: {e:#}", ch.id);
+        }
+    }
+}
+
+/// 取上游前 1 KB：清单地址（.m3u8）须含 `#EXTM3U` 才算可解析；
+/// 其他地址只要返回非空体即算可达。同样走 `fetch_checked`，
+/// 重定向目标逐跳重校验（M17①）。
+async fn fetch_manifest_head_ok(url: &str) -> bool {
+    let Ok(resp) = Worker::fetch_checked(reqwest::Method::GET, url, None).await else {
+        return false;
+    };
+    if !resp.status().is_success() {
+        return false;
+    }
+    use futures_util::StreamExt;
+    let mut first_kb = Vec::new();
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        match chunk {
+            Ok(c) => {
+                let need = 1024usize.saturating_sub(first_kb.len());
+                first_kb.extend_from_slice(&c[..c.len().min(need)]);
+                if first_kb.len() >= 1024 {
+                    break;
+                }
+            }
+            Err(_) => return false,
+        }
+    }
+    let text = String::from_utf8_lossy(&first_kb);
+    if url.contains(".m3u8") {
+        text.contains("#EXTM3U")
+    } else {
+        !text.trim().is_empty()
+    }
+}
+
+/// 单个 EPG 源的拉取 → 匹配 → 入库（m20）：存储访问只经 `EpgRepository`
+/// trait（泛型约束），频道匹配键由调用方一次查出传入（M7 内存匹配）。
+/// 拉取/解析失败只跳过该源（返回 `Ok`）；映射查询与节目入库报错才向
+/// 上传播（与原 `sync_due_epg` 循环体内 `?` 的语义一致）。
+async fn import_epg_source<E: EpgRepository>(
+    epg: &E,
+    source: &iptv_dto::EpgSource,
+    by_tvg_id: &std::collections::HashMap<String, i64>,
+    match_keys: &[(i64, Option<String>, String, i64)],
+) -> anyhow::Result<()> {
+    // M3/M17①：EPG 拉取与订阅同款逐跳 SSRF 校验（此前完全无校验，
+    // 之后只验首跳；现每跳重验，失败即跳过该源）。
+    let resp = match Worker::fetch_checked(reqwest::Method::GET, &source.url, None).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("epg fetch {} blocked/failed: {e}", source.url);
+            return Ok(());
+        }
+    };
+    if !resp.status().is_success() {
+        return Ok(());
+    }
+    // M4：边读边累计上限（20 MB），超限立即断流。
+    let bytes = match read_capped(resp, FETCH_MAX_BYTES).await {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!("epg fetch {} too large: {e:#}", source.url);
+            return Ok(());
+        }
+    };
+    let data = match parse_xmltv(&bytes) {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::warn!("epg parse {} failed: {e}", source.url);
+            return Ok(());
+        }
+    };
+    // m19：先取本源已配的映射（`epg_channel_map`），匹配时优先用；
+    // 拉取/解析失败的源直接跳过，不浪费这次查询。
+    let mapped: std::collections::HashMap<String, i64> = epg
+        .list_epg_channel_maps(Some(source.id), None)
+        .await?
+        .into_iter()
+        .filter_map(|m| match (m.tvg_id, m.channel_id) {
+            (Some(t), Some(c)) => Some((t, c)),
+            _ => None,
+        })
+        .collect();
+    let mut inputs = Vec::new();
+    for prog in data.programmes {
+        // m19：映射命中直接用；再精确 tvg-id；最后按旧 LIKE 语义
+        //（name/tvg_id 含子串，sort_weight DESC、id ASC 的首个）
+        // 在内存里扫一遍。
+        let channel_id = resolve_epg_channel(&mapped, by_tvg_id, match_keys, &prog.channel);
+        if let Some(channel_id) = channel_id {
+            inputs.push(EpgProgramInput {
+                channel_id,
+                tvg_id: Some(prog.channel.clone()),
+                title: prog.title,
+                description: prog.desc,
+                category: prog.category,
+                start_at: prog.start,
+                stop_at: prog.stop,
+            });
+        }
+    }
+    if !inputs.is_empty() {
+        let n = epg.upsert_epg_programs(inputs).await?;
+        tracing::info!("epg {} imported {} programmes", source.url, n);
+    }
+    Ok(())
+}
+
+/// m19：EPG 节目 → 频道的匹配优先级（纯函数，可单测）。
+///
+/// 1. `epg_channel_map` 映射命中直接用（管理员显式配置，哪怕该 EPG
+///    频道的 tvg-id 与频道自身的 tvg-id 不同也以映射为准）；
+/// 2. tvg-id 精确命中；3. 旧 LIKE 语义：name/tvg_id 含子串，
+///    sort_weight DESC、id ASC 的首个。
+pub fn resolve_epg_channel(
+    mapped: &std::collections::HashMap<String, i64>,
+    by_tvg_id: &std::collections::HashMap<String, i64>,
+    match_keys: &[(i64, Option<String>, String, i64)],
+    epg_channel: &str,
+) -> Option<i64> {
+    if let Some(id) = mapped.get(epg_channel) {
+        return Some(*id);
+    }
+    if let Some(id) = by_tvg_id.get(epg_channel) {
+        return Some(*id);
+    }
+    match_keys
+        .iter()
+        .find(|(_, tvg_id, name, _)| {
+            tvg_id.as_deref().is_some_and(|t| t.contains(epg_channel)) || name.contains(epg_channel)
+        })
+        .map(|(id, _, _, _)| *id)
 }
 
 /// 失败退避档位表（§7.3 第 9 步）：连续失败 0/1/2/3+ 次 → 60/300/1800/7200 秒。
@@ -508,4 +717,275 @@ async fn read_capped(resp: reqwest::Response, limit: usize) -> anyhow::Result<Ve
         buf.extend_from_slice(&chunk);
     }
     Ok(buf)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// 起一个本地 HTTP stub：每个连接读到请求头结束（`\r\n\r\n`）后
+    /// 回固定响应并关闭连接。返回监听地址。
+    async fn spawn_stub(ip: std::net::IpAddr, response: String) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind((ip, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let response = response.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let mut req = Vec::new();
+                    loop {
+                        match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => {
+                                req.extend_from_slice(&buf[..n]);
+                                if req.windows(4).any(|w| w == b"\r\n\r\n") {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    let _ = sock.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        addr
+    }
+
+    fn http_ok(body: &str) -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+    }
+
+    /// 测试开关的 RAII 守卫：`IPTV_TEST_ALLOW_PRIVATE_UPSTREAMS` 是进
+    /// 程环境变量，测试 panic 时也要恢复，避免污染同进程其他测试。
+    struct TestSwitchGuard {
+        prev: Option<String>,
+    }
+
+    impl TestSwitchGuard {
+        fn set() -> Self {
+            let prev = std::env::var("IPTV_TEST_ALLOW_PRIVATE_UPSTREAMS").ok();
+            std::env::set_var("IPTV_TEST_ALLOW_PRIVATE_UPSTREAMS", "1");
+            Self { prev }
+        }
+    }
+
+    impl Drop for TestSwitchGuard {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(v) => std::env::set_var("IPTV_TEST_ALLOW_PRIVATE_UPSTREAMS", v),
+                None => std::env::remove_var("IPTV_TEST_ALLOW_PRIVATE_UPSTREAMS"),
+            }
+        }
+    }
+
+    /// 把域名追加进 `NO_PROXY`/`no_proxy` 的 RAII 守卫（只追加已有
+    /// 值、不替换，drop 时恢复原值）。reqwest 在 `Client::build` 时
+    /// 读代理环境变量，守卫须在建客户端之前生效。
+    struct NoProxyGuard {
+        prev_upper: Option<String>,
+        prev_lower: Option<String>,
+    }
+
+    impl NoProxyGuard {
+        fn append(domain: &str) -> Self {
+            let prev_upper = std::env::var("NO_PROXY").ok();
+            let prev_lower = std::env::var("no_proxy").ok();
+            let add = |prev: &Option<String>| match prev {
+                Some(v) if !v.is_empty() => format!("{v},{domain}"),
+                _ => domain.to_string(),
+            };
+            std::env::set_var("NO_PROXY", add(&prev_upper));
+            std::env::set_var("no_proxy", add(&prev_lower));
+            Self {
+                prev_upper,
+                prev_lower,
+            }
+        }
+    }
+
+    impl Drop for NoProxyGuard {
+        fn drop(&mut self) {
+            match &self.prev_upper {
+                Some(v) => std::env::set_var("NO_PROXY", v),
+                None => std::env::remove_var("NO_PROXY"),
+            }
+            match &self.prev_lower {
+                Some(v) => std::env::set_var("no_proxy", v),
+                None => std::env::remove_var("no_proxy"),
+            }
+        }
+    }
+
+    /// N2 核心行为：固定后的客户端实际连向校验过的 IP。
+    /// `pinned.test` 在 DNS 里不存在（沙箱 DNS 也解析不到它）：未经
+    /// 固定的请求必然失败；固定到回环 stub 的 IP 后，请求必须打到
+    /// 本地 stub 并返回其响应——证明 `ClientBuilder::resolve` 的覆盖
+    /// 真的生效，而不是又走了一次 DNS。
+    /// 注意：沙箱设了出口代理环境变量（`http_proxy` 等），reqwest
+    /// 默认会走代理——`pinned.test` 不在 `NO_PROXY` 里时请求根本到
+    /// 不了本地 stub。测试内把该域名追加进 `NO_PROXY`/`no_proxy`
+    /// （只追加、不替换已有项，同进程并行的其他测试不受影响）。
+    #[tokio::test]
+    async fn pinned_client_connects_to_validated_ip() {
+        let _no_proxy = NoProxyGuard::append("pinned.test");
+        let loopback = std::net::IpAddr::from([127, 0, 0, 1]);
+        let addr = spawn_stub(loopback, http_ok("pinned-ok")).await;
+        let url = reqwest::Url::parse(&format!("http://pinned.test:{}/x", addr.port())).unwrap();
+        let client = pinned_client(&url, addr.ip());
+        let resp = client.get(url).send().await.unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.text().await.unwrap(), "pinned-ok");
+    }
+
+    /// N2 接线：`fetch_checked` 走“解析+校验+固定”全程，且开关语义
+    /// 不变。同一测试函数内顺序执行各阶段，避免多测试并行改进程环境
+    /// 变量竞态：① 开关开时回环拉取成功；② IPv6 回环同样成功；
+    /// ③ 302 重定向逐跳重新固定，终点响应可达；④ 开关关时回环被拒。
+    #[tokio::test]
+    async fn fetch_checked_loopback_redirect_and_switch() {
+        let v4 = std::net::IpAddr::from([127, 0, 0, 1]);
+        let v6 = std::net::IpAddr::from([0, 0, 0, 0, 0, 0, 0, 1]);
+        let _guard = TestSwitchGuard::set();
+
+        // ① 回环 v4 拉取成功。
+        let addr = spawn_stub(v4, http_ok("fetch-ok")).await;
+        let url = format!("http://127.0.0.1:{}/x.m3u", addr.port());
+        let resp = Worker::fetch_checked(reqwest::Method::GET, &url, None)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.text().await.unwrap(), "fetch-ok");
+
+        // ② 回环 v6（字面 IPv6）拉取成功。
+        let addr6 = spawn_stub(v6, http_ok("fetch-ok-v6")).await;
+        let url6 = format!("http://[::1]:{}/x.m3u", addr6.port());
+        let resp = Worker::fetch_checked(reqwest::Method::GET, &url6, None)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.text().await.unwrap(), "fetch-ok-v6");
+
+        // ③ 302 跳到另一回环端口：每跳重新解析+校验+固定，终点可达。
+        let final_addr = spawn_stub(v4, http_ok("redirect-ok")).await;
+        let redirect = format!(
+            "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{}/final\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            final_addr.port()
+        );
+        let redirect_addr = spawn_stub(v4, redirect).await;
+        let url = format!("http://127.0.0.1:{}/start", redirect_addr.port());
+        let resp = Worker::fetch_checked(reqwest::Method::GET, &url, None)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.text().await.unwrap(), "redirect-ok");
+
+        // ④ 开关关时回环必须被拒（开关只放行 IP 段，关掉即恢复拦截）。
+        drop(_guard);
+        assert!(Worker::fetch_checked(reqwest::Method::GET, &url, None)
+            .await
+            .is_err());
+    }
+
+    /// m21：cron 表达式可解析、调度器装配后任务真的触发。
+    /// 1 秒一档的计数任务在 2.5 秒内至少触发一次；`WORKER_CRON_SCHEDULE`
+    ///（15 秒档）本身也要能建成 Job（表达式合法）。
+    #[tokio::test]
+    async fn cron_scheduler_fires_job() {
+        use std::sync::atomic::AtomicUsize;
+        let hits = Arc::new(AtomicUsize::new(0));
+        let h = hits.clone();
+        let mut sched = JobScheduler::new().await.unwrap();
+        let job = Job::new_async("*/1 * * * * *", move |_uuid, _lock| {
+            let h = h.clone();
+            Box::pin(async move {
+                h.fetch_add(1, Ordering::Relaxed);
+            })
+        })
+        .unwrap();
+        sched.add(job).await.unwrap();
+        sched.start().await.unwrap();
+        tokio::time::sleep(StdDuration::from_millis(2500)).await;
+        sched.shutdown().await.unwrap();
+        assert!(
+            hits.load(Ordering::Relaxed) >= 1,
+            "1s cron job should have fired at least once in 2.5s"
+        );
+        // 生产表达式本身必须合法（只建 Job，不启动）。
+        assert!(
+            Job::new_async(WORKER_CRON_SCHEDULE, |_uuid, _lock| Box::pin(async move {})).is_ok()
+        );
+    }
+
+    static WORKER_TEST_DB_COUNTER: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+
+    /// m21：`build_scheduler_with` 装配出的调度器真的驱动 `run_once`。
+    /// 空库（无源/无 EPG）上一轮是空操作但必须成功完成并计轮数。
+    #[tokio::test]
+    async fn scheduler_drives_run_once() {
+        let n = WORKER_TEST_DB_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let path =
+            std::env::temp_dir().join(format!("iptv-worker-test-{}-{n}.db", std::process::id()));
+        let url = format!("sqlite://{}?mode=rwc", path.display());
+        let store = Arc::new(
+            iptv_store::Store::connect(&url)
+                .await
+                .expect("Store::connect"),
+        );
+        store.migrate().await.expect("migrate");
+        let worker = Worker::new(store);
+        let mut sched = worker
+            .build_scheduler_with("*/1 * * * * *")
+            .await
+            .expect("build_scheduler_with");
+        sched.start().await.expect("scheduler start");
+        tokio::time::sleep(StdDuration::from_millis(2500)).await;
+        sched.shutdown().await.expect("scheduler shutdown");
+        let rounds = worker.rounds_completed();
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            rounds >= 1,
+            "scheduler should have driven run_once at least once in 2.5s, got {rounds}"
+        );
+    }
+
+    /// m19：映射命中优先于 tvg-id 精确命中——EPG 频道 `epg.cctv5`
+    /// 明明与频道 1 的 tvg-id `cctv5.cn` 不同，映射指到频道 2 就用 2；
+    /// 无映射时仍走精确 tvg-id 与名称子串回落。
+    #[test]
+    fn resolve_epg_channel_prefers_map_over_tvg_id() {
+        use std::collections::HashMap;
+        let mapped: HashMap<String, i64> = [("epg.cctv5".to_string(), 2)].into_iter().collect();
+        let by_tvg_id: HashMap<String, i64> = [("cctv5.cn".to_string(), 1)].into_iter().collect();
+        let keys = vec![
+            (1, Some("cctv5.cn".to_string()), "CCTV-5".to_string(), 10),
+            (2, Some("cctv5b.cn".to_string()), "CCTV-5+".to_string(), 9),
+        ];
+        // 映射命中：即使 tvg-id 精确命中频道 1，也用映射的频道 2。
+        assert_eq!(
+            resolve_epg_channel(&mapped, &by_tvg_id, &keys, "epg.cctv5"),
+            Some(2)
+        );
+        // 无映射：精确 tvg-id 命中频道 1。
+        assert_eq!(
+            resolve_epg_channel(&mapped, &by_tvg_id, &keys, "cctv5.cn"),
+            Some(1)
+        );
+        // 无映射无精确命中：名称子串回落（"CCTV-5" 含 "CCTV-5"）。
+        assert_eq!(
+            resolve_epg_channel(&HashMap::new(), &by_tvg_id, &keys, "CCTV-5"),
+            Some(1)
+        );
+        // 全无命中：None。
+        assert_eq!(
+            resolve_epg_channel(&HashMap::new(), &by_tvg_id, &keys, "nope"),
+            None
+        );
+    }
 }
