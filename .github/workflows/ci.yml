@@ -36,7 +36,7 @@ jobs:
           cargo build --release -p iptv-api -p iptv-worker
           mkdir -p /tmp/iptv-smoke
           cd /tmp/iptv-smoke
-          DATABASE_URL=sqlite://./iptv.db IPTV_ADMIN_USER=admin IPTV_ADMIN_PASSWORD='smoke-test-123' BIND_ADDR=127.0.0.1:18080 timeout 15 ${{ github.workspace }}/target/release/iptv-api &
+          DATABASE_URL=sqlite://./iptv.db IPTV_ADMIN_USER=admin IPTV_ADMIN_PASSWORD='smoke-test-123' PLAY_SECRET='smoke-test-play-secret' ADMIN_SECRET='smoke-test-admin-secret' BIND_ADDR=127.0.0.1:18080 timeout 15 ${{ github.workspace }}/target/release/iptv-api &
           API_PID=$!
           sleep 6
           curl -fsSL http://127.0.0.1:18080/healthz

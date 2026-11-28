@@ -144,7 +144,7 @@ pub struct EpgProgramInput { pub channel_id: i64, pub tvg_id: Option<String>, pu
 pub struct Config {
     pub database_url: String,
     pub redis_url: Option<String>,
-    pub play_secret: String,      // HMAC 密钥（环境变量 PLAY_SECRET，未配则启动时随机生成并打印警告）
+    pub play_secret: String,      // HMAC 密钥（环境变量 PLAY_SECRET，未配或为空则拒绝启动，N3 fail-closed）
     pub portal_base_url: String,  // 如 https://portal.example.com
     pub admin_secret: String,     // 管理员会话 HMAC 密钥
 }
