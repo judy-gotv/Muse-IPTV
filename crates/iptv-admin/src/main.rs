@@ -38,6 +38,10 @@ async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
+    // m22：启动时读库装入 i18n 覆盖（与 API main.rs 同款；后台此前只在
+    // 访问覆盖页的 server fn 里惰性装入，重启后失效。读库失败只记警告，
+    // 不阻塞启动；无覆盖时 FTL 兜底）。
+    load_i18n_overrides().await;
     let conf = leptos::config::get_configuration(None).expect("leptos config");
     let leptos_options = conf.leptos_options;
     // 单端口部署时用专属变量定内部监听地址（.env 里门户/后台各写一行）；
@@ -107,6 +111,30 @@ async fn main() {
     axum::serve(listener, app.into_make_service())
         .await
         .unwrap();
+}
+
+/// m22：启动时把 `i18n_override` 表装入进程内覆盖表（与 API main.rs
+/// 同款；`DATABASE_URL` 未设时默认 `sqlite://iptv.db`，与 API 的
+/// `Config::from_env` 一致）。读库/连库失败只记警告，不阻塞启动。
+async fn load_i18n_overrides() {
+    let database_url =
+        std::env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite://iptv.db".to_string());
+    load_i18n_overrides_from(&database_url).await;
+}
+
+/// m22：`load_i18n_overrides` 的可测形态（单测传临时库 URL）。
+async fn load_i18n_overrides_from(database_url: &str) {
+    match iptv_store::Store::connect(database_url).await {
+        Ok(store) => match store.i18n_overrides_map().await {
+            Ok(map) => {
+                let n = map.len();
+                iptv_i18n::I18n::set_overrides(map);
+                tracing::info!("loaded {n} i18n overrides");
+            }
+            Err(e) => tracing::warn!("failed to load i18n overrides: {e}"),
+        },
+        Err(e) => tracing::warn!("failed to connect database for i18n overrides: {e}"),
+    }
 }
 
 async fn design_css() -> ([(header::HeaderName, &'static str); 1], &'static str) {
@@ -249,6 +277,9 @@ fn forwarded_for(headers: &HeaderMap) -> Option<String> {
 /// `X-CSRF-Token` 头 + `Cookie` 头里的 `iptv_csrf` 发给 API，走双提交
 /// 比对；无则只发会话 Cookie，API 退回 Origin 兜底（管理员登录尚无
 /// token 时就是这个形态）。
+/// m22：另转发浏览器的 `iptv_locale` Cookie 与 `Accept-Language`，API
+/// 的错误本地化中间件才能按管理员真实语言渲染 message（此前只转
+/// 发会话/Cookie，API 一律回退系统默认简体中文）。
 async fn backend_json(
     method: reqwest::Method,
     path: &str,
@@ -256,6 +287,7 @@ async fn backend_json(
     sid: Option<&str>,
     xff: Option<&str>,
     csrf: Option<&str>,
+    headers: &HeaderMap,
 ) -> BackendResult {
     let url = format!("{}{path}", api_base());
     let mut req = client().request(method, &url);
@@ -272,6 +304,24 @@ async fn backend_json(
         }
         cookie.push_str(&format!("iptv_csrf={c}"));
         req = req.header("x-csrf-token", c);
+    }
+    // m22：语言转发（Cookie 优先，Accept-Language 兜底；API 中间件按
+    // Cookie `iptv_locale` → Accept-Language → 默认的顺序协商）。
+    let locale = cookie_header(headers)
+        .and_then(|h| cookie_value(&h, "iptv_locale"))
+        .filter(|l| iptv_i18n::normalize_locale(l).is_some());
+    if let Some(l) = &locale {
+        if !cookie.is_empty() {
+            cookie.push_str("; ");
+        }
+        cookie.push_str(&format!("iptv_locale={l}"));
+    }
+    if let Some(al) = headers
+        .get(header::ACCEPT_LANGUAGE)
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.trim().is_empty())
+    {
+        req = req.header(header::ACCEPT_LANGUAGE, al);
     }
     if !cookie.is_empty() {
         req = req.header("Cookie", cookie);
@@ -338,9 +388,15 @@ fn pct_encode(s: &str) -> String {
     out
 }
 
-fn ok_redirect(base: &str, r: &BackendResult) -> (HeaderMap, Redirect) {
+/// m22：`?error=` 跳转前用当前 locale 把 SSR 自产 / 任务英文串翻成
+/// 本地文案（API 已本地化的 message 原样透传，见 `localize_backend_error`）。
+fn ok_redirect(base: &str, r: &BackendResult, headers: &HeaderMap) -> (HeaderMap, Redirect) {
     match &r.error {
-        Some(e) => redirect_with_cookies(&format!("{base}?error={}", pct_encode(e)), &[]),
+        Some(e) => {
+            let locale = locale_from_headers(headers);
+            let e = localize_backend_error(&locale, e);
+            redirect_with_cookies(&format!("{base}?error={}", pct_encode(&e)), &[])
+        }
         None => redirect_with_cookies(&format!("{base}?saved=1"), &[]),
     }
 }
@@ -399,30 +455,79 @@ fn t_args_or(locale: &str, key: &str, args: &[(&str, String)], fallback: String)
 /// N1：`backend_json` 在拿不到后端 message 时填的英文哨兵（`backend
 /// unreachable` 等）在展示时翻成本地文案；其余 message 已由 API 的
 /// 本地化中间件翻过，原样透传。
+/// m22：覆盖面从 7 串扩到全量——新增上传任务 `p.error` 的 6 条英文串
+/// （`run_upload_task` 的失败分支，见 `upload_task_status` 的 SSR 侧
+/// 映射；`handlers/admin.rs` 里的错误串本身不动）。带 `: {detail}` 后
+/// 缀的三条走前缀匹配，detail 原样保留在 `$detail` 占位符里。
+/// 注意：key 必须写字面量（不走 `(key, fallback)` 元组），`cargo xtask
+/// i18n-check` 的引用扫描只认字面量 key。
 fn localize_backend_error(locale: &str, msg: &str) -> String {
-    let (key, fallback) = match msg {
-        "backend unreachable" => (
+    // 带 detail 后缀的三条：前缀匹配（精确串里没有这三条的全形）。
+    if let Some(detail) = msg.strip_prefix("read source failed: ") {
+        return t_args_or(
+            locale,
+            "admin.upload-task-read-source-failed",
+            &[("detail", detail.to_string())],
+            format!("Failed to read source: {detail}"),
+        );
+    }
+    if let Some(detail) = msg.strip_prefix("create source failed: ") {
+        return t_args_or(
+            locale,
+            "admin.upload-task-create-source-failed",
+            &[("detail", detail.to_string())],
+            format!("Failed to create source: {detail}"),
+        );
+    }
+    if let Some(detail) = msg.strip_prefix("import channels failed: ") {
+        return t_args_or(
+            locale,
+            "admin.upload-task-import-failed",
+            &[("detail", detail.to_string())],
+            format!("Failed to import channels: {detail}"),
+        );
+    }
+    match msg {
+        "backend unreachable" => t_or(
+            locale,
             "admin.onetime-error-backend-unreachable",
             "Backend unreachable",
         ),
-        "login failed" => ("admin.onetime-error-login-failed", "Sign-in failed"),
-        "create token failed" => (
+        "login failed" => t_or(locale, "admin.onetime-error-login-failed", "Sign-in failed"),
+        "create token failed" => t_or(
+            locale,
             "admin.onetime-error-create-token-failed",
             "Failed to create token",
         ),
-        "create ticket failed" => (
+        "create ticket failed" => t_or(
+            locale,
             "admin.onetime-error-create-ticket-failed",
             "Failed to create login ticket",
         ),
-        "reset totp failed" => (
+        "reset totp failed" => t_or(
+            locale,
             "admin.onetime-error-reset-totp-failed",
             "Failed to reset TOTP",
         ),
-        "upload failed" => ("admin.onetime-error-upload-failed", "Upload failed"),
-        "error" => ("errors.e50000", "Internal server error"),
-        _ => return msg.to_string(),
-    };
-    t_or(locale, key, fallback)
+        "upload failed" => t_or(locale, "admin.onetime-error-upload-failed", "Upload failed"),
+        "read upload failed" => t_or(
+            locale,
+            "admin.upload-task-read-failed",
+            "Failed to read upload",
+        ),
+        "parse upload failed" => t_or(
+            locale,
+            "admin.upload-task-parse-failed",
+            "Failed to parse upload",
+        ),
+        "source not found" => t_or(
+            locale,
+            "admin.upload-task-source-not-found",
+            "Source not found",
+        ),
+        "error" => t_or(locale, "errors.e50000", "Internal server error"),
+        _ => msg.to_string(),
+    }
 }
 
 /// N1：错误页（message + 返回链接，文案走 FTL；`back_key` 如
@@ -501,6 +606,7 @@ async fn login(headers: HeaderMap, Form(form): Form<LoginForm>) -> (HeaderMap, R
         None,
         forwarded_for(&headers).as_deref(),
         csrf_token(&headers).as_deref(),
+        &headers,
     )
     .await;
     if !r.ok {
@@ -612,9 +718,10 @@ async fn create_user(headers: HeaderMap, Form(f): Form<UserForm>) -> (HeaderMap,
         admin_sid(&headers).as_deref(),
         forwarded_for(&headers).as_deref(),
         csrf_token(&headers).as_deref(),
+        &headers,
     )
     .await;
-    ok_redirect("/admin/users", &r)
+    ok_redirect("/admin/users", &r, &headers)
 }
 
 /// M19a：行内编辑表单提交 → PATCH /api/v1/admin/users/{id}。
@@ -647,9 +754,10 @@ async fn update_user(
         admin_sid(&headers).as_deref(),
         forwarded_for(&headers).as_deref(),
         csrf_token(&headers).as_deref(),
+        &headers,
     )
     .await;
-    ok_redirect("/admin/users", &r)
+    ok_redirect("/admin/users", &r, &headers)
 }
 
 async fn delete_user(headers: HeaderMap, Path(id): Path<i64>) -> (HeaderMap, Redirect) {
@@ -660,9 +768,10 @@ async fn delete_user(headers: HeaderMap, Path(id): Path<i64>) -> (HeaderMap, Red
         admin_sid(&headers).as_deref(),
         forwarded_for(&headers).as_deref(),
         csrf_token(&headers).as_deref(),
+        &headers,
     )
     .await;
-    ok_redirect("/admin/users", &r)
+    ok_redirect("/admin/users", &r, &headers)
 }
 
 #[derive(Deserialize)]
@@ -704,6 +813,7 @@ async fn create_token(headers: HeaderMap, Form(f): Form<TokenForm>) -> Html<Stri
         admin_sid(&headers).as_deref(),
         forwarded_for(&headers).as_deref(),
         csrf_token(&headers).as_deref(),
+        &headers,
     )
     .await;
     if !r.ok {
@@ -786,9 +896,10 @@ async fn update_token(
         admin_sid(&headers).as_deref(),
         forwarded_for(&headers).as_deref(),
         csrf_token(&headers).as_deref(),
+        &headers,
     )
     .await;
-    ok_redirect("/admin/tokens", &r)
+    ok_redirect("/admin/tokens", &r, &headers)
 }
 
 async fn delete_token(headers: HeaderMap, Path(id): Path<i64>) -> (HeaderMap, Redirect) {
@@ -799,9 +910,10 @@ async fn delete_token(headers: HeaderMap, Path(id): Path<i64>) -> (HeaderMap, Re
         admin_sid(&headers).as_deref(),
         forwarded_for(&headers).as_deref(),
         csrf_token(&headers).as_deref(),
+        &headers,
     )
     .await;
-    ok_redirect("/admin/tokens", &r)
+    ok_redirect("/admin/tokens", &r, &headers)
 }
 
 async fn create_login_ticket(headers: HeaderMap, Path(id): Path<i64>) -> Html<String> {
@@ -812,6 +924,7 @@ async fn create_login_ticket(headers: HeaderMap, Path(id): Path<i64>) -> Html<St
         admin_sid(&headers).as_deref(),
         forwarded_for(&headers).as_deref(),
         csrf_token(&headers).as_deref(),
+        &headers,
     )
     .await;
     if !r.ok {
@@ -871,9 +984,10 @@ async fn revoke_token_sessions(headers: HeaderMap, Path(id): Path<i64>) -> (Head
         admin_sid(&headers).as_deref(),
         forwarded_for(&headers).as_deref(),
         csrf_token(&headers).as_deref(),
+        &headers,
     )
     .await;
-    ok_redirect("/admin/tokens", &r)
+    ok_redirect("/admin/tokens", &r, &headers)
 }
 
 #[derive(Deserialize)]
@@ -914,9 +1028,10 @@ async fn create_channel(headers: HeaderMap, Form(f): Form<ChannelForm>) -> (Head
         admin_sid(&headers).as_deref(),
         forwarded_for(&headers).as_deref(),
         csrf_token(&headers).as_deref(),
+        &headers,
     )
     .await;
-    ok_redirect("/admin/channels", &r)
+    ok_redirect("/admin/channels", &r, &headers)
 }
 
 /// M19c：行内编辑表单提交 → PATCH /api/v1/admin/sources/{id}。
@@ -951,9 +1066,10 @@ async fn update_source(
         admin_sid(&headers).as_deref(),
         forwarded_for(&headers).as_deref(),
         csrf_token(&headers).as_deref(),
+        &headers,
     )
     .await;
-    ok_redirect("/admin/sources", &r)
+    ok_redirect("/admin/sources", &r, &headers)
 }
 
 async fn delete_source(headers: HeaderMap, Path(id): Path<i64>) -> (HeaderMap, Redirect) {
@@ -964,9 +1080,10 @@ async fn delete_source(headers: HeaderMap, Path(id): Path<i64>) -> (HeaderMap, R
         admin_sid(&headers).as_deref(),
         forwarded_for(&headers).as_deref(),
         csrf_token(&headers).as_deref(),
+        &headers,
     )
     .await;
-    ok_redirect("/admin/sources", &r)
+    ok_redirect("/admin/sources", &r, &headers)
 }
 
 async fn delete_channel(headers: HeaderMap, Path(id): Path<i64>) -> (HeaderMap, Redirect) {
@@ -977,9 +1094,10 @@ async fn delete_channel(headers: HeaderMap, Path(id): Path<i64>) -> (HeaderMap, 
         admin_sid(&headers).as_deref(),
         forwarded_for(&headers).as_deref(),
         csrf_token(&headers).as_deref(),
+        &headers,
     )
     .await;
-    ok_redirect("/admin/channels", &r)
+    ok_redirect("/admin/channels", &r, &headers)
 }
 
 #[derive(Deserialize)]
@@ -1004,9 +1122,10 @@ async fn create_source(headers: HeaderMap, Form(f): Form<SourceForm>) -> (Header
         admin_sid(&headers).as_deref(),
         forwarded_for(&headers).as_deref(),
         csrf_token(&headers).as_deref(),
+        &headers,
     )
     .await;
-    ok_redirect("/admin/sources", &r)
+    ok_redirect("/admin/sources", &r, &headers)
 }
 
 /// POST /admin/sources/paste：粘贴 M3U 文本导入（m18，表单字段见
@@ -1015,13 +1134,17 @@ async fn create_source(headers: HeaderMap, Form(f): Form<SourceForm>) -> (Header
 /// 注：m14 修复时补——路由与表单已在工作树里，handler 缺失导致
 /// `iptv-admin` 整个编不过；此处只按 `create_source` 同款补一个
 /// 最小转发，m18 的展示/文案仍归原负责人。
+/// N8（v0.1.6）：后端粘贴已改为异步（与上传同款 `{ task_id }`），
+/// 故成功时不再 `ok_redirect` 回源列表，而是走 `m3u_report_page`
+///（其 task_id 分支出上传进度页，JS 轮询任务进度）；失败时出本地化
+/// 错误页（与上传 handler 同款）。
 #[derive(Deserialize)]
 struct PasteForm {
     name: Option<String>,
     content: String,
 }
 
-async fn paste_m3u(headers: HeaderMap, Form(f): Form<PasteForm>) -> (HeaderMap, Redirect) {
+async fn paste_m3u(headers: HeaderMap, Form(f): Form<PasteForm>) -> Html<String> {
     let body = serde_json::json!({
         "name": opt_str(&f.name),
         "content": f.content,
@@ -1033,9 +1156,18 @@ async fn paste_m3u(headers: HeaderMap, Form(f): Form<PasteForm>) -> (HeaderMap, 
         admin_sid(&headers).as_deref(),
         forwarded_for(&headers).as_deref(),
         csrf_token(&headers).as_deref(),
+        &headers,
     )
     .await;
-    ok_redirect("/admin/sources", &r)
+    if let Some(e) = &r.error {
+        let locale = locale_from_headers(&headers);
+        let msg = localize_backend_error(&locale, e);
+        return error_page(&locale, &msg, "/admin/sources", "common.back", "Back");
+    }
+    // `backend_json` 已把信封的 `data` 拆出，`m3u_report_page` 要的是
+    // 整个信封，在此包回 `{ data }`（与上传 handler 传整信封一致）。
+    let env = serde_json::json!({ "data": r.data });
+    m3u_report_page(&headers, &env)
 }
 
 /// POST /admin/sources/upload：multipart 转发给后端（§7.1 本地 M3U 上传）。
@@ -1064,6 +1196,7 @@ async fn upload_m3u(headers: HeaderMap, mut multipart: Multipart) -> Html<String
     let url = format!("{}/api/v1/admin/sources/upload", api_base());
     let mut req = client().post(&url).multipart(form);
     // m14：multipart 转发也带双提交（与 backend_json 同款）。
+    // m22：同 backend_json，另转发 `iptv_locale` Cookie 与 Accept-Language。
     let mut cookie = String::new();
     if let Some(s) = sid {
         cookie.push_str(&format!("iptv_admin_sid={s}"));
@@ -1074,6 +1207,22 @@ async fn upload_m3u(headers: HeaderMap, mut multipart: Multipart) -> Html<String
         }
         cookie.push_str(&format!("iptv_csrf={c}"));
         req = req.header("x-csrf-token", c);
+    }
+    if let Some(l) = cookie_header(&headers)
+        .and_then(|h| cookie_value(&h, "iptv_locale"))
+        .filter(|l| iptv_i18n::normalize_locale(l).is_some())
+    {
+        if !cookie.is_empty() {
+            cookie.push_str("; ");
+        }
+        cookie.push_str(&format!("iptv_locale={l}"));
+    }
+    if let Some(al) = headers
+        .get(header::ACCEPT_LANGUAGE)
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.trim().is_empty())
+    {
+        req = req.header(header::ACCEPT_LANGUAGE, al);
     }
     if !cookie.is_empty() {
         req = req.header("Cookie", cookie);
@@ -1109,12 +1258,13 @@ async fn upload_m3u(headers: HeaderMap, mut multipart: Multipart) -> Html<String
 }
 
 /// m18：M3U 导入报告页（上传与粘贴共用；标题/行文案/返回链接走 FTL）。
-/// `env` 为后端信封：粘贴导入（m18）是同步 `{ data: M3uImportReport }`，
-/// 文件上传（M16）是异步 `{ data: { task_id } }`，两形各走一支。
+/// `env` 为后端信封：文件上传（M16）与粘贴导入（m18，N8 起异步）均
+/// 为异步 `{ data: { task_id } }`，走进度页分支；同步
+/// `{ data: M3uImportReport }` 分支仅作兼容保留（现无调用方返回该形）。
 fn m3u_report_page(headers: &HeaderMap, env: &serde_json::Value) -> Html<String> {
     let d = env.get("data").cloned().unwrap_or(serde_json::Value::Null);
-    // M16：文件上传走异步任务（data 含 task_id）→ 进度页；粘贴导入
-    // （m18，同步返回 M3uImportReport）→ 直接出报告页。
+    // M16/N8：上传与粘贴均走异步任务（data 含 task_id）→ 进度页；
+    // 同步 M3uImportReport 形仅作兼容保留。
     if let Some(task_id) = d.get("task_id").and_then(|v| v.as_str()) {
         return upload_progress_page(headers, task_id);
     }
@@ -1234,18 +1384,60 @@ fn upload_progress_page(headers: &HeaderMap, task_id: &str) -> Html<String> {
 /// GET /admin/upload-tasks/{id}（M16）：进度查询代理——把浏览器每秒轮询
 /// 转发给后端 GET /api/v1/admin/upload-tasks/{id}（带 iptv_admin_sid），
 /// 信封原样回透；后端 404 时同样回透（前端据 code 展示失败）。
+/// m22：`p.error` 的 6 条英文串由 API 的任务注册表原样存着（`handlers/
+/// admin.rs` 的串本身不动），SSR 侧在回透前用当前 locale 调
+/// `localize_backend_error` 映射，进度页 JS 展示到的即本地文案；同时
+/// 转发 `iptv_locale` Cookie 与 Accept-Language，让后端按管理员语言
+/// 渲染信封 message。
 async fn upload_task_status(headers: HeaderMap, Path(id): Path<String>) -> Json<serde_json::Value> {
+    let locale = locale_from_headers(&headers);
     let url = format!("{}/api/v1/admin/upload-tasks/{id}", api_base());
     let mut req = client().get(&url);
+    let mut cookie = String::new();
     if let Some(s) = admin_sid(&headers) {
-        req = req.header("Cookie", format!("iptv_admin_sid={s}"));
+        cookie.push_str(&format!("iptv_admin_sid={s}"));
+    }
+    if let Some(l) = cookie_header(&headers)
+        .and_then(|h| cookie_value(&h, "iptv_locale"))
+        .filter(|l| iptv_i18n::normalize_locale(l).is_some())
+    {
+        if !cookie.is_empty() {
+            cookie.push_str("; ");
+        }
+        cookie.push_str(&format!("iptv_locale={l}"));
+    }
+    if !cookie.is_empty() {
+        req = req.header("Cookie", cookie);
+    }
+    if let Some(al) = headers
+        .get(header::ACCEPT_LANGUAGE)
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.trim().is_empty())
+    {
+        req = req.header(header::ACCEPT_LANGUAGE, al);
     }
     let Ok(res) = req.send().await else {
-        return Json(
-            serde_json::json!({ "code": 50000, "message": "backend unreachable", "data": null }),
+        let msg = t_or(
+            &locale,
+            "admin.onetime-error-backend-unreachable",
+            "Backend unreachable",
         );
+        return Json(serde_json::json!({ "code": 50000, "message": msg, "data": null }));
     };
-    Json(res.json().await.unwrap_or(serde_json::Value::Null))
+    let mut v: serde_json::Value = res.json().await.unwrap_or(serde_json::Value::Null);
+    // m22：SSR 侧映射任务错误串（JS 只原样展示 `p.error`，见 PROGRESS_PAGE）。
+    if let Some(err) = v
+        .get("data")
+        .and_then(|d| d.get("error"))
+        .and_then(|e| e.as_str())
+        .map(|s| s.to_string())
+    {
+        let localized = localize_backend_error(&locale, &err);
+        if let Some(data) = v.get_mut("data") {
+            data["error"] = serde_json::json!(localized);
+        }
+    }
+    Json(v)
 }
 
 /// M19e：行内编辑表单提交 → PATCH /api/v1/admin/groups/{id}。
@@ -1275,9 +1467,10 @@ async fn update_group(
         admin_sid(&headers).as_deref(),
         forwarded_for(&headers).as_deref(),
         csrf_token(&headers).as_deref(),
+        &headers,
     )
     .await;
-    ok_redirect("/admin/groups", &r)
+    ok_redirect("/admin/groups", &r, &headers)
 }
 
 async fn delete_group(headers: HeaderMap, Path(id): Path<i64>) -> (HeaderMap, Redirect) {
@@ -1288,9 +1481,10 @@ async fn delete_group(headers: HeaderMap, Path(id): Path<i64>) -> (HeaderMap, Re
         admin_sid(&headers).as_deref(),
         forwarded_for(&headers).as_deref(),
         csrf_token(&headers).as_deref(),
+        &headers,
     )
     .await;
-    ok_redirect("/admin/groups", &r)
+    ok_redirect("/admin/groups", &r, &headers)
 }
 
 /// M19f：行内编辑表单提交 → PATCH /api/v1/admin/epg/sources/{id}。
@@ -1316,9 +1510,10 @@ async fn update_epg_source(
         admin_sid(&headers).as_deref(),
         forwarded_for(&headers).as_deref(),
         csrf_token(&headers).as_deref(),
+        &headers,
     )
     .await;
-    ok_redirect("/admin/epg", &r)
+    ok_redirect("/admin/epg", &r, &headers)
 }
 
 async fn delete_epg_source(headers: HeaderMap, Path(id): Path<i64>) -> (HeaderMap, Redirect) {
@@ -1329,9 +1524,10 @@ async fn delete_epg_source(headers: HeaderMap, Path(id): Path<i64>) -> (HeaderMa
         admin_sid(&headers).as_deref(),
         forwarded_for(&headers).as_deref(),
         csrf_token(&headers).as_deref(),
+        &headers,
     )
     .await;
-    ok_redirect("/admin/epg", &r)
+    ok_redirect("/admin/epg", &r, &headers)
 }
 
 async fn trigger_sync(headers: HeaderMap, Path(id): Path<i64>) -> (HeaderMap, Redirect) {
@@ -1342,9 +1538,10 @@ async fn trigger_sync(headers: HeaderMap, Path(id): Path<i64>) -> (HeaderMap, Re
         admin_sid(&headers).as_deref(),
         forwarded_for(&headers).as_deref(),
         csrf_token(&headers).as_deref(),
+        &headers,
     )
     .await;
-    ok_redirect("/admin/sources", &r)
+    ok_redirect("/admin/sources", &r, &headers)
 }
 
 #[derive(Deserialize)]
@@ -1369,9 +1566,10 @@ async fn create_group(headers: HeaderMap, Form(f): Form<GroupForm>) -> (HeaderMa
         admin_sid(&headers).as_deref(),
         forwarded_for(&headers).as_deref(),
         csrf_token(&headers).as_deref(),
+        &headers,
     )
     .await;
-    ok_redirect("/admin/groups", &r)
+    ok_redirect("/admin/groups", &r, &headers)
 }
 
 #[derive(Deserialize)]
@@ -1392,9 +1590,10 @@ async fn create_epg_source(
         admin_sid(&headers).as_deref(),
         forwarded_for(&headers).as_deref(),
         csrf_token(&headers).as_deref(),
+        &headers,
     )
     .await;
-    ok_redirect("/admin/epg", &r)
+    ok_redirect("/admin/epg", &r, &headers)
 }
 
 async fn kick_session(headers: HeaderMap, Path(id): Path<i64>) -> (HeaderMap, Redirect) {
@@ -1405,9 +1604,10 @@ async fn kick_session(headers: HeaderMap, Path(id): Path<i64>) -> (HeaderMap, Re
         admin_sid(&headers).as_deref(),
         forwarded_for(&headers).as_deref(),
         csrf_token(&headers).as_deref(),
+        &headers,
     )
     .await;
-    ok_redirect("/admin/sessions", &r)
+    ok_redirect("/admin/sessions", &r, &headers)
 }
 
 /// m19：映射表单提交 → PUT /api/v1/admin/epg/sources/{id}/maps。
@@ -1433,9 +1633,10 @@ async fn upsert_epg_channel_map(
         admin_sid(&headers).as_deref(),
         forwarded_for(&headers).as_deref(),
         csrf_token(&headers).as_deref(),
+        &headers,
     )
     .await;
-    ok_redirect("/admin/epg", &r)
+    ok_redirect("/admin/epg", &r, &headers)
 }
 
 /// m19：映射删除 → DELETE /api/v1/admin/epg/maps/{id}。
@@ -1447,9 +1648,10 @@ async fn delete_epg_channel_map(headers: HeaderMap, Path(id): Path<i64>) -> (Hea
         admin_sid(&headers).as_deref(),
         forwarded_for(&headers).as_deref(),
         csrf_token(&headers).as_deref(),
+        &headers,
     )
     .await;
-    ok_redirect("/admin/epg", &r)
+    ok_redirect("/admin/epg", &r, &headers)
 }
 
 #[derive(Deserialize)]
@@ -1480,9 +1682,10 @@ async fn create_plan(headers: HeaderMap, Form(f): Form<PlanForm>) -> (HeaderMap,
         admin_sid(&headers).as_deref(),
         forwarded_for(&headers).as_deref(),
         csrf_token(&headers).as_deref(),
+        &headers,
     )
     .await;
-    ok_redirect("/admin/plans", &r)
+    ok_redirect("/admin/plans", &r, &headers)
 }
 
 #[derive(Deserialize)]
@@ -1507,10 +1710,11 @@ async fn create_admin(headers: HeaderMap, Form(f): Form<AdminForm>) -> Response 
         admin_sid(&headers).as_deref(),
         forwarded_for(&headers).as_deref(),
         csrf_token(&headers).as_deref(),
+        &headers,
     )
     .await;
     if !r.ok {
-        return ok_redirect("/admin/admins", &r).into_response();
+        return ok_redirect("/admin/admins", &r, &headers).into_response();
     }
     // totp_required 时后端当场配给密钥：只显示一次（密钥 + otpauth URI + 二维码），
     // 用户须立即用验证器 App 扫码；首次登录输入一枚码后 TOTP 才启用。
@@ -1559,7 +1763,7 @@ async fn create_admin(headers: HeaderMap, Form(f): Form<AdminForm>) -> Response 
         )
         .into_response();
     }
-    ok_redirect("/admin/admins", &r).into_response()
+    ok_redirect("/admin/admins", &r, &headers).into_response()
 }
 
 #[derive(Deserialize)]
@@ -1584,9 +1788,10 @@ async fn update_admin(
         admin_sid(&headers).as_deref(),
         forwarded_for(&headers).as_deref(),
         csrf_token(&headers).as_deref(),
+        &headers,
     )
     .await;
-    ok_redirect("/admin/admins", &r)
+    ok_redirect("/admin/admins", &r, &headers)
 }
 
 async fn delete_admin(headers: HeaderMap, Path(id): Path<i64>) -> (HeaderMap, Redirect) {
@@ -1597,9 +1802,10 @@ async fn delete_admin(headers: HeaderMap, Path(id): Path<i64>) -> (HeaderMap, Re
         admin_sid(&headers).as_deref(),
         forwarded_for(&headers).as_deref(),
         csrf_token(&headers).as_deref(),
+        &headers,
     )
     .await;
-    ok_redirect("/admin/admins", &r)
+    ok_redirect("/admin/admins", &r, &headers)
 }
 
 async fn reset_admin_totp(headers: HeaderMap, Path(id): Path<i64>) -> Html<String> {
@@ -1610,6 +1816,7 @@ async fn reset_admin_totp(headers: HeaderMap, Path(id): Path<i64>) -> Html<Strin
         admin_sid(&headers).as_deref(),
         forwarded_for(&headers).as_deref(),
         csrf_token(&headers).as_deref(),
+        &headers,
     )
     .await;
     if !r.ok {
@@ -1698,9 +1905,10 @@ async fn update_plan(
         admin_sid(&headers).as_deref(),
         forwarded_for(&headers).as_deref(),
         csrf_token(&headers).as_deref(),
+        &headers,
     )
     .await;
-    ok_redirect("/admin/plans", &r)
+    ok_redirect("/admin/plans", &r, &headers)
 }
 
 async fn delete_plan(headers: HeaderMap, Path(id): Path<i64>) -> (HeaderMap, Redirect) {
@@ -1711,9 +1919,10 @@ async fn delete_plan(headers: HeaderMap, Path(id): Path<i64>) -> (HeaderMap, Red
         admin_sid(&headers).as_deref(),
         forwarded_for(&headers).as_deref(),
         csrf_token(&headers).as_deref(),
+        &headers,
     )
     .await;
-    ok_redirect("/admin/plans", &r)
+    ok_redirect("/admin/plans", &r, &headers)
 }
 
 #[derive(Deserialize)]
@@ -1733,9 +1942,10 @@ async fn update_settings(headers: HeaderMap, Form(f): Form<SettingForm>) -> (Hea
         admin_sid(&headers).as_deref(),
         forwarded_for(&headers).as_deref(),
         csrf_token(&headers).as_deref(),
+        &headers,
     )
     .await;
-    ok_redirect("/admin/settings", &r)
+    ok_redirect("/admin/settings", &r, &headers)
 }
 
 /// m22：文案覆盖编辑表单 → PUT /api/v1/admin/i18n-overrides。
@@ -1762,9 +1972,10 @@ async fn upsert_i18n_override(
         admin_sid(&headers).as_deref(),
         forwarded_for(&headers).as_deref(),
         csrf_token(&headers).as_deref(),
+        &headers,
     )
     .await;
-    ok_redirect("/admin/settings", &r)
+    ok_redirect("/admin/settings", &r, &headers)
 }
 
 /// m22：文案覆盖删除表单 → DELETE /api/v1/admin/i18n-overrides?locale=&key=。
@@ -1792,7 +2003,70 @@ async fn delete_i18n_override(
         admin_sid(&headers).as_deref(),
         forwarded_for(&headers).as_deref(),
         csrf_token(&headers).as_deref(),
+        &headers,
     )
     .await;
-    ok_redirect("/admin/settings", &r)
+    ok_redirect("/admin/settings", &r, &headers)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// m22：`localize_backend_error` 对新增 6 条上传任务串的映射（en）。
+    #[test]
+    fn localize_backend_error_upload_tasks_en() {
+        assert_eq!(
+            localize_backend_error("en", "read upload failed"),
+            "Failed to read upload"
+        );
+        assert_eq!(
+            localize_backend_error("en", "parse upload failed"),
+            "Failed to parse upload"
+        );
+        assert_eq!(
+            localize_backend_error("en", "source not found"),
+            "Source not found"
+        );
+        // Fluent 把 `{ $detail }` 插值包在 U+2068/U+2069 双向隔离符里
+        // （与现有 `$args` 文案同款行为），断言按真实渲染值写。
+        assert_eq!(
+            localize_backend_error("en", "read source failed: boom"),
+            "Failed to read source: \u{2068}boom\u{2069}"
+        );
+        assert_eq!(
+            localize_backend_error("en", "create source failed: boom"),
+            "Failed to create source: \u{2068}boom\u{2069}"
+        );
+        assert_eq!(
+            localize_backend_error("en", "import channels failed: boom"),
+            "Failed to import channels: \u{2068}boom\u{2069}"
+        );
+        assert_eq!(
+            localize_backend_error("en", "backend unreachable"),
+            "Backend unreachable"
+        );
+        // 未知串原样透传（已由 API 本地化中间件翻过的 message）。
+        assert_eq!(
+            localize_backend_error("en", "totally unknown"),
+            "totally unknown"
+        );
+    }
+
+    /// m22：同一批串在简体中文下的映射（含 `$detail` 占位符）。
+    #[test]
+    fn localize_backend_error_upload_tasks_zh() {
+        assert_eq!(
+            localize_backend_error("zh-Hans-CN", "read upload failed"),
+            "读取上传失败"
+        );
+        assert_eq!(
+            localize_backend_error("zh-Hans-CN", "import channels failed: boom"),
+            "导入频道失败：\u{2068}boom\u{2069}"
+        );
+        assert_eq!(
+            localize_backend_error("zh-Hans-CN", "read source failed: boom"),
+            "读取订阅源失败：\u{2068}boom\u{2069}"
+        );
+    }
 }

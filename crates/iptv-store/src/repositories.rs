@@ -138,6 +138,9 @@ pub trait SourceRepository: Send + Sync {
     ) -> anyhow::Result<()>;
     async fn claim_source_sync(&self, id: i64, next_sync_at: DateTime<Utc>)
         -> anyhow::Result<bool>;
+    /// M-D：源是否正被认领同步中（与 `claim_source_sync` 同一条 15 分钟
+    /// 陈旧规则；`trigger_sync` 靠它在上传/Worker 已占住认领时回 409）。
+    async fn is_source_syncing(&self, id: i64) -> anyhow::Result<bool>;
     async fn create_sync_log(&self, source_id: i64) -> anyhow::Result<i64>;
     async fn finish_sync_log(
         &self,
@@ -408,6 +411,9 @@ impl SourceRepository for Store {
         next_sync_at: DateTime<Utc>,
     ) -> anyhow::Result<bool> {
         self.claim_source_sync(id, next_sync_at).await
+    }
+    async fn is_source_syncing(&self, id: i64) -> anyhow::Result<bool> {
+        self.is_source_syncing(id).await
     }
     async fn create_sync_log(&self, source_id: i64) -> anyhow::Result<i64> {
         self.create_sync_log(source_id).await

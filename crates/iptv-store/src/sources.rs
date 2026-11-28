@@ -189,6 +189,10 @@ impl Store {
     /// 原子认领同步任务（M6）：只有未认领、或认领超过 15 分钟未更新
     /// （持有者已崩溃）的源才能被认领；返回 true 表示本次认领成功。
     /// 先查后置的旧写法会让多实例重复跑、崩溃后永久卡 syncing。
+    /// M-D（v0.1.6）：上传/同步/手动触发三路共用同一认领——Worker
+    /// `sync_source` 与 API `run_upload_task`（upsert 前）都调本函数，
+    /// 未认领到的一方直接失败/跳过，不再各跑各的 `upsert_channels`；
+    /// `trigger_sync` 用 `is_source_syncing` 读同一状态，认领被占住时回 409。
     pub async fn claim_source_sync(
         &self,
         id: i64,
@@ -208,6 +212,32 @@ impl Store {
         .await?
         .rows_affected();
         Ok(n > 0)
+    }
+
+    /// M-D（v0.1.6）：源是否正被认领同步中（上传/同步/手动触发三路共用的
+    /// 认领状态读端）。与 `claim_source_sync` 同一条陈旧规则：`last_status`
+    /// 为 `syncing` 且 `updated_at` 在 15 分钟内才算在同步中；超 15 分钟
+    /// 未更新视为持有者已崩溃，认领可被他人接管，本函数也返回 false。
+    /// `trigger_sync` 靠它在认领已被上传/Worker 占住时回 409；源不存在
+    /// 返回 false（调用方先做存在性校验）。
+    pub async fn is_source_syncing(&self, id: i64) -> anyhow::Result<bool> {
+        let row = sqlx::query(&ph(
+            "SELECT last_status, updated_at FROM playlist_source WHERE id = ?",
+            self.dialect,
+        ))
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else {
+            return Ok(false);
+        };
+        let status = r_opt_string(&row, "last_status")?;
+        if status.as_deref() != Some("syncing") {
+            return Ok(false);
+        }
+        let updated_at = r_i64(&row, "updated_at")?;
+        let stale_before = epoch(Utc::now() - Duration::seconds(15 * 60));
+        Ok(updated_at >= stale_before)
     }
 
     pub async fn create_sync_log(&self, source_id: i64) -> anyhow::Result<i64> {

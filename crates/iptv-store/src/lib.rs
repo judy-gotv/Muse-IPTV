@@ -48,6 +48,7 @@ mod settings;
 mod sources;
 mod tickets;
 mod tokens;
+mod upload_tasks;
 mod users;
 
 pub use repositories::{
@@ -55,6 +56,7 @@ pub use repositories::{
     TicketRepository, TokenRepository, UserRepository,
 };
 pub use tickets::ConsumedTicket;
+pub use upload_tasks::{UPLOAD_TASK_MAX_ROWS, UPLOAD_TASK_RETENTION_SECS};
 
 /// 数据库方言（由 `DATABASE_URL` 的 scheme 判定）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,10 +80,9 @@ impl std::fmt::Display for Dialect {
 pub struct Store {
     pool: AnyPool,
     dialect: Dialect,
-    /// 最近一次 `upsert_channels` 的差异缓存，供 `get_sync_diff` 重建
-    /// （CONTRACTS.md：“由 upsert_channels 的结果重建”；进程内缓存，
-    /// 重启后为空，见 `get_sync_diff`）。
-    last_diffs: std::sync::Mutex<HashMap<i64, SyncDiff>>,
+    // M-D（v0.1.6）：`last_diffs` 进程内缓存已删——`upsert_channels` 的差异
+    // 现随事务一起写 V9 `sync_diff` 表（见 channels.rs `save_sync_diff_tx`），
+    // `get_sync_diff` 直接读库；重启/多实例下仍可查，失败的导入不留差异。
     /// 系统设置缓存（M1）：整表一次读出，60 秒 TTL；`set_setting` 清空。
     /// 跨进程（API 与 Worker 各自）最多 stale 60 秒，设置类读操作可接受。
     settings_cache:
@@ -120,19 +121,46 @@ impl Store {
         } else {
             database_url
         };
-        let pool = sqlx::any::AnyPoolOptions::new()
-            .max_connections(5)
-            .connect(url)
-            .await?;
+        // M-B（v0.1.6）：SQLite 写锁竞争。`Store::connect` 此前只设
+        // `max_connections(5)`，无任何 SQLite 连接选项：默认回滚日志模式 +
+        // busy_timeout 仅 5 秒（sqlx-sqlite 0.8.6 `options/mod.rs:201`），
+        // 5000 台 upsert 的写风暴期间并发 PATCH 大量报 500。修法只动
+        // SQLite 分支，PG/MySQL 不受影响：
+        // - `journal_mode=WAL`：文件级持久，设一次即 sticky；WAL 下写提交
+        //   不再阻塞读。每个新连接都重申一次是无害的（已是 WAL 时返回 wal）。
+        // - `synchronous=NORMAL`：WAL 下的常规搭配。取舍：FULL 更安全
+        //   （每次提交都 fsync），但更慢；NORMAL 在 WAL 下只在操作系统崩溃/
+        //   掉电时可能丢最近已提交事务，应用崩溃不丢——本服务取 NORMAL。
+        // - `busy_timeout` 是连接级设置：必须对池内每个连接生效，故用
+        //   `after_connect` 钩子（已核实 sqlx 0.8.6：`AnyPoolOptions` 即
+        //   `PoolOptions<Any>`，`PoolOptions::after_connect` 可用），而不是
+        //   只在 `migrate()` 里对一条连接执行一次。15 秒。
+        let mut options = sqlx::any::AnyPoolOptions::new().max_connections(5);
+        if dialect == Dialect::Sqlite {
+            options = options.after_connect(|conn, _meta| {
+                Box::pin(async move {
+                    sqlx::query("PRAGMA journal_mode=WAL")
+                        .execute(&mut *conn)
+                        .await?;
+                    sqlx::query("PRAGMA synchronous=NORMAL")
+                        .execute(&mut *conn)
+                        .await?;
+                    sqlx::query("PRAGMA busy_timeout = 15000")
+                        .execute(&mut *conn)
+                        .await?;
+                    Ok(())
+                })
+            });
+        }
+        let pool = options.connect(url).await?;
         Ok(Self {
             pool,
             dialect,
-            last_diffs: std::sync::Mutex::new(HashMap::new()),
             settings_cache: std::sync::RwLock::new(None),
         })
     }
 
-    /// 按方言依次执行内嵌的 V1–V7 迁移（`migrations/{dialect}/`）。
+    /// 按方言依次执行内嵌的 V1–V8 迁移（`migrations/{dialect}/`）。
     /// 幂等：V1 用 `CREATE TABLE IF NOT EXISTS` + `CREATE INDEX IF NOT EXISTS`
     /// （MySQL 不支持索引的 `IF NOT EXISTS` 语法，见 `exec_script` 的
     /// 重复索引容忍），V2 种子用各方言的忽略冲突写法，V5 是单条 UPDATE，
@@ -149,6 +177,8 @@ impl Store {
                     "../../../migrations/postgres/V6__settings_updated_at_and_user_theme.sql"
                 ),
                 include_str!("../../../migrations/postgres/V7__login_tickets.sql"),
+                include_str!("../../../migrations/postgres/V8__upload_tasks.sql"),
+                include_str!("../../../migrations/postgres/V9__sync_diff.sql"),
             ],
             Dialect::MySql => &[
                 include_str!("../../../migrations/mysql/V1__init.sql"),
@@ -160,6 +190,8 @@ impl Store {
                     "../../../migrations/mysql/V6__settings_updated_at_and_user_theme.sql"
                 ),
                 include_str!("../../../migrations/mysql/V7__login_tickets.sql"),
+                include_str!("../../../migrations/mysql/V8__upload_tasks.sql"),
+                include_str!("../../../migrations/mysql/V9__sync_diff.sql"),
             ],
             Dialect::Sqlite => &[
                 include_str!("../../../migrations/sqlite/V1__init.sql"),
@@ -171,6 +203,8 @@ impl Store {
                     "../../../migrations/sqlite/V6__settings_updated_at_and_user_theme.sql"
                 ),
                 include_str!("../../../migrations/sqlite/V7__login_tickets.sql"),
+                include_str!("../../../migrations/sqlite/V8__upload_tasks.sql"),
+                include_str!("../../../migrations/sqlite/V9__sync_diff.sql"),
             ],
         };
         if self.dialect == Dialect::Sqlite {

@@ -166,8 +166,26 @@ async fn api_get<T: DeserializeOwned>(
 ) -> Result<(Option<T>, Option<String>), String> {
     let url = format!("{}{path}", api_base());
     let mut req = http_client().get(&url);
+    // m22：转发 `iptv_locale` Cookie 与 Accept-Language，API 的错误
+    // 本地化中间件才能按用户真实语言渲染 `env.message`（此前 server
+    // fn 请求只带会话 Cookie，错误文案一律回退系统默认简体中文）。
+    let mut cookie = String::new();
     if let Some(s) = sid {
-        req = req.header("Cookie", format!("iptv_portal_sid={s}"));
+        cookie.push_str(&format!("iptv_portal_sid={s}"));
+    }
+    if let Some(l) = parts_cookie("iptv_locale") {
+        if !cookie.is_empty() {
+            cookie.push_str("; ");
+        }
+        cookie.push_str(&format!("iptv_locale={l}"));
+    }
+    if !cookie.is_empty() {
+        req = req.header("Cookie", cookie);
+    }
+    if let Some(al) = parts_accept_language() {
+        if !al.trim().is_empty() {
+            req = req.header("Accept-Language", al);
+        }
     }
     if let Some(xff) = parts_forwarded_for() {
         req = req.header("X-Forwarded-For", xff);
@@ -211,8 +229,20 @@ async fn api_post<B: Serialize, T: DeserializeOwned>(
         cookie.push_str(&format!("iptv_csrf={c}"));
         req = req.header("x-csrf-token", c);
     }
+    // m22：语言转发（与 api_get 同款）。
+    if let Some(l) = parts_cookie("iptv_locale") {
+        if !cookie.is_empty() {
+            cookie.push_str("; ");
+        }
+        cookie.push_str(&format!("iptv_locale={l}"));
+    }
     if !cookie.is_empty() {
         req = req.header("Cookie", cookie);
+    }
+    if let Some(al) = parts_accept_language() {
+        if !al.trim().is_empty() {
+            req = req.header("Accept-Language", al);
+        }
     }
     if let Some(xff) = parts_forwarded_for() {
         req = req.header("X-Forwarded-For", xff);

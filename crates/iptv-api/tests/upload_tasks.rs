@@ -24,6 +24,18 @@ impl Drop for Fixture {
     }
 }
 
+fn config_for(path: &std::path::Path) -> Config {
+    Config {
+        database_url: format!("sqlite://{}?mode=rwc", path.display()),
+        redis_url: None,
+        play_secret: "test-play-secret".to_string(),
+        admin_secret: "test-admin-secret".to_string(),
+        portal_base_url: "http://127.0.0.1:8081".to_string(),
+        bind_addr: "127.0.0.1:0".to_string(),
+        cors_origins: vec![],
+    }
+}
+
 async fn setup() -> Fixture {
     let n = COUNTER.fetch_add(1, Ordering::SeqCst);
     // 根因修复：文件名必须带进程 id（与 m19 等测试同一约定）。此前只用
@@ -34,15 +46,7 @@ async fn setup() -> Fixture {
     // 在对方 Drop 前已完成而不受影响。
     let path =
         std::env::temp_dir().join(format!("iptv-api-upload-{}-{}.db", std::process::id(), n));
-    let config = Config {
-        database_url: format!("sqlite://{}?mode=rwc", path.display()),
-        redis_url: None,
-        play_secret: "test-play-secret".to_string(),
-        admin_secret: "test-admin-secret".to_string(),
-        portal_base_url: "http://127.0.0.1:8081".to_string(),
-        bind_addr: "127.0.0.1:0".to_string(),
-        cors_origins: vec![],
-    };
+    let config = config_for(&path);
     let state = Arc::new(AppState::new(config).await.expect("AppState::new"));
     Fixture { state, path }
 }
@@ -299,4 +303,56 @@ async fn large_upload_shows_running_mid_state() {
     assert_eq!(final_p.total_lines, 1 + 150_000 * 2);
     assert_eq!(final_p.channels_parsed, 150_000);
     assert_eq!(final_p.channels_imported, 150_000);
+}
+
+/// m-uptask：模拟重启——同一库文件上新建 AppState（新 Store + 新
+/// registry 实例），已完成任务的进度仍能查到（旧内存版此处会 404）。
+#[tokio::test]
+async fn upload_task_survives_appstate_restart() {
+    let fx = setup().await;
+    let body = gen_m3u(3);
+    let created = upload(&fx.state, &body, "small.m3u", None).await;
+    let (_, done) = poll_until_terminal(&fx.state, &created.task_id, 30_000).await;
+    assert_eq!(done.status, UploadTaskStatus::Done);
+    // “重启”：同一库文件上新 AppState。
+    let state2 = Arc::new(
+        AppState::new(config_for(&fx.path))
+            .await
+            .expect("AppState::new again"),
+    );
+    let p = get_task(&state2, &created.task_id).await;
+    assert_eq!(p.status, UploadTaskStatus::Done);
+    assert_eq!(p.total_lines, done.total_lines);
+    assert_eq!(p.channels_parsed, 3);
+    assert_eq!(p.channels_imported, 3);
+    assert_eq!(p.source_id, done.source_id);
+    drop(state2);
+}
+
+/// N5：已完成 24 小时以上的任务查 404，且 purge 会物理删行。
+#[tokio::test]
+async fn expired_upload_task_is_404_and_purged() {
+    let fx = setup().await;
+    let body = gen_m3u(2);
+    let created = upload(&fx.state, &body, "small.m3u", None).await;
+    let (_, done) = poll_until_terminal(&fx.state, &created.task_id, 30_000).await;
+    assert_eq!(done.status, UploadTaskStatus::Done);
+    // 把 updated_at 回拨 25 小时（模拟完成已久的任务）。
+    let old = chrono::Utc::now().timestamp() - 25 * 3600;
+    sqlx::query("UPDATE upload_task SET updated_at = ? WHERE task_id = ?")
+        .bind(old)
+        .bind(&created.task_id)
+        .execute(fx.state.store.pool())
+        .await
+        .unwrap();
+    let err = admin::get_upload_task(
+        State(fx.state.clone()),
+        super_admin(),
+        Path(created.task_id.clone()),
+    )
+    .await
+    .expect_err("expired task must err");
+    assert_eq!(err.code, ErrorCode::NotFound);
+    assert_eq!(fx.state.upload_tasks.purge_expired().await.unwrap(), 1);
+    assert_eq!(fx.state.store.count_upload_tasks().await.unwrap(), 0);
 }

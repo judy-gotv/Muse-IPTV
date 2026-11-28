@@ -115,6 +115,13 @@ pub struct EpgProgramInput { pub channel_id: i64, pub tvg_id: Option<String>, pu
 `content_hash = sha256(tvg_id|url|name|group)`（`iptv_core::content_hash`）比对，
 分新增 / 元数据变更 / URL 变更；库里有、订阅里没有的按源的 `on_missing`
 （disable 默认 / delete）处理；`auto_enable_new=false` 时新增频道为 disabled。
+分批提交（v0.1.6 WAL 大库修复）：每 1000 台一个短事务，单批次内原子、
+跨批次不保证原子——中途失败时已提交批次保留，错误里注明已入库数
+（added/updated）；`sync_diff` 只在全部批次成功后由独立短事务写，
+写失败只记 error 日志、不回滚已入库频道；导入期间并发 PATCH 的字段
+（status/display_name 等 upsert 不写的列）不被后一批覆盖。`sync_diff`
+四个列表落库时截断到 1000 条，真实总数记 `*_total`（未截断时 214MB
+单行 JSON 一条 UPDATE 持写锁 72 秒，并发写等满 busy_timeout 后 500）。
 
 ## `iptv-auth` / `iptv-concurrency` / `iptv-m3u` / `iptv-epg` / `iptv-i18n`
 

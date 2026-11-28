@@ -30,6 +30,12 @@ url = { workspace = true }
 # iptv-core 只被服务端 crate（iptv-api / iptv-store / iptv-worker）依赖，
 # 不进 Leptos WASM 构建，故可直接依赖 reqwest。
 reqwest = { workspace = true }
+# logo_store.rs 的台标缩略图（m9）用 image：默认特性关闭，只开
+# png/jpeg/gif（解码+编码同属这三个特性，无额外依赖；webp 解码
+# 需另开 webp 特性，故 webp 只做魔数校验、不生成缩略图）。
+# 工作区已定义同版本 image（iptv-api 在用，png/jpeg），这里补开 gif
+# 特性；特性在全工作区统一生效，只新增 gif/color_quant 两个小 crate。
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif"] }
 tracing = { workspace = true }
 
 [dev-dependencies]

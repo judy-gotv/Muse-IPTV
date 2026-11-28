@@ -666,6 +666,155 @@ pub fn verify_admin_cookie(secret: &str, cookie: &str) -> Option<i64> {
 /// （`#[derive(OpenApi)]`），不再是静态 `openapi.json` 文件。
 /// `version` 取 Cargo 包版本（`env!("CARGO_PKG_VERSION")`），随发版自动
 /// 走，不会再过期（v0.1.4 时静态文件仍写 0.1.0）。
+/// m-openapi：`#[utoipa::path]` 标注只写了响应描述文字、没有 `body=`，
+/// 响应 DTO 只在 `ApiDoc` 的 components 里注册——故用 `Modify` 在生成后
+/// 统一补齐（见 `OpenApiAddon::modify`）：每个返回 `ApiResult<T>`（JSON
+/// `Envelope<T>`）的操作，200 响应加 `content.application/json.schema.$ref`
+/// 指向 `Envelope_<T>`；需要鉴权的操作挂对应 Cookie 安全要求
+/// （`iptv_admin_sid` / `iptv_portal_sid`）。非 JSON 的操作（CSV 导出、
+/// /metrics、/p/* 代理、openapi.json 本身）不在表里，保持原样。
+/// 各 handler 文件不在本轮范围内，响应体只能这样集中补，不能逐个改标注。
+struct OpenApiAddon;
+
+impl utoipa::Modify for OpenApiAddon {
+    fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
+        use utoipa::openapi::security::{ApiKey, ApiKeyValue, SecurityRequirement, SecurityScheme};
+        use utoipa::openapi::{Content, Ref, RefOr};
+
+        let components = openapi.components.get_or_insert_default();
+        components.add_security_scheme(
+            "iptv_admin_sid",
+            SecurityScheme::ApiKey(ApiKey::Cookie(ApiKeyValue::new("iptv_admin_sid"))),
+        );
+        components.add_security_scheme(
+            "iptv_portal_sid",
+            SecurityScheme::ApiKey(ApiKey::Cookie(ApiKeyValue::new("iptv_portal_sid"))),
+        );
+
+        for (path, item) in openapi.paths.paths.iter_mut() {
+            for (method, slot) in [
+                ("get", &mut item.get),
+                ("put", &mut item.put),
+                ("post", &mut item.post),
+                ("delete", &mut item.delete),
+                ("patch", &mut item.patch),
+            ] {
+                let Some(op) = slot.as_mut() else {
+                    continue;
+                };
+                let Some((schema, security)) = openapi_response_for(path.as_str(), method) else {
+                    continue;
+                };
+                if let Some(RefOr::T(resp)) = op.responses.responses.get_mut("200") {
+                    resp.content.insert(
+                        "application/json".to_string(),
+                        Content::new(Some(Ref::from_schema_name(schema))),
+                    );
+                }
+                if let Some(scheme) = security {
+                    op.security =
+                        Some(vec![SecurityRequirement::new(scheme, Vec::<String>::new())]);
+                }
+            }
+        }
+    }
+}
+
+/// （路径，方法）→（200 响应 schema 名，需要的 Cookie 安全方案）。
+/// 覆盖全部返回 `ApiResult<T>` 的操作 + 直接返回 `HealthResponse` 的
+/// `/healthz`。`ticket-exchange` 成功实际是 302（见 handler），文档的
+/// 200 响应仍按 `Envelope<Value>` 描述（其 body 确实是该包）。
+fn openapi_response_for(path: &str, method: &str) -> Option<(&'static str, Option<&'static str>)> {
+    const ADMIN: Option<&'static str> = Some("iptv_admin_sid");
+    const PORTAL: Option<&'static str> = Some("iptv_portal_sid");
+    const NONE: Option<&'static str> = None;
+    let (schema, security) = match (path, method) {
+        ("/healthz", "get") => ("HealthResponse", NONE),
+        // 门户鉴权（尚无会话）
+        ("/api/v1/auth/ticket-exchange", "post") => ("Envelope_Value", NONE),
+        ("/api/v1/auth/token-login", "post") => ("Envelope_Value", NONE),
+        // 门户（iptv_portal_sid）
+        ("/api/v1/auth/logout", "post") => ("Envelope_Value", PORTAL),
+        ("/api/v1/auth/logout-all", "post") => ("Envelope_Value", PORTAL),
+        ("/api/v1/me", "get") => ("Envelope_MeResponse", PORTAL),
+        ("/api/v1/me/usage", "get") => ("Envelope_MeQuota", PORTAL),
+        ("/api/v1/me/devices", "get") => ("Envelope_Vec_DeviceView", PORTAL),
+        ("/api/v1/me/devices/{session_id}", "delete") => ("Envelope_Value", PORTAL),
+        ("/api/v1/me/channels", "get") => ("Envelope_Paged_Channel", PORTAL),
+        ("/api/v1/me/history", "get") => ("Envelope_Paged_PlaybackEvent", PORTAL),
+        ("/api/v1/me/plan", "get") => ("Envelope_Option_MePlan", PORTAL),
+        ("/api/v1/me/settings", "patch") => ("Envelope_Value", PORTAL),
+        ("/api/v1/playback/start", "post") => ("Envelope_PlaybackStartResponse", PORTAL),
+        ("/api/v1/playback/heartbeat", "post") => ("Envelope_Value", PORTAL),
+        ("/api/v1/playback/stop", "post") => ("Envelope_Value", PORTAL),
+        ("/api/v1/channels", "get") => ("Envelope_Paged_Channel", PORTAL),
+        ("/api/v1/epg/now", "get") => ("Envelope_Vec_EpgProgram", PORTAL),
+        ("/api/v1/epg/channels/{channel_id}/programs", "get") => {
+            ("Envelope_Vec_EpgProgram", PORTAL)
+        }
+        // 后台登录（尚无会话）
+        ("/api/v1/admin/auth/login", "post") => ("Envelope_Value", NONE),
+        // 后台（iptv_admin_sid）
+        ("/api/v1/admin/stats/overview", "get") => ("Envelope_StatsOverview", ADMIN),
+        ("/api/v1/admin/users", "get") => ("Envelope_Paged_AppUser", ADMIN),
+        ("/api/v1/admin/users", "post") => ("Envelope_AppUser", ADMIN),
+        ("/api/v1/admin/users/{id}", "get") => ("Envelope_AppUser", ADMIN),
+        ("/api/v1/admin/users/{id}", "patch") => ("Envelope_AppUser", ADMIN),
+        ("/api/v1/admin/users/{id}", "delete") => ("Envelope_Value", ADMIN),
+        ("/api/v1/admin/tokens", "get") => ("Envelope_Paged_UserToken", ADMIN),
+        ("/api/v1/admin/tokens", "post") => ("Envelope_CreateTokenResponse", ADMIN),
+        ("/api/v1/admin/tokens/{id}", "patch") => ("Envelope_UserToken", ADMIN),
+        ("/api/v1/admin/tokens/{id}", "delete") => ("Envelope_Value", ADMIN),
+        ("/api/v1/admin/tokens/{id}/login-ticket", "post") => ("Envelope_Value", ADMIN),
+        ("/api/v1/admin/tokens/{id}/revoke-sessions", "post") => ("Envelope_Value", ADMIN),
+        ("/api/v1/admin/channels", "get") => ("Envelope_Paged_Channel", ADMIN),
+        ("/api/v1/admin/channels", "post") => ("Envelope_Channel", ADMIN),
+        ("/api/v1/admin/channels/{id}", "patch") => ("Envelope_Channel", ADMIN),
+        ("/api/v1/admin/channels/{id}", "delete") => ("Envelope_Value", ADMIN),
+        ("/api/v1/admin/sources", "get") => ("Envelope_Vec_PlaylistSource", ADMIN),
+        ("/api/v1/admin/sources", "post") => ("Envelope_PlaylistSource", ADMIN),
+        ("/api/v1/admin/sources/{id}", "patch") => ("Envelope_PlaylistSource", ADMIN),
+        ("/api/v1/admin/sources/{id}", "delete") => ("Envelope_Value", ADMIN),
+        ("/api/v1/admin/sources/upload", "post") => ("Envelope_UploadTaskCreated", ADMIN),
+        ("/api/v1/admin/upload-tasks/{id}", "get") => ("Envelope_UploadTaskProgress", ADMIN),
+        ("/api/v1/admin/sources/{id}/sync", "post") => ("Envelope_Value", ADMIN),
+        ("/api/v1/admin/sources/{id}/diff", "get") => ("Envelope_SyncDiff", ADMIN),
+        ("/api/v1/admin/sources/{id}/logs", "get") => ("Envelope_Paged_SyncLog", ADMIN),
+        ("/api/v1/admin/groups", "get") => ("Envelope_Vec_ChannelGroup", ADMIN),
+        ("/api/v1/admin/groups", "post") => ("Envelope_ChannelGroup", ADMIN),
+        ("/api/v1/admin/groups/{id}", "patch") => ("Envelope_ChannelGroup", ADMIN),
+        ("/api/v1/admin/groups/{id}", "delete") => ("Envelope_Value", ADMIN),
+        ("/api/v1/admin/epg/sources", "get") => ("Envelope_Vec_EpgSource", ADMIN),
+        ("/api/v1/admin/epg/sources", "post") => ("Envelope_EpgSource", ADMIN),
+        ("/api/v1/admin/epg/sources/{id}", "patch") => ("Envelope_EpgSource", ADMIN),
+        ("/api/v1/admin/epg/sources/{id}", "delete") => ("Envelope_Value", ADMIN),
+        ("/api/v1/admin/sessions", "get") => ("Envelope_Paged_PlaybackSession", ADMIN),
+        ("/api/v1/admin/sessions/{id}", "delete") => ("Envelope_Value", ADMIN),
+        ("/api/v1/admin/plans", "get") => ("Envelope_Vec_Plan", ADMIN),
+        ("/api/v1/admin/plans", "post") => ("Envelope_Plan", ADMIN),
+        ("/api/v1/admin/plans/{id}", "patch") => ("Envelope_Plan", ADMIN),
+        ("/api/v1/admin/plans/{id}", "delete") => ("Envelope_Value", ADMIN),
+        ("/api/v1/admin/admins", "get") => ("Envelope_Vec_AdminUser", ADMIN),
+        ("/api/v1/admin/admins", "post") => ("Envelope_CreateAdminResponse", ADMIN),
+        ("/api/v1/admin/admins/{id}", "patch") => ("Envelope_AdminUser", ADMIN),
+        ("/api/v1/admin/admins/{id}", "delete") => ("Envelope_Value", ADMIN),
+        ("/api/v1/admin/admins/{id}/reset-totp", "post") => ("Envelope_Value", ADMIN),
+        ("/api/v1/admin/audit", "get") => ("Envelope_Paged_AuditLog", ADMIN),
+        ("/api/v1/admin/settings", "get") => ("Envelope_Vec_SystemSetting", ADMIN),
+        ("/api/v1/admin/settings", "patch") => ("Envelope_Vec_SystemSetting", ADMIN),
+        ("/api/v1/admin/i18n-overrides", "get") => ("Envelope_Vec_I18nOverride", ADMIN),
+        ("/api/v1/admin/i18n-overrides", "put") => ("Envelope_Vec_I18nOverride", ADMIN),
+        ("/api/v1/admin/i18n-overrides", "delete") => ("Envelope_Vec_I18nOverride", ADMIN),
+        ("/api/v1/admin/sources/paste", "post") => ("Envelope_UploadTaskCreated", ADMIN),
+        ("/api/v1/admin/epg/sources/{id}/maps", "get") => ("Envelope_Vec_EpgChannelMap", ADMIN),
+        ("/api/v1/admin/epg/maps", "get") => ("Envelope_Vec_EpgChannelMap", ADMIN),
+        ("/api/v1/admin/epg/sources/{id}/maps", "put") => ("Envelope_EpgChannelMap", ADMIN),
+        ("/api/v1/admin/epg/maps/{id}", "delete") => ("Envelope_Value", ADMIN),
+        _ => return None,
+    };
+    Some((schema, security))
+}
+
 #[derive(utoipa::OpenApi)]
 #[openapi(
     info(
@@ -769,6 +918,7 @@ pub fn verify_admin_cookie(secret: &str, cookie: &str) -> Option<i64> {
         iptv_dto::UpdateSourceRequest,
         iptv_dto::CreateGroupRequest,
         iptv_dto::UpdateGroupRequest,
+        iptv_dto::CreateEpgSourceRequest,
         iptv_dto::UpdateEpgSourceRequest,
         iptv_dto::CreatePlanRequest,
         iptv_dto::UpdatePlanRequest,
@@ -780,8 +930,80 @@ pub fn verify_admin_cookie(secret: &str, cookie: &str) -> Option<i64> {
         iptv_dto::PlaybackStopRequest,
         iptv_dto::UpsertI18nOverrideRequest,
         iptv_dto::PasteM3uRequest,
-        iptv_dto::UpsertEpgChannelMapRequest
+        iptv_dto::UpsertEpgChannelMapRequest,
+        iptv_dto::UploadM3uRequest,
+        iptv_dto::UpdateSettingsRequest,
+        // m-openapi：响应 DTO（`Envelope<T>` 的 `data` 与各 `ApiResult<T>`
+        // 的具化都要 ToSchema；`OpenApiAddon` 把 200 响应指到下面的
+        // `Envelope_*` 上）。
+        iptv_dto::AppUser,
+        iptv_dto::UserToken,
+        iptv_dto::CreateTokenResponse,
+        iptv_dto::Channel,
+        iptv_dto::ChannelGroup,
+        iptv_dto::PlaylistSource,
+        iptv_dto::SyncDiff,
+        iptv_dto::SyncLog,
+        iptv_dto::EpgProgram,
+        iptv_dto::EpgSource,
+        iptv_dto::EpgChannelMap,
+        iptv_dto::MeResponse,
+        iptv_dto::MeQuota,
+        iptv_dto::DeviceView,
+        iptv_dto::PlaybackEvent,
+        iptv_dto::PlaybackSession,
+        iptv_dto::PlaybackStartResponse,
+        iptv_dto::Plan,
+        iptv_dto::AdminUser,
+        iptv_dto::CreateAdminResponse,
+        iptv_dto::AuditLog,
+        iptv_dto::SystemSetting,
+        iptv_dto::I18nOverride,
+        iptv_dto::StatsOverview,
+        iptv_dto::HealthResponse,
+        iptv_dto::M3uImportReport,
+        iptv_dto::UploadTaskProgress,
+        iptv_dto::UploadTaskCreated,
+        iptv_dto::Envelope<serde_json::Value>,
+        iptv_dto::Envelope<iptv_dto::AppUser>,
+        iptv_dto::Envelope<iptv_dto::Paged<iptv_dto::AppUser>>,
+        iptv_dto::Envelope<iptv_dto::UserToken>,
+        iptv_dto::Envelope<iptv_dto::Paged<iptv_dto::UserToken>>,
+        iptv_dto::Envelope<iptv_dto::CreateTokenResponse>,
+        iptv_dto::Envelope<iptv_dto::Channel>,
+        iptv_dto::Envelope<iptv_dto::Paged<iptv_dto::Channel>>,
+        iptv_dto::Envelope<Vec<iptv_dto::ChannelGroup>>,
+        iptv_dto::Envelope<iptv_dto::ChannelGroup>,
+        iptv_dto::Envelope<iptv_dto::PlaylistSource>,
+        iptv_dto::Envelope<Vec<iptv_dto::PlaylistSource>>,
+        iptv_dto::Envelope<iptv_dto::StatsOverview>,
+        iptv_dto::Envelope<iptv_dto::SyncDiff>,
+        iptv_dto::Envelope<iptv_dto::Paged<iptv_dto::SyncLog>>,
+        iptv_dto::Envelope<Vec<iptv_dto::EpgSource>>,
+        iptv_dto::Envelope<iptv_dto::EpgSource>,
+        iptv_dto::Envelope<iptv_dto::Paged<iptv_dto::PlaybackSession>>,
+        iptv_dto::Envelope<Vec<iptv_dto::Plan>>,
+        iptv_dto::Envelope<iptv_dto::Plan>,
+        iptv_dto::Envelope<Vec<iptv_dto::AdminUser>>,
+        iptv_dto::Envelope<iptv_dto::AdminUser>,
+        iptv_dto::Envelope<iptv_dto::CreateAdminResponse>,
+        iptv_dto::Envelope<iptv_dto::Paged<iptv_dto::AuditLog>>,
+        iptv_dto::Envelope<Vec<iptv_dto::SystemSetting>>,
+        iptv_dto::Envelope<Vec<iptv_dto::I18nOverride>>,
+        iptv_dto::Envelope<iptv_dto::UploadTaskCreated>,
+        iptv_dto::Envelope<iptv_dto::UploadTaskProgress>,
+        iptv_dto::Envelope<iptv_dto::MeResponse>,
+        iptv_dto::Envelope<iptv_dto::MeQuota>,
+        iptv_dto::Envelope<Vec<iptv_dto::DeviceView>>,
+        iptv_dto::Envelope<iptv_dto::Paged<iptv_dto::PlaybackEvent>>,
+        iptv_dto::Envelope<Option<iptv_dto::MePlan>>,
+        iptv_dto::Envelope<iptv_dto::PlaybackStartResponse>,
+        iptv_dto::Envelope<Vec<iptv_dto::EpgProgram>>,
+        iptv_dto::Envelope<iptv_dto::M3uImportReport>,
+        iptv_dto::Envelope<Vec<iptv_dto::EpgChannelMap>>,
+        iptv_dto::Envelope<iptv_dto::EpgChannelMap>
     )),
+    modifiers(&OpenApiAddon),
     tags(
         (name = "auth", description = "门户鉴权"),
         (name = "me", description = "我的资料"),

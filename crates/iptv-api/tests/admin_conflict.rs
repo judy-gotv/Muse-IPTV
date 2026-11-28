@@ -318,7 +318,10 @@ async fn four_missing_audits_are_written() {
         State(state.clone()),
         super_admin(root_id),
         HeaderMap::new(),
-        Json(serde_json::json!({"name": "测试EPG", "url": "https://example.com/epg.xml"})),
+        Json(CreateEpgSourceRequest {
+            name: "测试EPG".to_string(),
+            url: "https://example.com/epg.xml".to_string(),
+        }),
     )
     .await
     .unwrap();

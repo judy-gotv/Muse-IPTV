@@ -1,6 +1,8 @@
 //! m21 回归：OpenAPI 文档由 utoipa 从代码生成（不再是静态文件）。
-//! 断言：版本号取 Cargo 包版本（0.1.5，不再是过期静态文件的 0.1.0）；
+//! 断言：版本号取 Cargo 包版本（0.1.6，不再是过期静态文件的 0.1.0）；
 //! 核心路由全在文档里；参数无重复（显式 params + 宏自动探测不得叠加）。
+//! m-openapi（v0.1.6）：响应有 body schema（`Envelope_*`）、上传接口有
+//! multipart requestBody、鉴权 Cookie 有 securityScheme 与操作级引用。
 //! 直接调 `ApiDoc::openapi()` 与走 HTTP 路由 `/api/v1/openapi.json` 双通道验证。
 // 作者: Passwd Word
 
@@ -118,7 +120,7 @@ fn assert_doc(doc: &Value) {
         env!("CARGO_PKG_VERSION"),
         "openapi version must follow the Cargo package version"
     );
-    assert_eq!(doc["info"]["version"].as_str().unwrap(), "0.1.5");
+    assert_eq!(doc["info"]["version"].as_str().unwrap(), "0.1.6");
     let paths = doc["paths"].as_object().expect("paths object");
     for p in CORE_PATHS {
         assert!(paths.contains_key(*p), "openapi paths missing {p}");
@@ -199,6 +201,165 @@ fn assert_doc(doc: &Value) {
             .is_some(),
         "components.schemas missing CreateUserRequest"
     );
+
+    // m-openapi：上传接口有 multipart requestBody，file 字段为 binary。
+    let upload_rb = &paths["/api/v1/admin/sources/upload"]["post"]["requestBody"]["content"]
+        ["multipart/form-data"]["schema"]["$ref"];
+    assert_eq!(
+        upload_rb.as_str().unwrap(),
+        "#/components/schemas/UploadM3uRequest",
+        "upload requestBody must reference UploadM3uRequest"
+    );
+    let upload_schema = &doc["components"]["schemas"]["UploadM3uRequest"];
+    assert_eq!(
+        upload_schema["properties"]["file"]["format"]
+            .as_str()
+            .unwrap(),
+        "binary",
+        "upload file field must be format binary"
+    );
+    assert!(
+        upload_schema["properties"]["source_id"].is_object(),
+        "upload schema must document optional source_id"
+    );
+
+    // m-openapi：两个原 Json<Value> 接口现为 typed DTO。
+    let create_epg = &paths["/api/v1/admin/epg/sources"]["post"]["requestBody"]["content"]
+        ["application/json"]["schema"]["$ref"];
+    assert_eq!(
+        create_epg.as_str().unwrap(),
+        "#/components/schemas/CreateEpgSourceRequest"
+    );
+    let settings_rb = &paths["/api/v1/admin/settings"]["patch"]["requestBody"]["content"]
+        ["application/json"]["schema"]["$ref"];
+    assert_eq!(
+        settings_rb.as_str().unwrap(),
+        "#/components/schemas/UpdateSettingsRequest"
+    );
+    let settings_schema = &doc["components"]["schemas"]["UpdateSettingsRequest"];
+    for key in [
+        "session_timeout_sec",
+        "default_locale",
+        "available_locales",
+        "play_url_ttl_sec",
+    ] {
+        assert!(
+            settings_schema["properties"].get(key).is_some(),
+            "UpdateSettingsRequest missing setting key {key}"
+        );
+    }
+
+    // m-openapi：securityScheme（Cookie）存在且位置正确。
+    let schemes = &doc["components"]["securitySchemes"];
+    for (name, cookie) in [
+        ("iptv_admin_sid", "iptv_admin_sid"),
+        ("iptv_portal_sid", "iptv_portal_sid"),
+    ] {
+        assert_eq!(schemes[name]["type"].as_str().unwrap(), "apiKey");
+        assert_eq!(schemes[name]["in"].as_str().unwrap(), "cookie");
+        assert_eq!(schemes[name]["name"].as_str().unwrap(), cookie);
+    }
+
+    // m-openapi：响应 body 全覆盖（除非 JSON 的 5 个操作外）。
+    // 每个 200 响应都要有 content.application/json.schema.$ref，
+    // 且 $ref 目标必须真实存在于 components.schemas。
+    const NON_JSON: &[&str] = &[
+        "/metrics",
+        "/api/v1/openapi.json",
+        "/api/v1/admin/audit/export",
+        "/p/{channel_id}.m3u8",
+        "/p/seg",
+    ];
+    let schemas = doc["components"]["schemas"].as_object().unwrap();
+    // 抽查泛型具化名（utoipa 以 `_` 连接泛型实参）。
+    for name in [
+        "Envelope_AppUser",
+        "Envelope_Paged_AppUser",
+        "Envelope_Paged_Channel",
+        "Envelope_Value",
+        "Envelope_UploadTaskCreated",
+        "Envelope_UploadTaskProgress",
+        "Envelope_Option_MePlan",
+        "Envelope_Vec_EpgProgram",
+        "Envelope_M3uImportReport",
+    ] {
+        assert!(
+            schemas.contains_key(name),
+            "components.schemas missing generic envelope {name}"
+        );
+    }
+    let mut covered = 0usize;
+    for (path, item) in paths {
+        if NON_JSON.contains(&path.as_str()) {
+            continue;
+        }
+        for (method, op) in item.as_object().unwrap() {
+            let resp = &op["responses"]["200"];
+            assert!(resp.is_object(), "{method} {path} has no 200 response");
+            let schema_ref = resp["content"]["application/json"]["schema"]["$ref"]
+                .as_str()
+                .unwrap_or("");
+            assert!(
+                schema_ref.starts_with("#/components/schemas/"),
+                "{method} {path} 200 response has no schema $ref: {resp}"
+            );
+            let target = schema_ref.trim_start_matches("#/components/schemas/");
+            assert!(
+                schemas.contains_key(target),
+                "{method} {path} 200 response $ref target missing: {target}"
+            );
+            covered += 1;
+        }
+    }
+    assert!(
+        covered >= 75,
+        "expected at least 75 operations with response body schema, got {covered}"
+    );
+
+    // m-openapi：操作级鉴权引用——后台（除登录）挂 admin Cookie，
+    // 门户挂 portal Cookie，登录接口不挂。
+    for (path, item) in paths {
+        for (method, op) in item.as_object().unwrap() {
+            let security = op.get("security");
+            if path == "/api/v1/admin/auth/login"
+                || path == "/api/v1/auth/ticket-exchange"
+                || path == "/api/v1/auth/token-login"
+                || path == "/healthz"
+                || NON_JSON.contains(&path.as_str())
+            {
+                assert!(
+                    security.is_none(),
+                    "{method} {path} must not require auth in docs"
+                );
+            } else if path.starts_with("/api/v1/admin/") {
+                assert_eq!(
+                    security
+                        .and_then(|s| s.as_array())
+                        .and_then(|a| a.first())
+                        .and_then(|r| r.get("iptv_admin_sid"))
+                        .map(|_| ()),
+                    Some(()),
+                    "{method} {path} must require iptv_admin_sid"
+                );
+            } else if path.starts_with("/api/v1/me")
+                || path.starts_with("/api/v1/playback")
+                || path.starts_with("/api/v1/channels")
+                || path.starts_with("/api/v1/epg")
+                || path == "/api/v1/auth/logout"
+                || path == "/api/v1/auth/logout-all"
+            {
+                assert_eq!(
+                    security
+                        .and_then(|s| s.as_array())
+                        .and_then(|a| a.first())
+                        .and_then(|r| r.get("iptv_portal_sid"))
+                        .map(|_| ()),
+                    Some(()),
+                    "{method} {path} must require iptv_portal_sid"
+                );
+            }
+        }
+    }
 }
 
 #[test]

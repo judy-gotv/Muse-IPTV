@@ -15,6 +15,7 @@ jobs:
   check:
     name: fmt / clippy / test (SQLite)
     runs-on: ubuntu-22.04
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -45,6 +46,7 @@ jobs:
   contract-postgres:
     name: 契约测试 PostgreSQL（§16）
     runs-on: ubuntu-22.04
+    timeout-minutes: 60
     services:
       postgres:
         image: postgres:16-alpine
@@ -68,6 +70,7 @@ jobs:
   contract-mysql:
     name: 契约测试 MySQL（§16）
     runs-on: ubuntu-22.04
+    timeout-minutes: 60
     services:
       mysql:
         image: mysql:8

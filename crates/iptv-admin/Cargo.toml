@@ -38,6 +38,8 @@ tokio = { workspace = true, optional = true }
 tracing = { workspace = true, optional = true }
 tracing-subscriber = { workspace = true, optional = true }
 dotenvy = { workspace = true, optional = true }
+# m22：启动时读库装入 i18n 覆盖（与 API main.rs 同款），仅 ssr 用。
+iptv-store = { path = "../iptv-store", optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
@@ -54,6 +56,7 @@ default = ["ssr"]
 ssr = [
     "dep:axum",
     "dep:dotenvy",
+    "dep:iptv-store",
     "dep:leptos_axum",
     "dep:rand",
     "dep:reqwest",

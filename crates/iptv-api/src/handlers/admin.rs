@@ -17,15 +17,16 @@ use iptv_core::{
 };
 use iptv_dto::{
     AdminLoginRequest, AdminRole, AdminUser, AppUser, AuditLog, Channel, ChannelGroup,
-    CreateAdminRequest, CreateAdminResponse, CreateChannelRequest, CreateGroupRequest,
-    CreatePlanRequest, CreateSourceRequest, CreateTokenRequest, CreateTokenResponse,
-    CreateUserRequest, EpgSource, ErrorCode, PageQuery, Paged, Plan, PlaylistSource, StatsOverview,
-    SyncDiff, SyncLog, SystemSetting, UpdateAdminRequest, UpdateChannelRequest,
-    UpdateEpgSourceRequest, UpdateGroupRequest, UpdatePlanRequest, UpdateSourceRequest,
-    UpdateTokenRequest, UpdateUserRequest, UploadTaskCreated, UploadTaskProgress, UploadTaskStatus,
-    UserToken,
+    CreateAdminRequest, CreateAdminResponse, CreateChannelRequest, CreateEpgSourceRequest,
+    CreateGroupRequest, CreatePlanRequest, CreateSourceRequest, CreateTokenRequest,
+    CreateTokenResponse, CreateUserRequest, EpgSource, ErrorCode, PageQuery, Paged, Plan,
+    PlaylistSource, StatsOverview, SyncDiff, SyncLog, SystemSetting, UpdateAdminRequest,
+    UpdateChannelRequest, UpdateEpgSourceRequest, UpdateGroupRequest, UpdatePlanRequest,
+    UpdateSettingsRequest, UpdateSourceRequest, UpdateTokenRequest, UpdateUserRequest,
+    UploadM3uRequest, UploadTaskCreated, UploadTaskProgress, UploadTaskStatus, UserToken,
 };
 use iptv_store::NewAuditLog;
+use std::future::Future;
 use std::sync::Arc;
 
 fn require(admin: &AdminAuth, ok_roles: &[AdminRole], what: &str) -> Result<(), ApiError> {
@@ -960,7 +961,7 @@ pub async fn delete_source(
 /// GET /api/v1/admin/upload-tasks/{id}。旧的同步返回体
 /// `M3uImportReport`（total_lines / channels_parsed / channels_imported /
 /// errors）不再由此接口返回，终态数字改从进度接口的同名字段读。
-#[utoipa::path(post, path = "/api/v1/admin/sources/upload", tag = "admin", responses((status = 200, description = "上传 M3U（multipart，异步解析，返回任务 id），UploadTaskCreated")))]
+#[utoipa::path(post, path = "/api/v1/admin/sources/upload", tag = "admin", request_body(content = UploadM3uRequest, content_type = "multipart/form-data"), responses((status = 200, description = "上传 M3U（multipart，异步解析，返回任务 id），UploadTaskCreated")))]
 pub async fn upload_m3u(
     State(state): State<Arc<AppState>>,
     admin: AdminAuth,
@@ -1024,13 +1025,13 @@ pub async fn upload_m3u(
     let tmp_path =
         tmp_path.ok_or_else(|| ApiError::new(ErrorCode::BadRequest, "missing file field"))?;
     // M16：只注册任务、起后台任务，立即返回任务 id，不等解析完成。
+    // m-uptask：任务行落库（V8 `upload_task` 表），重启后仍可查进度。
     let task_id = uuid::Uuid::new_v4().to_string();
-    crate::upload_tasks::create_queued(
-        &state.upload_tasks,
-        task_id.clone(),
-        filename.clone(),
-        source_id,
-    );
+    state
+        .upload_tasks
+        .create_queued(task_id.clone(), filename.clone(), source_id)
+        .await
+        .map_err(ApiError::from)?;
     let bg_state = state.clone();
     let bg_admin = AdminAuth {
         admin_id: admin.admin_id,
@@ -1041,17 +1042,18 @@ pub async fn upload_m3u(
     tokio::spawn(run_upload_task(
         bg_state,
         task_id.clone(),
-        tmp_path,
+        UploadTaskInput::File(tmp_path),
         filename,
         source_id,
         bg_admin,
         bg_ip,
+        "source.upload",
     ));
     ok(UploadTaskCreated { task_id })
 }
 
 /// GET /api/v1/admin/upload-tasks/{id}（M16）：查异步上传任务进度。
-/// 未知 id 回 404；任务只在进程内内存，重启后全部丢失（见 upload_tasks.rs）。
+/// 未知 id 回 404；m-uptask：任务落库，重启后仍可查；已过期终态任务也 404。
 #[utoipa::path(get, path = "/api/v1/admin/upload-tasks/{id}", tag = "admin", responses((status = 200, description = "上传任务进度（UploadTaskProgress）")))]
 pub async fn get_upload_task(
     State(state): State<Arc<AppState>>,
@@ -1059,9 +1061,19 @@ pub async fn get_upload_task(
     Path(id): Path<String>,
 ) -> ApiResult<UploadTaskProgress> {
     require(&admin, &[AdminRole::SuperAdmin], "read upload tasks")?;
-    crate::upload_tasks::get(&state.upload_tasks, &id)
-        .map(ok)
-        .unwrap_or_else(|| Err(ApiError::new(ErrorCode::NotFound, "upload task not found")))
+    match state.upload_tasks.get(&id).await.map_err(ApiError::from)? {
+        Some(p) => ok(p),
+        None => Err(ApiError::new(ErrorCode::NotFound, "upload task not found")),
+    }
+}
+
+/// N8：后台导入任务的输入——文件上传落盘后的临时文件，或粘贴的
+/// M3U 文本。两种输入走同一解析器（`parse_m3u_reader_progress`，
+/// 共用 `M3uParser` 状态机）与同一任务执行体，不复制解析逻辑。
+#[derive(Debug)]
+pub(crate) enum UploadTaskInput {
+    File(std::path::PathBuf),
+    Text(String),
 }
 
 /// M16：后台上传任务——解析（阻塞线程跑，边解析边上报进度）→ 建源/取源
@@ -1069,65 +1081,126 @@ pub async fn get_upload_task(
 /// 解析完即删临时文件；入库是单次 `upsert_channels` 全量调用（与同步版
 /// 完全一致的语义），故入库阶段进度停在“已解析终态、已入库 0”，完成后
 /// 一次跳到终态数字——不把 upsert 拆批，避免每批重读全源频道导致二次方开销。
-async fn run_upload_task(
+/// N8：粘贴导入复用本任务（`UploadTaskInput::Text`）；`audit_action`
+/// 区分审计动作（上传 `source.upload`、粘贴 `source.paste`）。
+#[allow(clippy::too_many_arguments)]
+/// 终态写库带退避重试（3 次）：任务终态与源同步状态写失败时不得静默
+/// 丢弃，否则任务永久卡在 running（v0.1.6 收尾验证：磁盘满时终态更新
+/// 的 `let _ =` 吞掉错误，任务停在 running 无恢复）。最终失败记 error
+/// 日志（调用方继续走原流程，任务行以最后一次成功写为准）。
+async fn retry_terminal_write<F, Fut>(label: &str, mut attempt: F)
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = anyhow::Result<()>>,
+{
+    let mut delay = std::time::Duration::from_millis(100);
+    for i in 1..=3 {
+        match attempt().await {
+            Ok(()) => return,
+            Err(e) if i < 3 => {
+                tracing::warn!("{label} 第 {i}/3 次写失败，{delay:?} 后重试：{e:#}");
+                tokio::time::sleep(delay).await;
+                delay *= 2;
+            }
+            Err(e) => {
+                tracing::error!("{label} 3 次重试均失败（终态可能未落库）：{e:#}");
+            }
+        }
+    }
+}
+
+/// 8 参数是上传任务的固有输入（状态/任务/输入/文件名/源/操作者/IP/审计
+/// 动作），两处调用点（上传、粘贴）共用同一签名，故放行。
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_upload_task(
     state: Arc<AppState>,
     task_id: String,
-    tmp_path: std::path::PathBuf,
+    input: UploadTaskInput,
     filename: String,
     source_id: Option<i64>,
     admin: AdminAuth,
     ip: Option<String>,
+    audit_action: &'static str,
 ) {
-    use crate::upload_tasks::update;
     let tasks = state.upload_tasks.clone();
-    update(&tasks, &task_id, |p| p.status = UploadTaskStatus::Running);
-    let fail = |tasks: &crate::upload_tasks::UploadTasks, task_id: &str, msg: String| {
-        update(tasks, task_id, |p| {
-            p.status = UploadTaskStatus::Failed;
-            p.error = Some(msg);
-        });
-    };
+    let _ = tasks
+        .update(&task_id, |p| p.status = UploadTaskStatus::Running)
+        .await;
     // 解析：阻塞线程跑（纯 CPU 活），每 2000 行回写一次进度。
     let parse_tasks = tasks.clone();
     let parse_id = task_id.clone();
     let parsed = tokio::task::spawn_blocking(move || {
-        let file = std::fs::File::open(&tmp_path)?;
-        let out = iptv_m3u::parse_m3u_reader_progress(std::io::BufReader::new(file), |l, c, e| {
-            update(&parse_tasks, &parse_id, |p| {
-                p.total_lines = l;
-                p.channels_parsed = c;
-                p.error_count = e;
-            });
-        });
-        let _ = std::fs::remove_file(&tmp_path);
-        out
+        // 解析回调跑在 spawn_blocking 线程内：用阻塞版行级 UPDATE
+        // 写库（见 UploadTaskRegistry::update_progress_blocking）。
+        let mut report = |l: usize, c: usize, e: usize| {
+            parse_tasks.update_progress_blocking(&parse_id, l, c, e);
+        };
+        match input {
+            UploadTaskInput::File(tmp_path) => {
+                let file = std::fs::File::open(&tmp_path)?;
+                let out =
+                    iptv_m3u::parse_m3u_reader_progress(std::io::BufReader::new(file), &mut report);
+                let _ = std::fs::remove_file(&tmp_path);
+                out
+            }
+            // 文本经 Cursor 走同一流式解析器（BOM 只剥首行、进度回调
+            // 每 2000 行触发，与文件路径行为一致）。
+            UploadTaskInput::Text(text) => iptv_m3u::parse_m3u_reader_progress(
+                std::io::BufReader::new(std::io::Cursor::new(text.into_bytes())),
+                &mut report,
+            ),
+        }
     })
     .await;
     let outcome = match parsed {
         Ok(Ok(o)) => o,
         Ok(Err(_)) => {
-            fail(&tasks, &task_id, "read upload failed".to_string());
+            retry_terminal_write("upload task fail: read upload failed", || async {
+                tasks
+                    .fail(&task_id, "read upload failed".to_string())
+                    .await
+                    .map(|_| ())
+            })
+            .await;
             return;
         }
         Err(_) => {
-            fail(&tasks, &task_id, "parse upload failed".to_string());
+            retry_terminal_write("upload task fail: parse upload failed", || async {
+                tasks
+                    .fail(&task_id, "parse upload failed".to_string())
+                    .await
+                    .map(|_| ())
+            })
+            .await;
             return;
         }
     };
-    update(&tasks, &task_id, |p| {
-        p.total_lines = outcome.total_lines;
-        p.channels_parsed = outcome.channels.len();
-        p.error_count = outcome.errors.len();
-    });
+    let _ = tasks
+        .update(&task_id, |p| {
+            p.total_lines = outcome.total_lines;
+            p.channels_parsed = outcome.channels.len();
+            p.error_count = outcome.errors.len();
+        })
+        .await;
     let source = match source_id {
         Some(id) => match state.store.get_source(id).await {
             Ok(Some(s)) => s,
             Ok(None) => {
-                fail(&tasks, &task_id, "source not found".to_string());
+                retry_terminal_write("upload task fail: source not found", || async {
+                    tasks
+                        .fail(&task_id, "source not found".to_string())
+                        .await
+                        .map(|_| ())
+                })
+                .await;
                 return;
             }
             Err(e) => {
-                fail(&tasks, &task_id, format!("read source failed: {e}"));
+                let msg = format!("read source failed: {e}");
+                retry_terminal_write("upload task fail: read source failed", || async {
+                    tasks.fail(&task_id, msg.clone()).await.map(|_| ())
+                })
+                .await;
                 return;
             }
         },
@@ -1147,20 +1220,90 @@ async fn run_upload_task(
         {
             Ok(s) => s,
             Err(e) => {
-                fail(&tasks, &task_id, format!("create source failed: {e}"));
+                let msg = format!("create source failed: {e}");
+                retry_terminal_write("upload task fail: create source failed", || async {
+                    tasks.fail(&task_id, msg.clone()).await.map(|_| ())
+                })
+                .await;
                 return;
             }
         },
     };
-    update(&tasks, &task_id, |p| p.source_id = Some(source.id));
+    let _ = tasks
+        .update(&task_id, |p| p.source_id = Some(source.id))
+        .await;
+    // M-D（v0.1.6）：上传与 Worker 同步共用同一认领（`claim_source_sync`，
+    // 与 Worker `sync_source` 同一个原子 UPDATE）。认领窗口只包住下面的
+    // `upsert_channels`：解析（可能数分钟）与台标转存不占锁；认领成功后
+    // 无论 upsert 成败都立即释放（`update_source_sync` 把 `last_status`
+    // 写回 ok/failed，`next_sync_at` 为现在 + 同步周期，与 Worker 一致）。
+    // 未认领到说明 Worker 正在同步该源、或另一次上传在跑：任务直接失败，
+    // 原因写进任务的 `error` 字段，不静默丢弃、不排队（排队会让任务长时
+    // 间挂在 running，调用方无法区分卡住与进行中；重试由调用方发起）。
+    let next_sync_at = Utc::now() + Duration::seconds(source.sync_interval_sec);
+    let claimed = match state.store.claim_source_sync(source.id, next_sync_at).await {
+        Ok(c) => c,
+        Err(e) => {
+            let msg = format!("claim source failed: {e}");
+            retry_terminal_write("upload task fail: claim source failed", || async {
+                tasks.fail(&task_id, msg.clone()).await.map(|_| ())
+            })
+            .await;
+            return;
+        }
+    };
+    if !claimed {
+        retry_terminal_write("upload task fail: source already syncing", || async {
+            tasks
+                .fail(
+                    &task_id,
+                    "source is already syncing (another upload or worker sync is running)"
+                        .to_string(),
+                )
+                .await
+                .map(|_| ())
+        })
+        .await;
+        return;
+    }
     let sync = match state
         .store
         .upsert_channels(source.id, outcome.channels.clone())
         .await
     {
-        Ok(s) => s,
+        Ok(s) => {
+            retry_terminal_write("update_source_sync ok", || async {
+                state
+                    .store
+                    .update_source_sync(
+                        source.id,
+                        Utc::now() + Duration::seconds(source.sync_interval_sec),
+                        "ok",
+                        None,
+                    )
+                    .await
+            })
+            .await;
+            s
+        }
         Err(e) => {
-            fail(&tasks, &task_id, format!("import channels failed: {e}"));
+            retry_terminal_write("update_source_sync failed", || async {
+                state
+                    .store
+                    .update_source_sync(
+                        source.id,
+                        Utc::now() + Duration::seconds(source.sync_interval_sec),
+                        "failed",
+                        Some(&e.to_string()),
+                    )
+                    .await
+            })
+            .await;
+            let msg = format!("import channels failed: {e}");
+            retry_terminal_write("upload task fail: import channels failed", || async {
+                tasks.fail(&task_id, msg.clone()).await.map(|_| ())
+            })
+            .await;
             return;
         }
     };
@@ -1177,7 +1320,7 @@ async fn run_upload_task(
     audit(
         &state,
         &admin,
-        "source.upload",
+        audit_action,
         "source",
         &source.id.to_string(),
         None,
@@ -1185,14 +1328,23 @@ async fn run_upload_task(
         ip.as_deref(),
     )
     .await;
-    update(&tasks, &task_id, |p| {
-        p.status = UploadTaskStatus::Done;
-        p.channels_imported = (sync.added + sync.updated) as usize;
-        p.error_count = outcome.errors.len();
-    });
+    retry_terminal_write("upload task done", || async {
+        tasks
+            .update(&task_id, |p| {
+                p.status = UploadTaskStatus::Done;
+                p.channels_imported = (sync.added + sync.updated) as usize;
+                p.error_count = outcome.errors.len();
+            })
+            .await
+            .map(|_| ())
+    })
+    .await;
 }
 
 /// POST /api/v1/admin/sources/{id}/sync：立即同步（把 next_sync_at 置为现在，worker 拾取）。
+/// M-D（v0.1.6）：源正被上传/Worker 认领同步中时回 409（`is_source_syncing`，
+/// 与 `claim_source_sync` 同一条 15 分钟陈旧规则），不再无条件把状态置为
+/// pending——旧写法会让手动触发与飞行中的上传互相覆盖认领状态。
 #[utoipa::path(post, path = "/api/v1/admin/sources/{id}/sync", tag = "admin", responses((status = 200, description = "triggered")))]
 pub async fn trigger_sync(
     State(state): State<Arc<AppState>>,
@@ -1206,6 +1358,17 @@ pub async fn trigger_sync(
         .await
         .map_err(ApiError::from)?
         .ok_or_else(|| ApiError::new(ErrorCode::NotFound, "source not found"))?;
+    if state
+        .store
+        .is_source_syncing(id)
+        .await
+        .map_err(ApiError::from)?
+    {
+        return Err(ApiError::new(
+            ErrorCode::Conflict,
+            "source is already syncing",
+        ));
+    }
     state
         .store
         .update_source_sync(id, Utc::now(), "pending", None)
@@ -1401,24 +1564,17 @@ pub async fn list_epg_sources(
     ok(sources)
 }
 
-#[utoipa::path(post, path = "/api/v1/admin/epg/sources", tag = "admin", responses((status = 200, description = "新建 EPG 源（EpgSource）")))]
+#[utoipa::path(post, path = "/api/v1/admin/epg/sources", tag = "admin", request_body = CreateEpgSourceRequest, responses((status = 200, description = "新建 EPG 源（EpgSource）")))]
 pub async fn create_epg_source(
     State(state): State<Arc<AppState>>,
     admin: AdminAuth,
     headers: HeaderMap,
-    Json(req): Json<serde_json::Value>,
+    Json(req): Json<CreateEpgSourceRequest>,
 ) -> ApiResult<EpgSource> {
     require(&admin, &[AdminRole::SuperAdmin], "create epg sources")?;
-    let name = req
-        .get("name")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    let url = req
-        .get("url")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
+    // m-openapi：typed DTO 已保证 name/url 存在；空串仍按原校验报 422。
+    let name = req.name;
+    let url = req.url;
     if name.is_empty() || url.is_empty() {
         return Err(ApiError::new(
             ErrorCode::ValidationFailed,
@@ -2082,15 +2238,19 @@ pub async fn list_settings(
     ok(settings)
 }
 
-#[utoipa::path(patch, path = "/api/v1/admin/settings", tag = "admin", responses((status = 200, description = "更新系统设置（超管，仅 §3.2 的键），SystemSetting[]")))]
+#[utoipa::path(patch, path = "/api/v1/admin/settings", tag = "admin", request_body = UpdateSettingsRequest, responses((status = 200, description = "更新系统设置（超管，仅 §3.2 的键），SystemSetting[]")))]
 pub async fn update_settings(
     State(state): State<Arc<AppState>>,
     admin: AdminAuth,
     headers: HeaderMap,
-    Json(req): Json<serde_json::Value>,
+    Json(req): Json<UpdateSettingsRequest>,
 ) -> ApiResult<Vec<SystemSetting>> {
     require(&admin, &[AdminRole::SuperAdmin], "update settings")?;
-    let obj = req
+    // m-openapi：typed DTO 只含已知键 + flatten 的未知键；先把 DTO 还原
+    // 成 JSON 对象，再走与原来完全相同的逐键校验/写库流程（未知键仍 422）。
+    let body = serde_json::to_value(&req)
+        .map_err(|_| ApiError::new(ErrorCode::ValidationFailed, "invalid settings body"))?;
+    let obj = body
         .as_object()
         .ok_or_else(|| ApiError::new(ErrorCode::ValidationFailed, "object required"))?;
     for (k, v) in obj {
@@ -2125,7 +2285,7 @@ pub async fn update_settings(
         "settings",
         "system",
         None,
-        Some(req.clone()),
+        Some(body),
         ip_of(&headers).as_deref(),
     )
     .await;

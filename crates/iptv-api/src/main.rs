@@ -36,6 +36,23 @@ async fn main() -> anyhow::Result<()> {
         }
         Err(e) => tracing::warn!("failed to load i18n overrides: {e}"),
     }
+    // m-uptask + N5：后台定期清理过期上传任务（完成 24 小时后删 + 最多
+    // 1000 行封顶）。`interval` 首 tick 立即执行，故启动即先清一轮上次
+    // 运行残留的过期行；清理失败只记警告，不阻塞启动/服务。
+    let purge_state = state.clone();
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(
+            iptv_api::upload_tasks::UPLOAD_TASK_PURGE_INTERVAL_SECS,
+        ));
+        loop {
+            ticker.tick().await;
+            match purge_state.upload_tasks.purge_expired().await {
+                Ok(n) if n > 0 => tracing::info!("purged {n} expired upload tasks"),
+                Ok(_) => {}
+                Err(e) => tracing::warn!("purge expired upload tasks failed: {e}"),
+            }
+        }
+    });
     // 首次启动建超管（仅当库里一个管理员都没有时）。
     if state.store.list_admins().await?.is_empty() {
         if let (Ok(user), Ok(pass)) = (

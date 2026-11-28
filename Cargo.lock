@@ -391,6 +391,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2550f75b8cfac212855f6b1885455df8eaee8fe8e246b647d69146142e016084"
 
 [[package]]
+name = "color_quant"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3d7b894f5411737b7867f4827955924d7c254fc9f4d91a6aad6b097804b1018b"
+
+[[package]]
 name = "combine"
 version = "4.6.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1098,6 +1104,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "gif"
+version = "0.14.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ee8cfcc411d9adbbaba82fb72661cc1bcca13e8bba98b364e62b2dba8f960159"
+dependencies = [
+ "color_quant",
+ "weezl",
+]
+
+[[package]]
 name = "gloo-net"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1515,6 +1531,8 @@ checksum = "85ab80394333c02fe689eaf900ab500fbd0c2213da414687ebf995a65d5a6104"
 dependencies = [
  "bytemuck",
  "byteorder-lite",
+ "color_quant",
+ "gif",
  "moxcms",
  "num-traits",
  "png",
@@ -1576,7 +1594,7 @@ checksum = "791930b43c0d5973160d90a8f3894509f2b273430f5c5c73b668636d0287c5c0"
 
 [[package]]
 name = "iptv-admin"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "axum",
  "chrono",
@@ -1586,6 +1604,7 @@ dependencies = [
  "iptv-design",
  "iptv-dto",
  "iptv-i18n",
+ "iptv-store",
  "iptv-ui",
  "leptos",
  "leptos_axum",
@@ -1604,7 +1623,7 @@ dependencies = [
 
 [[package]]
 name = "iptv-api"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "axum",
@@ -1643,7 +1662,7 @@ dependencies = [
 
 [[package]]
 name = "iptv-auth"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "argon2",
  "hex",
@@ -1656,7 +1675,7 @@ dependencies = [
 
 [[package]]
 name = "iptv-concurrency"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "redis",
@@ -1666,13 +1685,14 @@ dependencies = [
 
 [[package]]
 name = "iptv-core"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "chrono",
  "getrandom 0.2.17",
  "hex",
  "hmac",
+ "image",
  "iptv-dto",
  "rand 0.8.8",
  "reqwest",
@@ -1687,7 +1707,7 @@ dependencies = [
 
 [[package]]
 name = "iptv-design"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "leptos",
  "serde",
@@ -1696,7 +1716,7 @@ dependencies = [
 
 [[package]]
 name = "iptv-dto"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "chrono",
  "serde",
@@ -1707,7 +1727,7 @@ dependencies = [
 
 [[package]]
 name = "iptv-epg"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "chrono",
  "quick-xml",
@@ -1718,7 +1738,7 @@ dependencies = [
 
 [[package]]
 name = "iptv-gateway"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "axum",
  "dotenvy",
@@ -1730,7 +1750,7 @@ dependencies = [
 
 [[package]]
 name = "iptv-i18n"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -1744,7 +1764,7 @@ dependencies = [
 
 [[package]]
 name = "iptv-m3u"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "iptv-dto",
  "serde",
@@ -1753,7 +1773,7 @@ dependencies = [
 
 [[package]]
 name = "iptv-portal"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "axum",
  "chrono",
@@ -1763,6 +1783,7 @@ dependencies = [
  "iptv-design",
  "iptv-dto",
  "iptv-i18n",
+ "iptv-store",
  "iptv-ui",
  "leptos",
  "leptos_axum",
@@ -1781,7 +1802,7 @@ dependencies = [
 
 [[package]]
 name = "iptv-store"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1793,11 +1814,12 @@ dependencies = [
  "serde_json",
  "sqlx",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
 name = "iptv-ui"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "chrono",
  "fluent-bundle",
@@ -1814,7 +1836,7 @@ dependencies = [
 
 [[package]]
 name = "iptv-worker"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "chrono",
@@ -4636,6 +4658,12 @@ checksum = "7265c9301c16a8711c992c2d8da90ee77ef54b1ed51482d6dfeb00dc756b1297"
 dependencies = [
  "rustls-pki-types",
 ]
+
+[[package]]
+name = "weezl"
+version = "0.1.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a28ac98ddc8b9274cb41bb4d9d4d5c425b6020c50c46f25559911905610b4a88"
 
 [[package]]
 name = "whoami"

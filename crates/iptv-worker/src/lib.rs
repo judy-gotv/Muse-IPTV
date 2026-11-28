@@ -26,6 +26,9 @@ use tokio_cron_scheduler::{Job, JobScheduler};
 /// （:00/:15/:30/:45），与原 `tokio::time::interval(15s)` 轮询同节奏。
 pub const WORKER_CRON_SCHEDULE: &str = "*/15 * * * * *";
 
+/// N6：连续跳过多少轮升级为 error 日志 + 计一次告警（见 `skip_alerts`）。
+pub const SKIP_ALERT_THRESHOLD: u64 = 3;
+
 #[derive(Clone)]
 pub struct Worker {
     pub store: Arc<Store>,
@@ -37,6 +40,28 @@ pub struct Worker {
     round_running: Arc<AtomicBool>,
     /// 已完成轮数（调度单测的观测点；跳过不计）。
     rounds: Arc<AtomicU64>,
+    /// N6：已跳过轮数（metrics 风格，与 `rounds` 同款 `AtomicU64`）。
+    skipped_rounds: Arc<AtomicU64>,
+    /// N6：当前连续跳过轮数（跑一轮即清零）。
+    consecutive_skips: Arc<AtomicU64>,
+    /// N6：连续跳过达到 `SKIP_ALERT_THRESHOLD` 而记 error 的次数。
+    skip_alerts: Arc<AtomicU64>,
+    /// N6 故障注入（仅测试）：下一轮 `run_once_inner` 开头强制 panic，
+    /// 用于验证 panic 后标志复位、下一轮仍能跑。
+    #[cfg(test)]
+    panic_next_round: Arc<AtomicBool>,
+}
+
+/// N6：`round_running` 的 RAII 复位守卫：`run_once_inner` panic 时
+/// 析构仍会把标志复位，下一轮 cron 档不再被误判为“上一轮仍在跑”。
+struct RoundGuard {
+    flag: Arc<AtomicBool>,
+}
+
+impl Drop for RoundGuard {
+    fn drop(&mut self) {
+        self.flag.store(false, Ordering::SeqCst);
+    }
 }
 
 impl Worker {
@@ -46,12 +71,38 @@ impl Worker {
             failures: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             round_running: Arc::new(AtomicBool::new(false)),
             rounds: Arc::new(AtomicU64::new(0)),
+            skipped_rounds: Arc::new(AtomicU64::new(0)),
+            consecutive_skips: Arc::new(AtomicU64::new(0)),
+            skip_alerts: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            panic_next_round: Arc::new(AtomicBool::new(false)),
         }
     }
 
     /// 已完成的 `run_once` 轮数。
     pub fn rounds_completed(&self) -> u64 {
         self.rounds.load(Ordering::Relaxed)
+    }
+
+    /// N6：已跳过的 `run_once` 轮数（上一轮仍在跑时 cron 档跳过）。
+    pub fn rounds_skipped(&self) -> u64 {
+        self.skipped_rounds.load(Ordering::Relaxed)
+    }
+
+    /// N6：当前连续跳过轮数（跑一轮即清零）。
+    pub fn consecutive_skips(&self) -> u64 {
+        self.consecutive_skips.load(Ordering::Relaxed)
+    }
+
+    /// N6：连续跳过达到 `SKIP_ALERT_THRESHOLD` 而记 error 的次数。
+    pub fn skip_alerts(&self) -> u64 {
+        self.skip_alerts.load(Ordering::Relaxed)
+    }
+
+    /// N6 故障注入（仅测试）：让下一轮 `run_once_inner` 开头 panic。
+    #[cfg(test)]
+    fn inject_panic_once(&self) {
+        self.panic_next_round.store(true, Ordering::SeqCst);
     }
 
     /// 失败退避档位（§7.3）：1m → 5m → 30m → 2h（按连续失败次数进档）。
@@ -154,6 +205,11 @@ fn pinned_client(url: &reqwest::Url, ip: std::net::IpAddr) -> reqwest::Client {
     let mut builder = reqwest::Client::builder()
         .timeout(StdDuration::from_secs(30))
         .user_agent(format!("Muse-IPTV-Worker/{}", iptv_core::VERSION))
+        // M-E：强制直连，禁用环境代理（reqwest 默认读 http_proxy 等；
+        // 走 CONNECT 隧道时 DNS 由代理做，`resolve` 的固定值不生效，
+        // N2 的 TOCTOU 保护会被静默绕过）。上游只能经代理到达时走
+        // 应用自身的订阅代理（`Subscription.proxyId`），不依赖环境代理。
+        .no_proxy()
         .redirect(reqwest::redirect::Policy::none());
     if let Some((host, addr)) = pin_target(url, ip) {
         builder = builder.resolve(&host, addr);
@@ -203,20 +259,65 @@ impl Worker {
     /// 一轮活：订阅/EPG 同步认领、过期会话清理、审计保留、过期票据
     /// 清理（原 15s interval 每轮做的事，一项不丢）。上一轮仍在跑时
     /// 本轮跳过（cron 档到期不排队）。
+    ///
+    /// N6：`round_running` 由 `RoundGuard` 在 `Drop` 时复位，且
+    /// `run_once_inner` 包在 `catch_unwind` 里——轮内 panic 不再把
+    /// 标志留在 `true` 上导致后续每轮都跳过；panic 转为 `Err` 返回，
+    /// 由调用方（`run_forever` / cron 任务）记 error 日志，调度器继续跑。
     pub async fn run_once(&self) -> anyhow::Result<()> {
+        use futures_util::FutureExt;
         if self.round_running.swap(true, Ordering::SeqCst) {
-            tracing::debug!("worker round skipped: previous round still running");
+            let skipped = self.skipped_rounds.fetch_add(1, Ordering::Relaxed) + 1;
+            let streak = self.consecutive_skips.fetch_add(1, Ordering::Relaxed) + 1;
+            if streak >= SKIP_ALERT_THRESHOLD {
+                // 每轮 streak 只在首次达到阈值时计一次告警；达到阈值后
+                // 的每次跳过都记 error 日志，不再静默 debug。
+                if streak == SKIP_ALERT_THRESHOLD {
+                    self.skip_alerts.fetch_add(1, Ordering::Relaxed);
+                }
+                tracing::error!(
+                    "worker round skipped {streak} times in a row (total skipped {skipped}): previous round still running"
+                );
+            } else {
+                tracing::debug!("worker round skipped: previous round still running");
+            }
             return Ok(());
         }
-        let r = self.run_once_inner().await;
-        self.round_running.store(false, Ordering::SeqCst);
-        if r.is_ok() {
-            self.rounds.fetch_add(1, Ordering::Relaxed);
+        let _guard = RoundGuard {
+            flag: self.round_running.clone(),
+        };
+        let r = std::panic::AssertUnwindSafe(self.run_once_inner())
+            .catch_unwind()
+            .await;
+        // 显式释放守卫：先复位标志，再计轮数 / 清零连续跳过。
+        drop(_guard);
+        self.consecutive_skips.store(0, Ordering::Relaxed);
+        match r {
+            Ok(Ok(())) => {
+                self.rounds.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+            Ok(Err(e)) => Err(e),
+            Err(payload) => {
+                let msg = if let Some(s) = payload.downcast_ref::<&str>() {
+                    (*s).to_string()
+                } else if let Some(s) = payload.downcast_ref::<String>() {
+                    s.clone()
+                } else {
+                    "unknown panic".to_string()
+                };
+                tracing::error!("worker round panicked: {msg}");
+                anyhow::bail!("worker round panicked: {msg}");
+            }
         }
-        r
     }
 
     async fn run_once_inner(&self) -> anyhow::Result<()> {
+        // N6 故障注入（仅测试，见 `inject_panic_once`）。
+        #[cfg(test)]
+        if self.panic_next_round.swap(false, Ordering::SeqCst) {
+            panic!("injected worker round panic (N6 fault-injection test)");
+        }
         self.sync_due_sources().await?;
         self.sync_due_epg().await?;
         self.expire_stale_sessions().await?;
@@ -761,6 +862,13 @@ mod tests {
         )
     }
 
+    /// 进程环境变量（代理开关/NO_PROXY）是全局共享的：改动它们的测试
+    /// 必须串行，否则一个测试恢复环境变量会关掉另一个正在跑的测试的
+    /// 开关（M-E 回归测试引入第二个 `TestSwitchGuard` 使用方后，
+    /// `fetch_checked_loopback_redirect_and_switch` 在 ① 即报
+    /// "url host is private"，实测撞上）。持锁的测试全程独占环境变量。
+    static ENV_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     /// 测试开关的 RAII 守卫：`IPTV_TEST_ALLOW_PRIVATE_UPSTREAMS` 是进
     /// 程环境变量，测试 panic 时也要恢复，避免污染同进程其他测试。
     struct TestSwitchGuard {
@@ -833,6 +941,7 @@ mod tests {
     /// （只追加、不替换已有项，同进程并行的其他测试不受影响）。
     #[tokio::test]
     async fn pinned_client_connects_to_validated_ip() {
+        let _env = ENV_TEST_LOCK.lock().await;
         let _no_proxy = NoProxyGuard::append("pinned.test");
         let loopback = std::net::IpAddr::from([127, 0, 0, 1]);
         let addr = spawn_stub(loopback, http_ok("pinned-ok")).await;
@@ -843,12 +952,157 @@ mod tests {
         assert_eq!(resp.text().await.unwrap(), "pinned-ok");
     }
 
+    /// M-E 回归测试用的最小 CONNECT 代理 stub：监听回环地址；收到
+    /// `CONNECT host:port` 后记下目标、回 `200` 并把字节流中继到真实
+    /// 目标（于是即使同进程并行测试的请求误走本代理也能正常完成，
+    /// 只影响 CONNECT 记录的断言本身）。
+    async fn spawn_connect_recorder() -> (std::net::SocketAddr, Arc<std::sync::Mutex<Vec<String>>>)
+    {
+        let listener = tokio::net::TcpListener::bind((std::net::IpAddr::from([127, 0, 0, 1]), 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let targets: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = targets.clone();
+        tokio::spawn(async move {
+            while let Ok((sock, _)) = listener.accept().await {
+                let seen = seen.clone();
+                tokio::spawn(async move {
+                    handle_proxy_conn(sock, seen).await;
+                });
+            }
+        });
+        (addr, targets)
+    }
+
+    async fn handle_proxy_conn(
+        mut sock: tokio::net::TcpStream,
+        seen: Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        let mut buf = [0u8; 4096];
+        let mut req = Vec::new();
+        loop {
+            match sock.read(&mut buf).await {
+                Ok(0) | Err(_) => return,
+                Ok(n) => {
+                    req.extend_from_slice(&buf[..n]);
+                    if req.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+            }
+        }
+        let text = String::from_utf8_lossy(&req);
+        let first = text.lines().next().unwrap_or("");
+        let mut parts = first.split_whitespace();
+        if parts.next() != Some("CONNECT") {
+            // 非 CONNECT（绝对形式 GET 等）：直接关闭，调用方会报错。
+            return;
+        }
+        let Some(target) = parts.next().map(|s| s.to_string()) else {
+            return;
+        };
+        seen.lock().unwrap().push(target.clone());
+        let Ok(mut upstream) = tokio::net::TcpStream::connect(target.as_str()).await else {
+            let _ = sock
+                .write_all(
+                    b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await;
+            return;
+        };
+        if sock
+            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            .await
+            .is_err()
+        {
+            return;
+        }
+        let _ = tokio::io::copy_bidirectional(&mut sock, &mut upstream).await;
+    }
+
+    /// M-E 回归测试用的代理环境守卫：把 `http_proxy`/`https_proxy`
+    ///（大小写与 `ALL_PROXY`）指向记录 CONNECT 的 stub，并把 `NO_PROXY`
+    /// 置空（沙箱默认 `NO_PROXY` 含 127.0.0.1，否则回环目标会绕过代理、
+    /// 测不到 CONNECT）。drop 时恢复原值。
+    struct HttpProxyGuard {
+        prev: Vec<(&'static str, Option<String>)>,
+    }
+
+    impl HttpProxyGuard {
+        fn set(proxy_addr: std::net::SocketAddr) -> Self {
+            const KEYS: [&str; 8] = [
+                "http_proxy",
+                "https_proxy",
+                "HTTP_PROXY",
+                "HTTPS_PROXY",
+                "ALL_PROXY",
+                "all_proxy",
+                "NO_PROXY",
+                "no_proxy",
+            ];
+            let proxy_url = format!("http://127.0.0.1:{}/", proxy_addr.port());
+            let mut prev = Vec::new();
+            for k in KEYS {
+                prev.push((k, std::env::var(k).ok()));
+                let v = if k == "NO_PROXY" || k == "no_proxy" {
+                    String::new()
+                } else {
+                    proxy_url.clone()
+                };
+                std::env::set_var(k, v);
+            }
+            Self { prev }
+        }
+    }
+
+    impl Drop for HttpProxyGuard {
+        fn drop(&mut self) {
+            for (k, v) in &self.prev {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+
+    /// M-E 回归：`http_proxy` 已设置时，pinned client 仍直连校验过的 IP，
+    /// 不向代理发 `CONNECT <原主机名>`。用 `fetch_checked` 走订阅拉取
+    /// 全程（解析+校验+固定+发送），目标为回环 stub；代理 stub 记录
+    /// CONNECT 目标并中继——修复前会记录到 `CONNECT 127.0.0.1:<port>`，
+    /// 修复后记录为空且响应仍为直连 stub 的内容。
+    #[tokio::test]
+    async fn pinned_client_ignores_http_proxy() {
+        let _env = ENV_TEST_LOCK.lock().await;
+        let _switch = TestSwitchGuard::set();
+        let v4 = std::net::IpAddr::from([127, 0, 0, 1]);
+        let stub = spawn_stub(v4, http_ok("fetch-ok")).await;
+        let (proxy_addr, connects) = spawn_connect_recorder().await;
+        let _proxy = HttpProxyGuard::set(proxy_addr);
+        let url = format!("http://127.0.0.1:{}/x.m3u", stub.port());
+        let resp = Worker::fetch_checked(reqwest::Method::GET, &url, None)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.text().await.unwrap(), "fetch-ok");
+        // 直连断言：代理 stub 全程未收到发往本目标的 CONNECT。
+        let target = format!("127.0.0.1:{}", stub.port());
+        let seen = connects.lock().unwrap();
+        assert!(
+            !seen.iter().any(|t| t == &target),
+            "pinned client must connect directly, but proxy saw CONNECT: {seen:?}"
+        );
+    }
+
     /// N2 接线：`fetch_checked` 走“解析+校验+固定”全程，且开关语义
     /// 不变。同一测试函数内顺序执行各阶段，避免多测试并行改进程环境
     /// 变量竞态：① 开关开时回环拉取成功；② IPv6 回环同样成功；
     /// ③ 302 重定向逐跳重新固定，终点响应可达；④ 开关关时回环被拒。
     #[tokio::test]
     async fn fetch_checked_loopback_redirect_and_switch() {
+        let _env = ENV_TEST_LOCK.lock().await;
         let v4 = std::net::IpAddr::from([127, 0, 0, 1]);
         let v6 = std::net::IpAddr::from([0, 0, 0, 0, 0, 0, 0, 1]);
         let _guard = TestSwitchGuard::set();
@@ -953,6 +1207,64 @@ mod tests {
             rounds >= 1,
             "scheduler should have driven run_once at least once in 2.5s, got {rounds}"
         );
+    }
+
+    /// 建一个空库 Worker（无源/无 EPG）：一轮是空操作但必须成功。
+    /// 返回 worker 与库文件路径（调用方在测试末尾删文件）。
+    async fn empty_worker() -> (Worker, std::path::PathBuf) {
+        let n = WORKER_TEST_DB_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let path =
+            std::env::temp_dir().join(format!("iptv-worker-test-{}-{n}.db", std::process::id()));
+        let url = format!("sqlite://{}?mode=rwc", path.display());
+        let store = Arc::new(
+            iptv_store::Store::connect(&url)
+                .await
+                .expect("Store::connect"),
+        );
+        store.migrate().await.expect("migrate");
+        (Worker::new(store), path)
+    }
+
+    /// N6 故障注入：`run_once_inner` 强制 panic 后，`run_once` 返回 Err
+    /// 而不是把 panic 抛给调用方；`round_running` 已复位，下一轮仍能
+    /// 正常跑完并计轮数。
+    #[tokio::test]
+    async fn round_recovers_after_panic_in_run_once_inner() {
+        let (worker, path) = empty_worker().await;
+        worker.inject_panic_once();
+        let r = worker.run_once().await;
+        assert!(r.is_err(), "panicking round should report Err, got {r:?}");
+        assert!(
+            !worker.round_running.load(Ordering::SeqCst),
+            "round_running must reset after panic"
+        );
+        assert_eq!(worker.rounds_completed(), 0);
+        let r2 = worker.run_once().await;
+        assert!(r2.is_ok(), "next round after panic must still run: {r2:?}");
+        assert_eq!(worker.rounds_completed(), 1);
+        assert_eq!(worker.consecutive_skips(), 0);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// N6：连续跳过计数与阈值告警。把 `round_running` 置 true 模拟上一轮
+    /// 未完，连调 `SKIP_ALERT_THRESHOLD` 次 `run_once` 均跳过；达到阈值
+    /// 计一次告警；放开标志后下一轮正常跑，连续跳过清零。
+    #[tokio::test]
+    async fn skipped_rounds_count_and_alert_threshold() {
+        let (worker, path) = empty_worker().await;
+        worker.round_running.store(true, Ordering::SeqCst);
+        for _ in 0..SKIP_ALERT_THRESHOLD {
+            assert!(worker.run_once().await.is_ok());
+        }
+        assert_eq!(worker.rounds_skipped(), SKIP_ALERT_THRESHOLD);
+        assert_eq!(worker.consecutive_skips(), SKIP_ALERT_THRESHOLD);
+        assert_eq!(worker.skip_alerts(), 1);
+        worker.round_running.store(false, Ordering::SeqCst);
+        assert!(worker.run_once().await.is_ok());
+        assert_eq!(worker.rounds_completed(), 1);
+        assert_eq!(worker.consecutive_skips(), 0);
+        assert_eq!(worker.rounds_skipped(), SKIP_ALERT_THRESHOLD);
+        let _ = std::fs::remove_file(&path);
     }
 
     /// m19：映射命中优先于 tvg-id 精确命中——EPG 频道 `epg.cctv5`

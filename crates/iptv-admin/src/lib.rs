@@ -107,12 +107,30 @@ fn http_client() -> reqwest::Client {
 }
 
 /// GET 后端接口；401 返回 `Ok(None)`（未登录）。
+/// m22：转发浏览器的 `iptv_locale` Cookie 与 `Accept-Language`，API 的
+/// 错误本地化中间件才能按管理员真实语言渲染 `env.message`（此前的
+/// server fn 请求只带会话 Cookie，错误文案一律回退系统默认简体中文）。
 #[cfg(feature = "ssr")]
 async fn admin_get<T: DeserializeOwned>(path: &str) -> Result<Option<T>, String> {
     let url = format!("{}{path}", api_base());
     let mut req = http_client().get(&url);
+    let mut cookie = String::new();
     if let Some(s) = parts_cookie("iptv_admin_sid") {
-        req = req.header("Cookie", format!("iptv_admin_sid={s}"));
+        cookie.push_str(&format!("iptv_admin_sid={s}"));
+    }
+    if let Some(l) = parts_cookie("iptv_locale") {
+        if !cookie.is_empty() {
+            cookie.push_str("; ");
+        }
+        cookie.push_str(&format!("iptv_locale={l}"));
+    }
+    if !cookie.is_empty() {
+        req = req.header("Cookie", cookie);
+    }
+    if let Some(al) = parts_accept_language() {
+        if !al.trim().is_empty() {
+            req = req.header("Accept-Language", al);
+        }
     }
     let res = req.send().await.map_err(|e| e.to_string())?;
     if res.status() == reqwest::StatusCode::UNAUTHORIZED {
@@ -1167,16 +1185,29 @@ fn SourcesPage() -> impl IntoView {
             </Suspense>
             <Suspense fallback=LoadingSkeleton>
                 {move || diff.get().map(|res| match res {
-                    Ok(Some(d)) => view! {
-                        <div class="card">
-                            <h3 style="margin-top:0">{t_or("admin.sync-diff", "Sync diff")}</h3>
-                            <p>{format!("added {} · metadata changed {} · url changed {} · missing {}", d.added.len(), d.metadata_changed.len(), d.url_changed.len(), d.missing.len())}</p>
-                            <ul class="list">
-                                {d.added.into_iter().map(|c| view! { <li class="row"><span>{format!("+ {}", c.name)}</span></li> }).collect_view()}
-                                {d.missing.into_iter().map(|c| view! { <li class="row"><span>{format!("− {}", c.name)}</span></li> }).collect_view()}
-                            </ul>
-                        </div>
-                    }.into_any(),
+                    Ok(Some(d)) => {
+                        // v0.1.6：差异列表落库时截断到 1000 条，计数用
+                        // `*_total`（真实总数），列表只渲染截断后的样本。
+                        let truncated = d.added_total as usize > d.added.len()
+                            || d.metadata_changed_total as usize > d.metadata_changed.len()
+                            || d.url_changed_total as usize > d.url_changed.len()
+                            || d.missing_total as usize > d.missing.len();
+                        let note = if truncated {
+                            " (lists show first 1000)"
+                        } else {
+                            ""
+                        };
+                        view! {
+                            <div class="card">
+                                <h3 style="margin-top:0">{t_or("admin.sync-diff", "Sync diff")}</h3>
+                                <p>{format!("added {} · metadata changed {} · url changed {} · missing {}{}", d.added_total, d.metadata_changed_total, d.url_changed_total, d.missing_total, note)}</p>
+                                <ul class="list">
+                                    {d.added.into_iter().map(|c| view! { <li class="row"><span>{format!("+ {}", c.name)}</span></li> }).collect_view()}
+                                    {d.missing.into_iter().map(|c| view! { <li class="row"><span>{format!("− {}", c.name)}</span></li> }).collect_view()}
+                                </ul>
+                            </div>
+                        }.into_any()
+                    }
                     Ok(None) => view! { "" }.into_any(),
                     Err(e) => view! { <div class="notice notice-error" role="alert">{e.to_string()}</div> }.into_any(),
                 })}

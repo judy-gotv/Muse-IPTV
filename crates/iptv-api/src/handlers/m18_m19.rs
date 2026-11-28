@@ -2,18 +2,20 @@
 //!
 //! 单独成模块的原因：`handlers/admin.rs` 正由并行 worker（M16 异步上传）
 //! 整文件重写，paste/映射 handler 放进去会被覆盖；本模块只依赖公开
-//! 的 store/dto 接口，与 admin.rs 共用的三段小逻辑（`require` /
-//! `audit` / `mirror_channel_logos`）在此各复制一份并注明出处，
-//! 改动 admin.rs 对应逻辑时请同步这里。
+//! 的 store/dto 接口，与 admin.rs 共用的两段小逻辑（`require` /
+//! `audit`）在此各复制一份并注明出处，改动 admin.rs 对应逻辑时请同步
+//! 这里。N8：粘贴导入不再自带解析/入库逻辑，直接复用 admin.rs 的
+//! `run_upload_task`（与文件上传同一任务执行体），台标转存等尾段
+//! 逻辑也随之共用，不再另复制 `mirror_channel_logos`。
 // 作者: Passwd Word
 
+use crate::handlers::admin::{run_upload_task, UploadTaskInput};
 use crate::{ok, AdminAuth, ApiError, ApiResult, AppState};
 use axum::extract::{Path, Query, State};
 use axum::http::HeaderMap;
 use axum::Json;
-use iptv_core::{mirror_logo_if_configured, S3Config, LOGO_MIRROR_PER_SYNC};
 use iptv_dto::{
-    AdminRole, Channel, EpgChannelMap, ErrorCode, M3uImportReport, PasteM3uRequest,
+    AdminRole, EpgChannelMap, ErrorCode, PasteM3uRequest, UploadTaskCreated,
     UpsertEpgChannelMapRequest,
 };
 use iptv_store::NewAuditLog;
@@ -61,60 +63,31 @@ fn ip_of(headers: &HeaderMap) -> Option<String> {
     crate::client_ip(headers, None)
 }
 
-/// 与 `handlers/admin.rs::mirror_channel_logos` 同款（m9 台标转存）：
-/// 未配置存储时直接返回；单张转存失败只记日志、保留直链；成功才
-/// 写回 `logo_url` 并更新传入的频道对象。
-async fn mirror_channel_logos(state: &Arc<AppState>, channels: &mut [Channel]) {
-    let Some(cfg) = S3Config::from_env() else {
-        return;
-    };
-    let mut seen = std::collections::HashSet::new();
-    let mut n = 0;
-    for ch in channels.iter_mut() {
-        let Some(logo_url) = ch.logo_url.clone() else {
-            continue;
-        };
-        if logo_url.trim().is_empty() || !seen.insert(logo_url.clone()) {
-            continue;
-        }
-        if n >= LOGO_MIRROR_PER_SYNC {
-            break;
-        }
-        n += 1;
-        match mirror_logo_if_configured(Some(&cfg), &logo_url).await {
-            Ok(Some(new_url)) => {
-                if let Err(e) = state.store.update_channel_logo_url(ch.id, &new_url).await {
-                    tracing::warn!("update logo url channel {} failed: {e:#}", ch.id);
-                } else {
-                    ch.logo_url = Some(new_url);
-                }
-            }
-            Ok(None) => {}
-            Err(e) => tracing::warn!("logo mirror channel {} failed: {e:#}", ch.id),
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // m18：M3U 粘贴文本导入
 // ---------------------------------------------------------------------------
 
 /// POST /api/v1/admin/sources/paste（m18）：粘贴 M3U 文本导入。
 ///
-/// 与文件上传走同一解析器：`iptv_m3u::parse_m3u` 与上传的
-/// `parse_m3u_reader` 共用 `M3uParser` 状态机（BOM/CRLF/重复/
-/// 非法 URL 逐条报错，异常行不整批失败）；入库路径（定源 →
-/// upsert 频道 → 台标转存 → 审计 → 报告）与上传的
-/// `upload_m3u` 尾段相同。`source_id` 给了就导入该源，否则按
-/// `name`（缺省 `pasted.m3u`）新建源；空文本直接 422。
-/// 仍受 axum 默认 2 MB JSON 体限保护，超大文本请走上传接口。
-#[utoipa::path(post, path = "/api/v1/admin/sources/paste", tag = "admin", request_body = PasteM3uRequest, responses((status = 200, description = "粘贴 M3U 文本导入，M3uImportReport")))]
+/// N8（v0.1.6）：与文件上传走同一异步任务注册表——本接口只注册任务、
+/// 起后台任务后立即返回 `{ task_id }`；解析 + 入库在后台
+/// `run_upload_task`（`UploadTaskInput::Text`）里做，进度见
+/// GET /api/v1/admin/upload-tasks/{id}。终态数字（total_lines /
+/// channels_parsed / channels_imported / error_count）与上传一致，
+/// 从进度接口读，不再同步返回 `M3uImportReport`。
+/// 保留的同步语义：空文本直接 400（`ValidationFailed` → 40001）；`source_id` 给了就导入该源，否则
+/// 按 `name`（缺省 `pasted.m3u`）新建源；审计动作仍为 `source.paste`。
+/// 未知的 `source_id` 不再同步 404，改为任务 Failed（与上传一致，
+/// error 为 "source not found"）；源认领语义亦与上传一致（M-D：
+/// 未认领到则任务 Failed）。仍受 axum 默认 2 MB JSON 体限保护，
+/// 超大文本请走上传接口。
+#[utoipa::path(post, path = "/api/v1/admin/sources/paste", tag = "admin", request_body = PasteM3uRequest, responses((status = 200, description = "粘贴 M3U 文本导入（异步解析，返回任务 id），UploadTaskCreated")))]
 pub async fn paste_m3u(
     State(state): State<Arc<AppState>>,
     admin: AdminAuth,
     headers: HeaderMap,
     Json(req): Json<PasteM3uRequest>,
-) -> ApiResult<M3uImportReport> {
+) -> ApiResult<UploadTaskCreated> {
     require(&admin, &[AdminRole::SuperAdmin], "paste sources")?;
     if req.content.trim().is_empty() {
         return Err(ApiError::new(
@@ -122,62 +95,38 @@ pub async fn paste_m3u(
             "content is empty",
         ));
     }
-    let outcome = iptv_m3u::parse_m3u(&req.content);
-    let source = match req.source_id {
-        Some(id) => state
-            .store
-            .get_source(id)
-            .await
-            .map_err(ApiError::from)?
-            .ok_or_else(|| ApiError::new(ErrorCode::NotFound, "source not found"))?,
-        None => state
-            .store
-            .create_source(&iptv_dto::CreateSourceRequest {
-                name: req
-                    .name
-                    .filter(|n| !n.trim().is_empty())
-                    .unwrap_or_else(|| "pasted.m3u".to_string()),
-                url: None,
-                sync_interval_sec: None,
-                http_headers: None,
-                epg_url: outcome.x_tvg_url.clone(),
-                on_missing: None,
-                auto_enable_new: None,
-                enabled: Some(true),
-            })
-            .await
-            .map_err(ApiError::from)?,
-    };
-    let sync = state
-        .store
-        .upsert_channels(source.id, outcome.channels.clone())
+    // 源名沿用旧逻辑：给了非空 name 就用它，否则缺省 `pasted.m3u`；
+    // 该名字同时是任务行的 filename 与新建源的名字（与上传以文件名
+    // 建源一致）。
+    let filename = req
+        .name
+        .filter(|n| !n.trim().is_empty())
+        .unwrap_or_else(|| "pasted.m3u".to_string());
+    // N8：只注册任务、起后台任务，立即返回任务 id，不等解析完成。
+    let task_id = uuid::Uuid::new_v4().to_string();
+    state
+        .upload_tasks
+        .create_queued(task_id.clone(), filename.clone(), req.source_id)
         .await
         .map_err(ApiError::from)?;
-    let mut to_mirror: Vec<Channel> = sync
-        .added_channels
-        .iter()
-        .chain(sync.metadata_changed.iter())
-        .chain(sync.url_changed.iter())
-        .cloned()
-        .collect();
-    mirror_channel_logos(&state, &mut to_mirror).await;
-    audit(
-        &state,
-        &admin,
+    let bg_state = state.clone();
+    let bg_admin = AdminAuth {
+        admin_id: admin.admin_id,
+        username: admin.username.clone(),
+        role: admin.role,
+    };
+    let bg_ip = ip_of(&headers);
+    tokio::spawn(run_upload_task(
+        bg_state,
+        task_id.clone(),
+        UploadTaskInput::Text(req.content),
+        filename,
+        req.source_id,
+        bg_admin,
+        bg_ip,
         "source.paste",
-        "source",
-        &source.id.to_string(),
-        None,
-        Some(serde_json::json!({ "added": sync.added, "updated": sync.updated })),
-        ip_of(&headers).as_deref(),
-    )
-    .await;
-    ok(M3uImportReport {
-        total_lines: outcome.total_lines,
-        channels_parsed: outcome.channels.len(),
-        channels_imported: (sync.added + sync.updated) as usize,
-        errors: outcome.errors,
-    })
+    ));
+    ok(UploadTaskCreated { task_id })
 }
 
 // ---------------------------------------------------------------------------

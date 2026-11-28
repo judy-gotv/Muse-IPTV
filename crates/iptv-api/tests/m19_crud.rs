@@ -510,7 +510,10 @@ async fn m19f_epg_source_update_then_delete_cleans_map() {
             State(state.clone()),
             super_admin(),
             HeaderMap::new(),
-            Json(serde_json::json!({"name": "m19f-epg", "url": "https://example.com/epg.xml"})),
+            Json(CreateEpgSourceRequest {
+                name: "m19f-epg".to_string(),
+                url: "https://example.com/epg.xml".to_string(),
+            }),
         )
         .await
         .unwrap(),

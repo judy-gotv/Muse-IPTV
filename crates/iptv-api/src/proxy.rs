@@ -348,6 +348,11 @@ fn pinned_client(url: &reqwest::Url, ip: std::net::IpAddr, timeout_secs: u64) ->
     let mut builder = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(timeout_secs))
         .user_agent(format!("Muse-IPTV/{}", iptv_core::VERSION))
+        // M-E：强制直连，禁用环境代理（reqwest 默认读 http_proxy 等；
+        // 走 CONNECT 隧道时 DNS 由代理做，`resolve` 的固定值不生效，
+        // N2 的 TOCTOU 保护会被静默绕过）。上游只能经代理到达时走
+        // 应用自身的订阅代理（`Subscription.proxyId`），不依赖环境代理。
+        .no_proxy()
         .redirect(reqwest::redirect::Policy::none());
     if let Some((host, addr)) = pin_target(url, ip) {
         builder = builder.resolve(&host, addr);
@@ -485,6 +490,13 @@ mod tests {
         addr
     }
 
+    /// 进程环境变量（代理开关/NO_PROXY）是全局共享的：改动它们的测试
+    /// 必须串行，否则一个测试恢复环境变量会关掉另一个正在跑的测试的
+    /// 开关（M-E 回归测试引入第二个 `TestSwitchGuard` 使用方后，
+    /// `fetch_checked_and_segment_loopback` 在并行跑时可能被关开关，
+    /// 实测在 worker 同款测试上撞上）。持锁的测试全程独占环境变量。
+    static ENV_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     /// 测试开关的 RAII 守卫：`IPTV_TEST_ALLOW_PRIVATE_UPSTREAMS` 是进
     /// 程环境变量，测试 panic 时也要恢复，避免污染同进程其他测试。
     struct TestSwitchGuard {
@@ -556,6 +568,7 @@ mod tests {
     /// （只追加、不替换已有项，同进程并行的其他测试不受影响）。
     #[tokio::test]
     async fn pinned_client_connects_to_validated_ip() {
+        let _env = ENV_TEST_LOCK.lock().await;
         let _no_proxy = NoProxyGuard::append("pinned.test");
         let loopback = std::net::IpAddr::from([127, 0, 0, 1]);
         let addr = spawn_stub(loopback, http_ok("pinned-ok")).await;
@@ -566,6 +579,158 @@ mod tests {
         assert_eq!(resp.text().await.unwrap(), "pinned-ok");
     }
 
+    /// M-E 回归测试用的最小 CONNECT 代理 stub：监听回环地址；收到
+    /// `CONNECT host:port` 后记下目标、回 `200` 并把字节流中继到真实
+    /// 目标（于是即使同进程并行测试的请求误走本代理也能正常完成，
+    /// 只影响 CONNECT 记录的断言本身）。
+    async fn spawn_connect_recorder() -> (std::net::SocketAddr, Arc<std::sync::Mutex<Vec<String>>>)
+    {
+        let listener = tokio::net::TcpListener::bind((std::net::IpAddr::from([127, 0, 0, 1]), 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let targets: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = targets.clone();
+        tokio::spawn(async move {
+            while let Ok((sock, _)) = listener.accept().await {
+                let seen = seen.clone();
+                tokio::spawn(async move {
+                    handle_proxy_conn(sock, seen).await;
+                });
+            }
+        });
+        (addr, targets)
+    }
+
+    async fn handle_proxy_conn(
+        mut sock: tokio::net::TcpStream,
+        seen: Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        let mut buf = [0u8; 4096];
+        let mut req = Vec::new();
+        loop {
+            match sock.read(&mut buf).await {
+                Ok(0) | Err(_) => return,
+                Ok(n) => {
+                    req.extend_from_slice(&buf[..n]);
+                    if req.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+            }
+        }
+        let text = String::from_utf8_lossy(&req);
+        let first = text.lines().next().unwrap_or("");
+        let mut parts = first.split_whitespace();
+        if parts.next() != Some("CONNECT") {
+            // 非 CONNECT（绝对形式 GET 等）：直接关闭，调用方会报错。
+            return;
+        }
+        let Some(target) = parts.next().map(|s| s.to_string()) else {
+            return;
+        };
+        seen.lock().unwrap().push(target.clone());
+        let Ok(mut upstream) = tokio::net::TcpStream::connect(target.as_str()).await else {
+            let _ = sock
+                .write_all(
+                    b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await;
+            return;
+        };
+        if sock
+            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            .await
+            .is_err()
+        {
+            return;
+        }
+        let _ = tokio::io::copy_bidirectional(&mut sock, &mut upstream).await;
+    }
+
+    /// M-E 回归测试用的代理环境守卫：把 `http_proxy`/`https_proxy`
+    ///（大小写与 `ALL_PROXY`）指向记录 CONNECT 的 stub，并把 `NO_PROXY`
+    /// 置空（沙箱默认 `NO_PROXY` 含 127.0.0.1，否则回环目标会绕过代理、
+    /// 测不到 CONNECT）。drop 时恢复原值。
+    struct HttpProxyGuard {
+        prev: Vec<(&'static str, Option<String>)>,
+    }
+
+    impl HttpProxyGuard {
+        fn set(proxy_addr: std::net::SocketAddr) -> Self {
+            const KEYS: [&str; 8] = [
+                "http_proxy",
+                "https_proxy",
+                "HTTP_PROXY",
+                "HTTPS_PROXY",
+                "ALL_PROXY",
+                "all_proxy",
+                "NO_PROXY",
+                "no_proxy",
+            ];
+            let proxy_url = format!("http://127.0.0.1:{}/", proxy_addr.port());
+            let mut prev = Vec::new();
+            for k in KEYS {
+                prev.push((k, std::env::var(k).ok()));
+                let v = if k == "NO_PROXY" || k == "no_proxy" {
+                    String::new()
+                } else {
+                    proxy_url.clone()
+                };
+                std::env::set_var(k, v);
+            }
+            Self { prev }
+        }
+    }
+
+    impl Drop for HttpProxyGuard {
+        fn drop(&mut self) {
+            for (k, v) in &self.prev {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+
+    /// M-E 回归：`http_proxy` 已设置时，清单/分片拉取仍直连校验过的 IP，
+    /// 不向代理发 `CONNECT`。目标为回环 stub（开关放行私网 IP）；代理
+    /// stub 记录 CONNECT 目标并中继——修复前会记录到
+    /// `CONNECT 127.0.0.1:<port>`，修复后记录为空且响应仍为直连内容。
+    #[tokio::test]
+    async fn pinned_client_ignores_http_proxy() {
+        let _env = ENV_TEST_LOCK.lock().await;
+        let _switch = TestSwitchGuard::set();
+        let v4 = std::net::IpAddr::from([127, 0, 0, 1]);
+        let addr = spawn_stub(v4, http_ok("segment-ok")).await;
+        let (proxy_addr, connects) = spawn_connect_recorder().await;
+        let _proxy = HttpProxyGuard::set(proxy_addr);
+        let target = format!("127.0.0.1:{}", addr.port());
+
+        // 清单拉取（`fetch_checked` → `pinned_client`）。
+        let manifest = format!("http://127.0.0.1:{}/live.m3u8", addr.port());
+        let resp = fetch_checked(&manifest).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.text().await.unwrap(), "segment-ok");
+
+        // 分片拉取（`fetch_segment_checked` → `pinned_client`）。
+        let upstream = reqwest::Url::parse(&manifest).unwrap();
+        let seg =
+            reqwest::Url::parse(&format!("http://127.0.0.1:{}/seg0.ts", addr.port())).unwrap();
+        assert!(check_segment_target(&upstream, &seg).await.is_ok());
+        let resp = fetch_segment_checked(&upstream, seg, None).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.text().await.unwrap(), "segment-ok");
+
+        let seen = connects.lock().unwrap();
+        assert!(
+            !seen.iter().any(|t| t == &target),
+            "pinned client must connect directly, but proxy saw CONNECT: {seen:?}"
+        );
+    }
+
     /// N2 接线：清单拉取与分片拉取都走“解析+校验+固定”全程，且开关
     /// 语义不变。同一测试函数内顺序执行各阶段，避免多测试并行改进
     /// 程环境变量竞态：① 开关开时清单拉取成功；② 同 host 分片拉取
@@ -574,6 +739,7 @@ mod tests {
     /// 分片目标双双被拒。
     #[tokio::test]
     async fn fetch_checked_and_segment_loopback() {
+        let _env = ENV_TEST_LOCK.lock().await;
         let v4 = std::net::IpAddr::from([127, 0, 0, 1]);
         let _guard = TestSwitchGuard::set();
 

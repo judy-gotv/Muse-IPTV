@@ -15,8 +15,15 @@
 //! - 转存失败不抛给调用方主流程：`mirror_logo_if_configured` 只在
 //!   配置齐全且下载+上传都成功时返回 `Some(新 URL)`，其余返回 `Ok(None)`
 //!   并记 `tracing::warn`，调用方保留直链。
-//! - 缩略图（§7.2 后半句）本轮未做：转存的是原图，`logo_url` 仍指向
-//!   全尺寸图。
+//! - 转存的是 128px 与 256px 两档缩略图（m9，§7.2 后半句），对象键
+//!   `logos/thumbs/<sha256(缩略图字节)>.<ext>`，入库的 `logo_url` 指
+//!   256px 档；原图不另存（只存缩略图，省存储、列表加载流量小）。
+//!   缩略图生成/上传失败时回退到原图转存，不阻塞入库；WebP/ICO
+//!   只做魔数校验、不解码（不引 webp 解码器），直接走原图转存。
+//! - N9：转存白名单去掉 svg；下载字节先过魔数校验（PNG/JPEG/GIF/
+//!   WebP/ICO），魔数不符（含 SVG/HTML）拒绝转存、保留直链。
+//! - M-E：下载与 S3 上传两个客户端都 `.no_proxy()`，SSRF 固定 IP
+//!   的路径不走环境代理。
 // 作者: Passwd Word
 
 use crate::ssrf::{pin_target, resolve_checked_ip};
@@ -29,6 +36,101 @@ pub const LOGO_MAX_BYTES: usize = 5 * 1024 * 1024;
 /// 每轮同步最多转存的台标数（大源首次同步不把 worker 拖垮；超出的
 /// 频道保留直链，下次内容变化时再转存）。
 pub const LOGO_MIRROR_PER_SYNC: usize = 200;
+
+/// 缩略图两档的目标边长（m9）：等比缩放、最长边不超过该值。
+pub const LOGO_THUMB_SIZES: [u32; 2] = [128, 256];
+
+/// 入库的 `logo_url` 指哪一档缩略图（256px；128px 档同存，供小尺寸
+/// 展示用）。
+pub const LOGO_THUMB_URL_SIZE: u32 = 256;
+
+/// 魔数识别出的图片格式（N9：只认这五种；SVG 是文本、无魔数，
+/// 走到这里即被拒）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DetectedImage {
+    Png,
+    Jpeg,
+    Gif,
+    Webp,
+    Ico,
+}
+
+impl DetectedImage {
+    /// 对象键与 Content-Type 用的扩展名（以魔数为准，不信上游
+    /// Content-Type / URL 后缀，避免类型冒充）。
+    fn ext(self) -> &'static str {
+        match self {
+            Self::Png => "png",
+            Self::Jpeg => "jpg",
+            Self::Gif => "gif",
+            Self::Webp => "webp",
+            Self::Ico => "ico",
+        }
+    }
+
+    fn content_type(self) -> &'static str {
+        match self {
+            Self::Png => "image/png",
+            Self::Jpeg => "image/jpeg",
+            Self::Gif => "image/gif",
+            Self::Webp => "image/webp",
+            Self::Ico => "image/x-icon",
+        }
+    }
+
+    /// 能用 `image` crate 解码并重编码的格式（只开 png/jpeg/gif
+    /// 三特性；WebP 解码需额外特性、ICO 无解码器，均不做缩略图）。
+    fn thumbnail_format(self) -> Option<image::ImageFormat> {
+        match self {
+            Self::Png => Some(image::ImageFormat::Png),
+            Self::Jpeg => Some(image::ImageFormat::Jpeg),
+            Self::Gif => Some(image::ImageFormat::Gif),
+            Self::Webp | Self::Ico => None,
+        }
+    }
+}
+
+/// 对下载字节做魔数校验（N9）：PNG 8 字节签名、JPEG `FF D8 FF`、
+/// GIF `GIF87a`/`GIF89a`、WebP `RIFF....WEBP`、ICO `00 00 01 00`。
+/// 不符返回 `None`（调用方拒绝转存、保留直链）；SVG/HTML/随机字节
+/// 都落在这里。注意只看魔数，不看 Content-Type。
+fn detect_image_format(bytes: &[u8]) -> Option<DetectedImage> {
+    if bytes.len() >= 8 && bytes[..8] == [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A] {
+        Some(DetectedImage::Png)
+    } else if bytes.len() >= 3 && bytes[..3] == [0xFF, 0xD8, 0xFF] {
+        Some(DetectedImage::Jpeg)
+    } else if bytes.len() >= 6 && (&bytes[..6] == b"GIF87a" || &bytes[..6] == b"GIF89a") {
+        Some(DetectedImage::Gif)
+    } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        Some(DetectedImage::Webp)
+    } else if bytes.len() >= 4 && bytes[..4] == [0x00, 0x00, 0x01, 0x00] {
+        Some(DetectedImage::Ico)
+    } else {
+        None
+    }
+}
+
+/// 生成两档缩略图（m9）：解码一次、等比缩放到最长边不超过目标档
+///（`thumbnail` 保持宽高比、不放大），按原格式重编码；返回
+/// `(128px 字节, 256px 字节)`。任一步失败返回 `None`，调用方回退
+/// 到原图转存（不阻塞入库）。动图 GIF 只取首帧（动画丢失，见注释）。
+fn make_thumbnails(bytes: &[u8], format: image::ImageFormat) -> Option<(Vec<u8>, Vec<u8>)> {
+    let img = image::load_from_memory_with_format(bytes, format).ok()?;
+    let encode = |max_px: u32| -> Option<Vec<u8>> {
+        let thumb = img.thumbnail(max_px, max_px);
+        let mut buf = Vec::new();
+        thumb
+            .write_to(&mut std::io::Cursor::new(&mut buf), format)
+            .ok()?;
+        Some(buf)
+    };
+    Some((encode(LOGO_THUMB_SIZES[0])?, encode(LOGO_THUMB_SIZES[1])?))
+}
+
+/// 缩略图对象键：`logos/thumbs/<sha256(缩略图字节)>.<ext>`。
+fn thumbnail_key_for(thumb_bytes: &[u8], ext: &str) -> String {
+    format!("logos/thumbs/{}.{}", sha256_hex(thumb_bytes), ext)
+}
 
 /// S3 兼容对象存储配置（全部来自环境变量，见 `from_env`）。
 #[derive(Debug, Clone)]
@@ -109,7 +211,8 @@ fn ext_from_content_type(content_type: Option<&str>) -> Option<&'static str> {
         "image/jpeg" => "jpg",
         "image/gif" => "gif",
         "image/webp" => "webp",
-        "image/svg+xml" => "svg",
+        // N9：svg 不在白名单——SVG 是可执行 XML，原样转存到公开桶
+        // 有存储型 XSS 面；上游是 SVG 时不转存、保留直链。
         "image/x-icon" | "image/vnd.microsoft.icon" => "ico",
         _ => return None,
     })
@@ -127,7 +230,7 @@ fn ext_from_url(source_url: &str) -> Option<&'static str> {
             "jpg" | "jpeg" => Some("jpg"),
             "gif" => Some("gif"),
             "webp" => Some("webp"),
-            "svg" => Some("svg"),
+            // N9：svg 不在白名单（见 ext_from_content_type）。
             "ico" => Some("ico"),
             _ => None,
         }
@@ -167,23 +270,69 @@ async fn mirror_logo(cfg: &S3Config, logo_url: &str) -> anyhow::Result<String> {
     upload_logo(cfg, &bytes, content_type.as_deref(), logo_url).await
 }
 
-/// 上传已下载好的台标字节：按内容定对象键、SigV4 PUT、返回公开地址。
-/// 下载路径由调用方定（worker 走自身的 `fetch_checked` 固定 IP 版；
-/// API 走这里的 `mirror_logo_if_configured`，同样逐跳固定 IP），上传目标是
-/// 运营方配置的 S3 端点，不走 SSRF 校验。
+/// 上传已下载好的台标字节：先过魔数校验（N9，魔数不符直接拒绝，
+/// 调用方保留直链），再对 PNG/JPEG/GIF 生成 128/256 两档缩略图并
+/// 上传（m9，`logo_url` 指 256px 档，原图不另存）；缩略图生成或
+/// 上传失败时回退到原图转存（不阻塞入库）；WebP/ICO 不做缩略图，
+/// 直接原图转存。下载路径由调用方定（worker 走自身的 `fetch_checked`
+/// 固定 IP 版；API 走这里的 `mirror_logo_if_configured`，同样逐跳
+/// 固定 IP），上传目标是运营方配置的 S3 端点，不走 SSRF 校验。
 pub async fn upload_logo(
     cfg: &S3Config,
     bytes: &[u8],
     content_type: Option<&str>,
     source_url: &str,
 ) -> anyhow::Result<String> {
-    let key = object_key_for(bytes, content_type, source_url)
-        .ok_or_else(|| anyhow::anyhow!("unrecognized logo content type"))?;
+    // N9：魔数是唯一可信的类型依据；SVG/HTML/随机字节在这里被拒。
+    let detected = detect_image_format(bytes)
+        .ok_or_else(|| anyhow::anyhow!("unrecognized logo image magic"))?;
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
+        // M-E：S3 上传不走环境代理（运营方内网/直连端点不应被
+        // http_proxy 劫持；与 pinned_client 同款处理）。
+        .no_proxy()
         .build()?;
-    put_object(&client, cfg, &key, bytes, content_type).await?;
+    // m9：可解码的格式先试缩略图；成功则直接返回 256px 档地址。
+    if let Some(format) = detected.thumbnail_format() {
+        match try_upload_thumbnails(&client, cfg, bytes, format, detected).await {
+            Some(url) => return Ok(url),
+            None => {
+                tracing::warn!("logo thumbnail failed, falling back to original upload");
+            }
+        }
+    }
+    // 回退路径（缩略图失败，或 WebP/ICO 不做缩略图）：原图转存；
+    // 对象键仍走 `object_key_for`（上游声明与魔数一致时保持旧键，
+    // 声明与魔数冲突时以魔数为准）；Content-Type 一律以魔数为准。
+    let key = match object_key_for(bytes, content_type, source_url) {
+        Some(k) if k.ends_with(&format!(".{}", detected.ext())) => k,
+        _ => format!("logos/{}.{}", sha256_hex(bytes), detected.ext()),
+    };
+    put_object(&client, cfg, &key, bytes, Some(detected.content_type())).await?;
     Ok(cfg.public_url(&key))
+}
+
+/// 生成并上传两档缩略图，成功返回 256px 档的公开地址；任一步失败
+/// 返回 `None`（调用方回退原图转存）。两档都上传成功才算成功，
+/// 避免 `logo_url` 指向的 256px 档缺失而 128px 档孤悬。
+async fn try_upload_thumbnails(
+    client: &reqwest::Client,
+    cfg: &S3Config,
+    bytes: &[u8],
+    format: image::ImageFormat,
+    detected: DetectedImage,
+) -> Option<String> {
+    let (thumb128, thumb256) = make_thumbnails(bytes, format)?;
+    let key128 = thumbnail_key_for(&thumb128, detected.ext());
+    let key256 = thumbnail_key_for(&thumb256, detected.ext());
+    let content_type = detected.content_type();
+    put_object(client, cfg, &key128, &thumb128, Some(content_type))
+        .await
+        .ok()?;
+    put_object(client, cfg, &key256, &thumb256, Some(content_type))
+        .await
+        .ok()?;
+    Some(cfg.public_url(&key256))
 }
 
 /// 带逐跳 SSRF 校验的台标下载（N2）：每跳先 `resolve_checked_ip`
@@ -241,6 +390,9 @@ fn pinned_client(url: &reqwest::Url, ip: std::net::IpAddr) -> reqwest::Client {
     let mut builder = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
         .user_agent(format!("Muse-IPTV/{}", crate::VERSION))
+        // M-E：SSRF 固定 IP 的路径不走环境代理——否则 http_proxy 下
+        // 请求走 CONNECT 隧道、DNS 由代理做，`resolve` 的固定值失效。
+        .no_proxy()
         .redirect(reqwest::redirect::Policy::none());
     if let Some((host, addr)) = pin_target(url, ip) {
         builder = builder.resolve(&host, addr);
@@ -448,6 +600,7 @@ fn authorization_header_with_headers(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use image::GenericImageView;
     use std::collections::HashMap;
 
     fn example_cfg() -> S3Config {
@@ -577,6 +730,94 @@ mod tests {
         assert!(object_key_for(bytes, None, "https://cdn.example.com/a.bmp").is_none());
     }
 
+    /// m9：2000px 台标生成两档缩略图，最长边不超过目标档；同时
+    /// 覆盖 PNG/JPEG/GIF 三种可解码格式。
+    #[test]
+    fn thumbnails_fit_within_both_targets() {
+        for format in [
+            image::ImageFormat::Png,
+            image::ImageFormat::Jpeg,
+            image::ImageFormat::Gif,
+        ] {
+            let bytes = test_image_bytes(format, 2000, 1200);
+            assert_eq!(
+                detect_image_format(&bytes).unwrap().thumbnail_format(),
+                Some(format)
+            );
+            let (t128, t256) = make_thumbnails(&bytes, format).unwrap();
+            let d128 = image::load_from_memory(&t128).unwrap().dimensions();
+            let d256 = image::load_from_memory(&t256).unwrap().dimensions();
+            assert!(
+                d128.0 <= 128 && d128.1 <= 128,
+                "{format:?} 128px档超限：{d128:?}"
+            );
+            assert!(
+                d256.0 <= 256 && d256.1 <= 256,
+                "{format:?} 256px档超限：{d256:?}"
+            );
+            // 2000x1200 横图：最长边顶满目标档、短边等比缩小。
+            assert_eq!(d128, (128, 77), "{format:?} 128px档尺寸");
+            assert_eq!(d256, (256, 154), "{format:?} 256px档尺寸");
+            // 缩略图键形如 logos/thumbs/<sha256>.<ext>。
+            assert!(thumbnail_key_for(&t256, "png").starts_with("logos/thumbs/"));
+            assert_eq!(LOGO_THUMB_URL_SIZE, 256);
+        }
+    }
+
+    /// N9：SVG 与魔数不符的字节一律拒绝转存；WebP/ICO 只认魔数、
+    /// 不做缩略图。
+    #[test]
+    fn svg_and_bad_magic_are_rejected() {
+        // 带 <script> 的 SVG：无魔数 → 拒绝；白名单也不再认 svg。
+        let svg = b"<svg xmlns=\"http://www.w3.org/2000/svg\"><script>alert(1)</script></svg>";
+        assert_eq!(detect_image_format(svg), None);
+        assert!(
+            object_key_for(svg, Some("image/svg+xml"), "https://cdn.example.com/a.svg").is_none()
+        );
+        assert!(object_key_for(svg, None, "https://cdn.example.com/a.svg").is_none());
+        // HTML 冒充图片、随机字节、截断的 PNG 签名同样拒绝。
+        assert_eq!(detect_image_format(b"<html><body>hi</body></html>"), None);
+        assert_eq!(detect_image_format(b"not an image at all"), None);
+        assert_eq!(detect_image_format(b"\x89PNG"), None);
+        assert_eq!(detect_image_format(b""), None);
+        // 魔数白名单五种都认；WebP/ICO 不做缩略图（无解码器）。
+        assert_eq!(
+            detect_image_format(b"\x89PNG\r\n\x1a\nxxxx"),
+            Some(DetectedImage::Png)
+        );
+        assert_eq!(
+            detect_image_format(&[0xFF, 0xD8, 0xFF, 0xE0]),
+            Some(DetectedImage::Jpeg)
+        );
+        assert_eq!(detect_image_format(b"GIF89aXXXX"), Some(DetectedImage::Gif));
+        let webp = b"RIFF\x00\x00\x00\x00WEBPxxxx";
+        assert_eq!(detect_image_format(webp), Some(DetectedImage::Webp));
+        assert_eq!(detect_image_format(webp).unwrap().thumbnail_format(), None);
+        let ico = [0x00, 0x00, 0x01, 0x00, 0x01];
+        assert_eq!(detect_image_format(&ico), Some(DetectedImage::Ico));
+        assert_eq!(detect_image_format(&ico).unwrap().thumbnail_format(), None);
+    }
+
+    /// 5MB 上限仍在（`fetch_logo_checked` 的流式断流逻辑未动，
+    /// 这里只锁定上限常量；经 stub 的超大体下载用例需开
+    /// `IPTV_TEST_ALLOW_PRIVATE_UPSTREAMS` 开关，与同进程并行测试
+    /// 竞态，见 ssrf.rs 说明，故不在单测里做）。
+    #[test]
+    fn logo_size_cap_is_still_5mb() {
+        assert_eq!(LOGO_MAX_BYTES, 5 * 1024 * 1024);
+    }
+
+    fn test_image_bytes(format: image::ImageFormat, w: u32, h: u32) -> Vec<u8> {
+        let img = image::RgbImage::from_fn(w, h, |x, y| {
+            image::Rgb([(x % 256) as u8, (y % 256) as u8, 128])
+        });
+        let mut buf = Vec::new();
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(&mut std::io::Cursor::new(&mut buf), format)
+            .unwrap();
+        buf
+    }
+
     /// 未配置存储时不碰网络、直接回落：`mirror_logo_if_configured`
     /// 在 cfg 为 None 时返回 Ok(None)，哪怕 URL 根本连不上。
     #[tokio::test]
@@ -675,6 +916,67 @@ mod tests {
     #[tokio::test]
     async fn pinned_client_connects_to_validated_ip() {
         let _no_proxy = NoProxyGuard::append("pinned.test");
+        let loopback = std::net::IpAddr::from([127, 0, 0, 1]);
+        let png: Vec<u8> = b"\x89PNG fake logo bytes".to_vec();
+        let resp = [
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: image/png\r\nConnection: close\r\n\r\n",
+                png.len()
+            )
+            .into_bytes(),
+            png.clone(),
+        ]
+        .concat();
+        let addr = spawn_stub(loopback, resp).await;
+        let url =
+            reqwest::Url::parse(&format!("http://pinned.test:{}/logo.png", addr.port())).unwrap();
+        let client = pinned_client(&url, addr.ip());
+        let got = client.get(url).send().await.unwrap();
+        assert_eq!(got.status(), 200);
+        assert_eq!(got.bytes().await.unwrap().to_vec(), png);
+    }
+
+    /// 把 `http_proxy`/`https_proxy` 指向一个死代理的 RAII 守卫
+    ///（M-E 回归用；drop 时恢复原值）。
+    struct HttpProxyGuard {
+        prev_http: Option<String>,
+        prev_https: Option<String>,
+    }
+
+    impl HttpProxyGuard {
+        fn set_dead_proxy() -> Self {
+            let prev_http = std::env::var("http_proxy").ok();
+            let prev_https = std::env::var("https_proxy").ok();
+            // 127.0.0.1:9 是 discard 端口、必然拒绝连接：若客户端还
+            // 走环境代理，请求必失败；直连则不受影响。
+            std::env::set_var("http_proxy", "http://127.0.0.1:9");
+            std::env::set_var("https_proxy", "http://127.0.0.1:9");
+            Self {
+                prev_http,
+                prev_https,
+            }
+        }
+    }
+
+    impl Drop for HttpProxyGuard {
+        fn drop(&mut self) {
+            match &self.prev_http {
+                Some(v) => std::env::set_var("http_proxy", v),
+                None => std::env::remove_var("http_proxy"),
+            }
+            match &self.prev_https {
+                Some(v) => std::env::set_var("https_proxy", v),
+                None => std::env::remove_var("https_proxy"),
+            }
+        }
+    }
+
+    /// M-E 回归：`http_proxy` 指向死代理时，固定后的客户端仍直连
+    /// 校验过的 IP（`.no_proxy()` 生效）；若还走代理，CONNECT 到
+    /// 死代理即失败。
+    #[tokio::test]
+    async fn pinned_client_ignores_http_proxy() {
+        let _proxy = HttpProxyGuard::set_dead_proxy();
         let loopback = std::net::IpAddr::from([127, 0, 0, 1]);
         let png: Vec<u8> = b"\x89PNG fake logo bytes".to_vec();
         let resp = [

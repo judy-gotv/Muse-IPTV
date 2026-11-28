@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 /// 只抛 key 与参数，序列化层按 locale 渲染（§12.5：业务层只抛错误码
 /// 与文案参数）。无 key 时按 `errors.e<code>` 渲染；`message` 仍保留
 /// 英文兜底，供无 key 的旧路径与日志用。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct Envelope<T> {
     pub code: i32,
     pub message: String,
@@ -144,7 +144,7 @@ fn default_page_size() -> u32 {
 }
 
 /// 分页响应。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct Paged<T> {
     pub items: Vec<T>,
     pub total: u64,
@@ -164,7 +164,7 @@ pub enum UserStatus {
     Expired,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct AppUser {
     pub id: i64,
     pub display_name: String,
@@ -205,7 +205,7 @@ pub struct UpdateUserRequest {
 }
 
 /// 套餐（§3.2 / §5.1 plans）。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct Plan {
     pub id: i64,
     pub name: String,
@@ -264,7 +264,7 @@ fn default_max_quality() -> String {
 }
 
 /// Token 主数据。明文 Token 永不入库，只存 SHA-256（§4.3 / §13）。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct UserToken {
     pub id: i64,
     pub user_id: i64,
@@ -329,7 +329,7 @@ pub struct UpdateTokenRequest {
 }
 
 /// 创建 Token 响应：明文 Token 只返回一次（§5.2）。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct CreateTokenResponse {
     pub id: i64,
     /// 仅显示一次，调用方必须当场保存。
@@ -350,7 +350,7 @@ pub enum ChannelStatus {
     Disabled,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct Channel {
     pub id: i64,
     pub tvg_id: Option<String>,
@@ -411,7 +411,7 @@ pub struct ChannelEndpoint {
     pub priority: i32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ChannelGroup {
     pub id: i64,
     pub name: String,
@@ -445,7 +445,7 @@ pub enum OnMissing {
     Delete,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct PlaylistSource {
     pub id: i64,
     pub name: String,
@@ -489,16 +489,28 @@ pub struct UpdateSourceRequest {
 }
 
 /// 同步差异（§7.3：新增 / 元数据变更 / URL 变更 / 消失）。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// 四个列表持久化时截断到 1000 条（v0.1.6：未截断时 54 万台的 `missing`
+/// 写成 214MB 单行 JSON，一条 UPDATE 持写锁 72 秒，并发写等满
+/// busy_timeout 后 500）；`*_total` 是截断前的真实总数，旧行 JSON
+/// 无此字段时反序列化为 0，读取方（`get_sync_diff`）用列表长度回退补全。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct SyncDiff {
     pub added: Vec<Channel>,
     pub metadata_changed: Vec<Channel>,
     pub url_changed: Vec<Channel>,
     pub missing: Vec<Channel>,
+    #[serde(default)]
+    pub added_total: u64,
+    #[serde(default)]
+    pub metadata_changed_total: u64,
+    #[serde(default)]
+    pub url_changed_total: u64,
+    #[serde(default)]
+    pub missing_total: u64,
 }
 
 /// 同步日志（§9 `sync_log`）。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct SyncLog {
     pub id: i64,
     pub source_id: i64,
@@ -512,7 +524,7 @@ pub struct SyncLog {
 }
 
 /// EPG 节目（§9 `epg_program`，XMLTV）。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct EpgProgram {
     pub id: i64,
     pub channel_id: i64,
@@ -524,13 +536,22 @@ pub struct EpgProgram {
     pub stop_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct EpgSource {
     pub id: i64,
     pub name: String,
     pub url: String,
     pub last_sync_at: Option<DateTime<Utc>>,
     pub last_status: Option<String>,
+}
+
+/// m-openapi：POST `/api/v1/admin/epg/sources` 入参（原先收 `Json<Value>`，
+/// 手动取 `name`/`url`；现为 typed DTO，缺字段由 axum 拒 400，空串仍由
+/// handler 判 422，与原校验一致）。
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct CreateEpgSourceRequest {
+    pub name: String,
+    pub url: String,
 }
 
 /// M19f：EPG 源 PATCH——只改提供的字段。
@@ -543,7 +564,7 @@ pub struct UpdateEpgSourceRequest {
 /// m19：`epg_channel_map` 一行——某 EPG 源的某个 EPG 频道（`tvg_id`，即
 /// XMLTV `<channel id>`）固定对应某个本台频道（`channel_id`）。
 /// Worker 同步时优先按此映射落节目，不再走 tvg-id/名称猜测。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct EpgChannelMap {
     pub id: i64,
     pub epg_source_id: i64,
@@ -589,7 +610,7 @@ pub struct PortalSession {
 }
 
 /// 在线设备行（§4.1：IP 脱敏后展示）。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct DeviceView {
     pub session_id: i64,
     pub device_id: String,
@@ -601,7 +622,7 @@ pub struct DeviceView {
 }
 
 /// §4.5 `GET /api/v1/me` 响应示例（文档原字段）。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct MeResponse {
     pub user: MeUser,
     pub token: MeToken,
@@ -611,7 +632,7 @@ pub struct MeResponse {
     pub features: TokenFeatures,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct MeUser {
     pub id: i64,
     pub display_name: String,
@@ -619,7 +640,7 @@ pub struct MeUser {
     pub theme: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct MeToken {
     pub id: i64,
     pub name: String,
@@ -629,7 +650,7 @@ pub struct MeToken {
     pub days_remaining: i64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct MeQuota {
     pub max_concurrent_sessions: i32,
     pub active_sessions: i32,
@@ -637,7 +658,7 @@ pub struct MeQuota {
     pub bound_devices: i32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct MePlan {
     pub name: String,
     pub expires_at: Option<DateTime<Utc>>,
@@ -665,7 +686,7 @@ pub struct MeSettingsPatch {
 }
 
 /// 播放会话（§6.2 `playback_session`）。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct PlaybackSession {
     pub id: i64,
     pub session_uid: String,
@@ -687,7 +708,7 @@ pub struct PlaybackStartRequest {
     pub device_id: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct PlaybackStartResponse {
     pub session_uid: String,
     /// 短时效 HMAC 播放地址（§6.4 / §8，默认 300s，上游真实地址不下发）。
@@ -707,7 +728,7 @@ pub struct PlaybackStopRequest {
     pub session_uid: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct PlaybackEvent {
     pub id: i64,
     pub session_uid: String,
@@ -765,7 +786,7 @@ impl AdminRole {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct AdminUser {
     pub id: i64,
     pub username: String,
@@ -795,7 +816,7 @@ pub struct CreateAdminRequest {
 
 /// 建管理员的返回：totp_required 时服务端当场生成密钥，密钥/URI/二维码
 /// 仅返回一次（调用方必须立即展示并让用户扫码配置，之后不再可取）。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct CreateAdminResponse {
     pub admin: AdminUser,
     pub totp_secret: Option<String>,
@@ -810,7 +831,7 @@ pub struct UpdateAdminRequest {
 }
 
 /// 审计日志（§3.2：操作者、对象、变更前后快照，保留 180 天 §13）。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct AuditLog {
     pub id: i64,
     pub actor: String,
@@ -825,17 +846,58 @@ pub struct AuditLog {
 }
 
 /// 系统设置（§3.2 全部键，见 `system_setting` 表与默认配置）。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct SystemSetting {
     pub key: String,
     pub value: serde_json::Value,
     pub updated_at: DateTime<Utc>,
 }
 
+/// m-openapi：PATCH `/api/v1/admin/settings` 入参——§3.2 的全部设置键
+/// （见 `iptv_core::default_settings`），只传要改的键。值类型按各键
+/// 的默认值类型；`extra` 收未知键，handler 仍按原行为报 422
+/// （`unknown setting`），而不是静默丢弃。前端一次只改一个键
+/// （`{ key: value }`），与本结构兼容。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct UpdateSettingsRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_max_concurrent_sessions: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_max_bound_devices: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heartbeat_interval_sec: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_timeout_sec: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub single_ip_token_limit: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub play_url_ttl_sec: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cdn_domain: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alert_threshold_failed_syncs: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_locale: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub available_locales: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub portal_session_ttl_days: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remember_device_ttl_days: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ticket_ttl_sec: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audit_retention_days: Option<i64>,
+    /// 未知键（flatten）：只用于在 handler 里报 422，schema 上体现为
+    /// additionalProperties。
+    #[serde(default, flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
 /// m22：文案覆盖（§12.8 `i18n_override` 表）。`key` 为点分逻辑 key
 /// （如 `admin.settings`），`value` 为覆盖文案（可含 `{ $var }` 占位符，
 /// 按调用方参数替换）；覆盖只作用于指定 key 与 locale。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct I18nOverride {
     pub id: i64,
     pub locale: String,
@@ -853,7 +915,7 @@ pub struct UpsertI18nOverrideRequest {
 }
 
 /// §5.2 `GET /api/v1/admin/stats/overview`。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct StatsOverview {
     pub online_users: i64,
     pub active_sessions: i64,
@@ -867,7 +929,7 @@ pub struct StatsOverview {
 }
 
 /// 健康检查。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct HealthResponse {
     pub status: String,
     pub version: String,
@@ -876,7 +938,7 @@ pub struct HealthResponse {
 }
 
 /// M3U 上传解析报告（§7.2：逐条报错并汇总，异常行不得整批失败）。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct M3uImportReport {
     pub total_lines: usize,
     pub channels_parsed: usize,
@@ -885,7 +947,7 @@ pub struct M3uImportReport {
 }
 
 /// M16：异步上传任务状态（§7.1 异步解析）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum UploadTaskStatus {
     Queued,
@@ -895,7 +957,7 @@ pub enum UploadTaskStatus {
 }
 
 /// M16：异步上传任务进度（GET /api/v1/admin/upload-tasks/{id} 返回体）。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct UploadTaskProgress {
     pub task_id: String,
     pub status: UploadTaskStatus,
@@ -909,12 +971,22 @@ pub struct UploadTaskProgress {
 }
 
 /// M16：POST /api/v1/admin/sources/upload 的即时返回体（只含任务 id）。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct UploadTaskCreated {
     pub task_id: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// m-openapi：POST `/api/v1/admin/sources/upload` 的 multipart 表单描述
+/// （仅 OpenAPI 文档用；handler 仍用 axum `Multipart` 提取器流式收文件）。
+/// `file` 为 M3U 文件，`source_id` 给了就导入该源，否则按文件名新建源。
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct UploadM3uRequest {
+    #[schema(format = Binary)]
+    pub file: String,
+    pub source_id: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct M3uLineError {
     pub line: usize,
     pub message: String,

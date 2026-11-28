@@ -33,6 +33,10 @@ async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
+    // m22：启动时读库装入 i18n 覆盖（与 API main.rs 同款；门户此前从不
+    // 读 `i18n_override` 表，覆盖文案在门户永不生效。读库失败只记警告，
+    // 不阻塞启动；无覆盖时 FTL 兜底）。
+    load_i18n_overrides().await;
     let conf = leptos::config::get_configuration(None).expect("leptos config");
     let leptos_options = conf.leptos_options;
     // 单端口部署时用专属变量定内部监听地址（.env 里门户/后台各写一行）；
@@ -70,6 +74,30 @@ async fn main() {
     axum::serve(listener, app.into_make_service())
         .await
         .unwrap();
+}
+
+/// m22：启动时把 `i18n_override` 表装入进程内覆盖表（与 API main.rs
+/// 同款；`DATABASE_URL` 未设时默认 `sqlite://iptv.db`，与 API 的
+/// `Config::from_env` 一致）。读库/连库失败只记警告，不阻塞启动。
+async fn load_i18n_overrides() {
+    let database_url =
+        std::env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite://iptv.db".to_string());
+    load_i18n_overrides_from(&database_url).await;
+}
+
+/// m22：`load_i18n_overrides` 的可测形态（单测传临时库 URL）。
+async fn load_i18n_overrides_from(database_url: &str) {
+    match iptv_store::Store::connect(database_url).await {
+        Ok(store) => match store.i18n_overrides_map().await {
+            Ok(map) => {
+                let n = map.len();
+                iptv_i18n::I18n::set_overrides(map);
+                tracing::info!("loaded {n} i18n overrides");
+            }
+            Err(e) => tracing::warn!("failed to load i18n overrides: {e}"),
+        },
+        Err(e) => tracing::warn!("failed to connect database for i18n overrides: {e}"),
+    }
 }
 
 async fn design_css() -> ([(header::HeaderName, &'static str); 1], &'static str) {
@@ -195,15 +223,16 @@ async fn csrf_middleware(req: Request, next: Next) -> Response {
 }
 
 /// POST 后端 JSON 接口；返回 `(http_status, data, set_cookie)`。
-/// `csrf` 为入站请求的 `iptv_csrf` Cookie 值：有则同时以
-/// `X-CSRF-Token` 头 + `Cookie` 头里的 `iptv_csrf` 发给 API，走双提交
-/// 比对；无则只发会话 Cookie，API 退回 Origin 兜底（登录/票据兑换尚无
-/// token 时就是这个形态）。
+/// `headers` 为入站请求头：会话/Cookie 与双提交 token 由此取。
+/// m22：另转发浏览器的 `iptv_locale` Cookie 与 `Accept-Language`，API
+/// 的错误本地化中间件才能按用户真实语言渲染 message（此前只转发会
+/// 话/CSRF，API 一律回退系统默认简体中文）；后端不可达时返回
+/// `{"error": "backend unreachable"}` 而非空 data，登录页才能把失败
+/// 展示出来（此前静默跳去 /me）。
 async fn backend_post(
     path: &str,
     body: serde_json::Value,
-    sid: Option<&str>,
-    csrf: Option<&str>,
+    headers: &HeaderMap,
 ) -> (
     reqwest::StatusCode,
     Option<serde_json::Value>,
@@ -211,22 +240,45 @@ async fn backend_post(
 ) {
     let url = format!("{}{path}", api_base());
     let mut req = client().post(&url).json(&body);
+    let sid = portal_sid(headers);
+    let csrf = csrf_token(headers);
     let mut cookie = String::new();
-    if let Some(s) = sid {
+    if let Some(s) = sid.as_deref() {
         cookie.push_str(&format!("iptv_portal_sid={s}"));
     }
-    if let Some(c) = csrf {
+    if let Some(c) = csrf.as_deref() {
         if !cookie.is_empty() {
             cookie.push_str("; ");
         }
         cookie.push_str(&format!("iptv_csrf={c}"));
         req = req.header("x-csrf-token", c);
     }
+    // m22：语言转发（Cookie 优先，Accept-Language 兜底）。
+    if let Some(l) = cookie_header(headers)
+        .and_then(|h| cookie_value(&h, "iptv_locale"))
+        .filter(|l| iptv_i18n::normalize_locale(l).is_some())
+    {
+        if !cookie.is_empty() {
+            cookie.push_str("; ");
+        }
+        cookie.push_str(&format!("iptv_locale={l}"));
+    }
+    if let Some(al) = headers
+        .get(header::ACCEPT_LANGUAGE)
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.trim().is_empty())
+    {
+        req = req.header(header::ACCEPT_LANGUAGE, al);
+    }
     if !cookie.is_empty() {
         req = req.header("Cookie", cookie);
     }
     let Ok(res) = req.send().await else {
-        return (reqwest::StatusCode::BAD_GATEWAY, None, None);
+        return (
+            reqwest::StatusCode::BAD_GATEWAY,
+            Some(serde_json::json!({ "error": "backend unreachable" })),
+            None,
+        );
     };
     let status = res.status();
     let set_cookie = res
@@ -252,19 +304,39 @@ async fn backend_post(
     (status, data, set_cookie)
 }
 
-async fn backend_delete(path: &str, sid: Option<&str>, csrf: Option<&str>) -> bool {
+async fn backend_delete(path: &str, headers: &HeaderMap) -> bool {
     let url = format!("{}{path}", api_base());
     let mut req = client().delete(&url);
+    let sid = portal_sid(headers);
+    let csrf = csrf_token(headers);
     let mut cookie = String::new();
-    if let Some(s) = sid {
+    if let Some(s) = sid.as_deref() {
         cookie.push_str(&format!("iptv_portal_sid={s}"));
     }
-    if let Some(c) = csrf {
+    if let Some(c) = csrf.as_deref() {
         if !cookie.is_empty() {
             cookie.push_str("; ");
         }
         cookie.push_str(&format!("iptv_csrf={c}"));
         req = req.header("x-csrf-token", c);
+    }
+    // m22：语言转发（与 backend_post 同款；DELETE 无响应体，只影响
+    // API 侧的错误日志/限流文案语言）。
+    if let Some(l) = cookie_header(headers)
+        .and_then(|h| cookie_value(&h, "iptv_locale"))
+        .filter(|l| iptv_i18n::normalize_locale(l).is_some())
+    {
+        if !cookie.is_empty() {
+            cookie.push_str("; ");
+        }
+        cookie.push_str(&format!("iptv_locale={l}"));
+    }
+    if let Some(al) = headers
+        .get(header::ACCEPT_LANGUAGE)
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.trim().is_empty())
+    {
+        req = req.header(header::ACCEPT_LANGUAGE, al);
     }
     if !cookie.is_empty() {
         req = req.header("Cookie", cookie);
@@ -306,6 +378,40 @@ fn safe_redirect(to: &str, fallback: &str) -> String {
     }
 }
 
+/// 从请求头 Cookie 读 `iptv_locale`，非法/缺失时回退 `DEFAULT_LOCALE`（m13）。
+fn locale_from_headers(headers: &HeaderMap) -> String {
+    cookie_header(headers)
+        .and_then(|h| cookie_value(&h, "iptv_locale"))
+        .filter(|l| iptv_i18n::normalize_locale(l).is_some())
+        .unwrap_or_else(|| iptv_i18n::DEFAULT_LOCALE.to_string())
+}
+
+/// m22：main.rs 内的文案走 FTL（与后台 main.rs 的 `t_or` 同 key 体系；
+/// 缺 key 时回退英文兜底并打警告）。
+fn t_or(locale: &str, key: &str, fallback: &str) -> String {
+    let v = iptv_i18n::I18n::new().t_simple(locale, key);
+    if v == key {
+        tracing::warn!("i18n 缺 key：`{key}`（locale `{locale}`），回退英文兜底");
+        fallback.to_string()
+    } else {
+        v
+    }
+}
+
+/// m22：登录失败时 SSR 自产的英文哨兵（`backend unreachable`）在展示
+/// 时翻成本地文案；API 的 message 已按转发过去的 locale 本地化过，
+/// 原样透传。
+fn localize_login_error(locale: &str, msg: &str) -> String {
+    match msg {
+        "backend unreachable" => t_or(
+            locale,
+            "admin.onetime-error-backend-unreachable",
+            "Backend unreachable",
+        ),
+        _ => msg.to_string(),
+    }
+}
+
 #[derive(Deserialize)]
 struct LoginForm {
     token: String,
@@ -330,7 +436,7 @@ async fn login(headers: HeaderMap, Form(form): Form<LoginForm>) -> (HeaderMap, R
         "remember_device": form.remember_device.as_deref() == Some("true"),
     });
     let (_status, data, set_cookie) =
-        backend_post("/api/v1/auth/token-login", body, None, None).await;
+        backend_post("/api/v1/auth/token-login", body, &headers).await;
     if let Some(sc) = set_cookie {
         cookies.push(sc);
     }
@@ -339,22 +445,18 @@ async fn login(headers: HeaderMap, Form(form): Form<LoginForm>) -> (HeaderMap, R
         .and_then(|d| d.get("error"))
         .and_then(|e| e.as_str())
     {
-        return redirect_with_cookies(&format!("/?error={}", pct_encode(err)), &cookies);
+        // m22：API 的 message 已按转发过去的 locale 本地化；只有 SSR 自产
+        // 的 `backend unreachable` 哨兵需在这里翻（后端不可达时）。
+        let locale = locale_from_headers(&headers);
+        let e = localize_login_error(&locale, err);
+        return redirect_with_cookies(&format!("/?error={}", pct_encode(&e)), &cookies);
     }
     redirect_with_cookies("/me", &cookies)
 }
 
 /// POST /logout：调后端退出并清除会话 Cookie。
 async fn logout(headers: HeaderMap) -> (HeaderMap, Redirect) {
-    let sid = portal_sid(&headers);
-    let csrf = csrf_token(&headers);
-    let _ = backend_post(
-        "/api/v1/auth/logout",
-        serde_json::json!({}),
-        sid.as_deref(),
-        csrf.as_deref(),
-    )
-    .await;
+    let _ = backend_post("/api/v1/auth/logout", serde_json::json!({}), &headers).await;
     redirect_with_cookies(
         "/",
         &[
@@ -366,15 +468,7 @@ async fn logout(headers: HeaderMap) -> (HeaderMap, Redirect) {
 
 /// POST /logout-all（M14）：调后端吊销该 Token 全部会话（含当前），并清除 Cookie。
 async fn logout_all(headers: HeaderMap) -> (HeaderMap, Redirect) {
-    let sid = portal_sid(&headers);
-    let csrf = csrf_token(&headers);
-    let _ = backend_post(
-        "/api/v1/auth/logout-all",
-        serde_json::json!({}),
-        sid.as_deref(),
-        csrf.as_deref(),
-    )
-    .await;
+    let _ = backend_post("/api/v1/auth/logout-all", serde_json::json!({}), &headers).await;
     redirect_with_cookies(
         "/",
         &[
@@ -403,9 +497,7 @@ async fn set_locale(headers: HeaderMap, Form(form): Form<LocaleForm>) -> (Header
     let sid = portal_sid(&headers);
     if sid.is_some() {
         let body = serde_json::json!({ "locale": loc });
-        let csrf = csrf_token(&headers);
-        let (_, _, _) =
-            backend_post("/api/v1/me/settings", body, sid.as_deref(), csrf.as_deref()).await;
+        let (_, _, _) = backend_post("/api/v1/me/settings", body, &headers).await;
     }
     let to = safe_redirect(form.redirect_to.as_deref().unwrap_or("/me"), "/me");
     redirect_with_cookies(&to, &cookies)
@@ -413,14 +505,7 @@ async fn set_locale(headers: HeaderMap, Form(form): Form<LocaleForm>) -> (Header
 
 /// POST /me/devices/{id}/kick：下线自己的设备（服务端只认本 token 的会话）。
 async fn kick_device(headers: HeaderMap, Path(session_id): Path<i64>) -> Redirect {
-    let sid = portal_sid(&headers);
-    let csrf = csrf_token(&headers);
-    let _ = backend_delete(
-        &format!("/api/v1/me/devices/{session_id}"),
-        sid.as_deref(),
-        csrf.as_deref(),
-    )
-    .await;
+    let _ = backend_delete(&format!("/api/v1/me/devices/{session_id}"), &headers).await;
     Redirect::to("/me/devices")
 }
 
@@ -452,12 +537,10 @@ async fn save_settings(
         body.insert("theme".to_string(), serde_json::json!(t));
     }
     if sid.is_some() && !body.is_empty() {
-        let csrf = csrf_token(&headers);
         let _ = backend_post(
             "/api/v1/me/settings",
             serde_json::Value::Object(body),
-            sid.as_deref(),
-            csrf.as_deref(),
+            &headers,
         )
         .await;
     }
@@ -491,18 +574,65 @@ async fn change_quality(
     Path(channel_id): Path<i64>,
     Form(form): Form<QualityForm>,
 ) -> Redirect {
-    let sid = portal_sid(&headers);
-    let csrf = csrf_token(&headers);
     let body = serde_json::json!({ "session_uid": form.session_uid });
-    let _ = backend_post(
-        "/api/v1/playback/stop",
-        body,
-        sid.as_deref(),
-        csrf.as_deref(),
-    )
-    .await;
+    let _ = backend_post("/api/v1/playback/stop", body, &headers).await;
     Redirect::to(&format!(
         "/watch/{channel_id}?quality={}",
         pct_encode(&form.quality)
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    /// m22：登录错误本地化——SSR 自产哨兵翻成本地文案，未知串原样透传。
+    #[test]
+    fn localize_login_error_backend_unreachable() {
+        assert_eq!(
+            localize_login_error("en", "backend unreachable"),
+            "Backend unreachable"
+        );
+        assert_eq!(
+            localize_login_error("zh-Hans-CN", "backend unreachable"),
+            "后端无法连接"
+        );
+        assert_eq!(
+            localize_login_error("en", "something else"),
+            "something else"
+        );
+    }
+
+    /// m22：改一条覆盖文案后，门户进程读库生效——临时库里写一条
+    /// `common.app-name` 的 en 覆盖，调启动装入路径，`t_simple` 即返回
+    /// 覆盖值（而不是 FTL 原值）；测完清空覆盖表，避免影响同进程内
+    /// 其他测试。
+    #[tokio::test]
+    async fn portal_loads_i18n_overrides_from_db() {
+        let n = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "iptv-portal-override-test-{}-{n}.db",
+            std::process::id()
+        ));
+        let url = format!("sqlite://{}?mode=rwc", path.display());
+        let store = iptv_store::Store::connect(&url)
+            .await
+            .expect("connect sqlite");
+        store.migrate().await.expect("migrate");
+        store
+            .upsert_i18n_override("en", "common.app-name", "OVERRIDE-NAME")
+            .await
+            .expect("upsert override");
+        load_i18n_overrides_from(&url).await;
+        assert_eq!(
+            iptv_i18n::I18n::new().t_simple("en", "common.app-name"),
+            "OVERRIDE-NAME"
+        );
+        iptv_i18n::I18n::set_overrides(HashMap::new());
+        let _ = std::fs::remove_file(&path);
+    }
 }

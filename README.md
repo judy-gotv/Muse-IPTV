@@ -96,12 +96,12 @@ docker compose -f deploy/docker-compose.yml up -d
 |---|---|---|
 | `IPTV_ADMIN_USER` / `IPTV_ADMIN_PASSWORD` | admin / 空 | 首次启动建超管；密码为空建不出账号 |
 | `DATABASE_URL` | `sqlite:///app/data/iptv.db` | 改 PostgreSQL/MySQL 见 `.env.example` |
-| `PLAY_SECRET` / `ADMIN_SECRET` | 为空则随机生成 | 不固定则重启后旧播放链接与会话失效 |
+| `PLAY_SECRET` / `ADMIN_SECRET` | 空（Docker 入口自动生成并持久化） | Docker 入口在 `/app/data/.secrets` 生成一次持久化（chmod 600），显式环境变量优先；删文件 + 重启即轮换，全体会话失效；未设且无入口生成时 API 拒绝启动，不再静默随机生成 |
 | `PORTAL_BASE_URL` | `http://127.0.0.1:8081` | 票据链接用的门户地址；远程访问改成服务器 IP/域名 |
 | `IPTV_PORT` | 8081 | compose 映射到宿主的端口（只映射网关一个） |
 | `GATEWAY_BIND_ADDR` | `0.0.0.0:8081` | 网关监听地址 |
 | `IPTV_PORTAL_ADDR` / `IPTV_ADMIN_ADDR` | `0.0.0.0:18081` / `0.0.0.0:18082` | 门户/后台内部监听地址（.env 方式部署时用） |
-| `S3_ENDPOINT` / `S3_BUCKET` / `S3_ACCESS_KEY` / `S3_SECRET_KEY` | 空（不转存） | 台标转存对象存储（§7.2）：四项全配才启用，`logo_url` 转存为 `logos/<sha256>.<ext>` 后入库；缺一即保持上游直链；`S3_REGION` 缺省 `us-east-1`，`S3_PUBLIC_BASE_URL` 可选（公开访问前缀，如 CDN 域名） |
+| `S3_ENDPOINT` / `S3_BUCKET` / `S3_ACCESS_KEY` / `S3_SECRET_KEY` | 空（不转存） | 台标转存对象存储（§7.2）：四项全配才启用，转存 128px/256px 两档缩略图，`logo_url` 指 256px 档（`logos/thumbs/<sha256>.<ext>`），原图不另存；SVG 不转存（只留直链），下载字节做魔数校验；缺一即保持上游直链；`S3_REGION` 缺省 `us-east-1`，`S3_PUBLIC_BASE_URL` 可选（公开访问前缀，如 CDN 域名） |
 | `IPTV_CORS_ORIGINS` | 空（只同源） | CORS 允许源，逗号分隔，如 `https://app.example.com`；写请求仍须过 CSRF 双提交/Origin 检查，且永不配 `allow_credentials`（会话 Cookie 只走同源网关） |
 
 
@@ -232,3 +232,6 @@ cargo run -p xtask -- i18n-check   # 语言包 key 齐全性 + 占位符一致�
   管理员密码 Argon2id；会话 Cookie HttpOnly + SameSite=Lax。
 - SSRF：订阅仅 http/https，目标私网 IP 拒绝；本地 M3U 上传不限大小（流式落盘+逐行解析）；按 IP/Token/账号三维限流。
 - 仅接入有授权的源，提供下架与黑名单机制，日志脱敏（§13）。
+- 密钥：Docker 入口在 `/app/data/.secrets` 持久化生成一次（显式环境变量优先）；删文件 + 重启即轮换，全体会话失效。未设密钥时 API 拒绝启动，不再静默随机生成。
+- SQLite 以 WAL 模式运行：备份、迁移或拷库时须把主库 + `-wal` + `-shm` 三个文件一起复制，只拷主库会丢失已提交但尚未检查点回主库的数据。
+- SSRF 固定 IP 的三处 pinned client 强制直连，不读 `http_proxy`/`https_proxy`/`NO_PROXY` 等环境代理；上游只能经代理到达时走应用自身的订阅代理（`Subscription.proxyId`），不得依赖环境代理。
